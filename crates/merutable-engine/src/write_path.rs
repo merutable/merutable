@@ -127,13 +127,25 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
     // Apply to memtable.
     let should_flush = engine.memtable.apply_batch(&wal_batch)?;
 
+    // Auto-flush when the threshold is crossed. Must rotate the active
+    // memtable to the immutable queue BEFORE spawning `run_flush`, or the
+    // spawned task sees an empty immutable queue and silently no-ops (Bug
+    // F regression). `rotation_lock` serializes bursts so only one writer
+    // actually rotates; later writers re-check under the lock and find the
+    // fresh (small) active memtable.
     if should_flush {
-        let engine = Arc::clone(engine);
-        tokio::spawn(async move {
-            if let Err(e) = crate::flush::run_flush(&engine).await {
-                tracing::error!(error = %e, "flush failed");
+        if let Ok(_guard) = engine.rotation_lock.try_lock() {
+            if engine.memtable.active_should_flush() {
+                let next_seq = engine.global_seq.current().next();
+                engine.memtable.rotate(next_seq);
+                let engine = Arc::clone(engine);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::flush::run_flush(&engine).await {
+                        tracing::error!(error = %e, "auto-flush failed");
+                    }
+                });
             }
-        });
+        }
     }
 
     Ok(base_seq)

@@ -95,6 +95,16 @@ impl MemtableManager {
         self.immutable_count() >= self.max_immutable
     }
 
+    /// Returns `true` if the **current active** memtable has crossed its
+    /// flush threshold. Used by the auto-flush path on the write side so
+    /// that after a burst of concurrent writes all observed the same
+    /// `apply_batch → should_flush=true`, only the task that actually gets
+    /// to rotate re-checks and proceeds — later tasks find a freshly
+    /// rotated (small) active memtable and bail out.
+    pub fn active_should_flush(&self) -> bool {
+        self.inner.read().unwrap().active.should_flush()
+    }
+
     /// Multi-level point lookup: check active first, then immutable queue newest→oldest.
     pub fn get(&self, user_key_bytes: &[u8], read_seq: SeqNum) -> Option<EntryValue> {
         let set = self.inner.read().unwrap();

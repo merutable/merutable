@@ -27,6 +27,13 @@ pub struct MeruEngine {
     pub(crate) memtable: MemtableManager,
     pub(crate) version_set: VersionSet,
     pub(crate) catalog: Arc<IcebergCatalog>,
+    /// Serializes memtable rotation attempts from the auto-flush path so a
+    /// burst of concurrent writes all seeing `should_flush=true` triggers
+    /// at most one rotation. Bug F regression: without this, every task in
+    /// a concurrent write burst would either (a) skip rotation entirely or
+    /// (b) race and seal empty memtables. The fix is `try_lock` + double
+    /// check under the lock: the loser drops through, the winner rotates.
+    pub(crate) rotation_lock: Mutex<()>,
 }
 
 impl MeruEngine {
@@ -95,6 +102,7 @@ impl MeruEngine {
             memtable,
             version_set,
             catalog,
+            rotation_lock: Mutex::new(()),
         });
 
         Ok(engine)
@@ -156,14 +164,30 @@ impl MeruEngine {
         // Apply to memtable.
         let should_flush = self.memtable.apply_batch(&batch)?;
 
-        // Trigger flush if threshold crossed.
+        // Trigger flush if threshold crossed. The flush requires a rotate
+        // (active → immutable) so that `run_flush` has something to find in
+        // `oldest_immutable()`; before Bug F was fixed, this path spawned
+        // `run_flush` without rotating and the task returned a no-op,
+        // leaving the memtable to grow unbounded. Concurrent writers all
+        // see the same stale `should_flush=true` during a burst — serialize
+        // rotation through `rotation_lock` and re-check under the lock so
+        // only one task actually seals and spawns a flush.
         if should_flush {
-            let engine = Arc::clone(self);
-            tokio::spawn(async move {
-                if let Err(e) = crate::flush::run_flush(&engine).await {
-                    tracing::error!(error = %e, "flush failed");
+            if let Ok(_guard) = self.rotation_lock.try_lock() {
+                // Stale should_flush from another task's apply_batch? If the
+                // active memtable was already rotated out from under us, the
+                // new active is small and we have nothing to do.
+                if self.memtable.active_should_flush() {
+                    let next_seq = self.global_seq.current().next();
+                    self.memtable.rotate(next_seq);
+                    let engine = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::flush::run_flush(&engine).await {
+                            tracing::error!(error = %e, "auto-flush failed");
+                        }
+                    });
                 }
-            });
+            }
         }
 
         Ok(seq)
