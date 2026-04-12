@@ -1174,13 +1174,8 @@ mod tests {
                 Some(FieldValue::Bytes(BBytes::from(format!("v{ver}")))),
             ]);
             rows.push((
-                InternalKey::encode(
-                    &[FieldValue::Int64(42)],
-                    SeqNum(ver),
-                    OpType::Put,
-                    &schema,
-                )
-                .unwrap(),
+                InternalKey::encode(&[FieldValue::Int64(42)], SeqNum(ver), OpType::Put, &schema)
+                    .unwrap(),
                 row,
             ));
         }
@@ -1229,10 +1224,7 @@ mod tests {
              to full scan when page miss)",
         );
         assert_eq!(ik.seq, SeqNum(10));
-        assert_eq!(
-            row.get(1),
-            Some(&FieldValue::Bytes(BBytes::from("v10")))
-        );
+        assert_eq!(row.get(1), Some(&FieldValue::Bytes(BBytes::from("v10"))));
 
         // read_seq=1 → oldest version.
         let got = reader.get(&user_key, SeqNum(1), None).unwrap();
