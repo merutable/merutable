@@ -154,7 +154,12 @@ impl DeletionVector {
         let footer_json = serde_json::to_string(&footer)
             .map_err(|e| MeruError::Iceberg(format!("Puffin footer JSON: {e}")))?;
         let footer_bytes = footer_json.as_bytes();
-        let footer_len = footer_bytes.len() as i32;
+        let footer_len = i32::try_from(footer_bytes.len()).map_err(|_| {
+            MeruError::Iceberg(format!(
+                "Puffin footer too large for i32: {} bytes",
+                footer_bytes.len()
+            ))
+        })?;
 
         // Assemble: magic + blob_data + footer_payload + footer_len(i32 LE) + magic
         let total = PUFFIN_MAGIC.len()
@@ -210,9 +215,18 @@ impl DeletionVector {
         }
 
         // Read footer length (i32 LE, 4 bytes before closing magic).
+        // Bug L: the raw i32 can be negative in a corrupt file, so validate
+        // before casting to usize — a negative value cast `as usize` wraps
+        // to a huge number and either panics on the subtraction below or
+        // reads garbage bytes as the footer JSON.
         let fl_start = data.len() - 8;
-        let footer_len =
-            i32::from_le_bytes(data[fl_start..fl_start + 4].try_into().unwrap()) as usize;
+        let footer_len_raw = i32::from_le_bytes(data[fl_start..fl_start + 4].try_into().unwrap());
+        if footer_len_raw < 0 {
+            return Err(MeruError::Corruption(format!(
+                "Puffin footer length is negative: {footer_len_raw}"
+            )));
+        }
+        let footer_len = footer_len_raw as usize;
 
         if footer_len > data.len() - PUFFIN_MIN_SIZE {
             return Err(MeruError::Corruption(format!(
@@ -313,7 +327,18 @@ fn parse_puffin_footer(data: &[u8]) -> Result<PuffinFooter> {
         return Err(MeruError::Corruption("Puffin magic mismatch".into()));
     }
     let fl_start = data.len() - 8;
-    let footer_len = i32::from_le_bytes(data[fl_start..fl_start + 4].try_into().unwrap()) as usize;
+    let footer_len_raw = i32::from_le_bytes(data[fl_start..fl_start + 4].try_into().unwrap());
+    if footer_len_raw < 0 {
+        return Err(MeruError::Corruption(format!(
+            "Puffin footer length is negative: {footer_len_raw}"
+        )));
+    }
+    let footer_len = footer_len_raw as usize;
+    if footer_len > fl_start - 4 {
+        return Err(MeruError::Corruption(format!(
+            "Puffin footer length {footer_len} exceeds available data"
+        )));
+    }
     let footer_start = fl_start - footer_len;
     let json_str = std::str::from_utf8(&data[footer_start..fl_start])
         .map_err(|e| MeruError::Corruption(format!("Puffin footer UTF-8: {e}")))?;
@@ -419,6 +444,27 @@ mod tests {
         // Wrong opening magic.
         data[0..4].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(DeletionVector::from_puffin_bytes(&data).is_err());
+    }
+
+    /// Bug L regression: a Puffin file with a negative footer_len i32
+    /// must return a clean Corruption error, not panic via usize
+    /// wraparound on the subtraction `fl_start - footer_len`.
+    #[test]
+    fn puffin_negative_footer_len_rejected() {
+        // Build a minimal valid-ish Puffin frame: magic + <padding> +
+        // footer_len(i32 LE, negative) + magic.
+        let neg: i32 = -1;
+        let mut data = Vec::new();
+        data.extend_from_slice(&PUFFIN_MAGIC); // opening magic
+        data.extend_from_slice(&[0u8; 4]); // dummy padding
+        data.extend_from_slice(&neg.to_le_bytes()); // negative footer_len
+        data.extend_from_slice(&PUFFIN_MAGIC); // closing magic
+        let err = DeletionVector::from_puffin_bytes(&data).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("negative"),
+            "expected 'negative' in error: {msg}"
+        );
     }
 
     #[test]

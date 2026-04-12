@@ -233,8 +233,13 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
         for (local_pos, (ikey, row)) in rows.into_iter().enumerate() {
             let global_pos = global_start + local_pos as u64;
             if let Some(dv) = deleted_rows {
-                if dv.contains(global_pos as u32) {
-                    continue;
+                // Bug M: match the safe u32::try_from pattern used in
+                // read_physical_rows_with_positions. Positions beyond u32::MAX
+                // cannot be in the DV bitmap, so treat them as not-deleted.
+                if let Ok(pos32) = u32::try_from(global_pos) {
+                    if dv.contains(pos32) {
+                        continue;
+                    }
                 }
             }
             if ikey.user_key_bytes() != user_key_bytes {
@@ -270,8 +275,12 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
 
         for (global_pos, (ikey, row)) in rows.into_iter().enumerate() {
             if let Some(dv) = deleted_rows {
-                if dv.contains(global_pos as u32) {
-                    continue;
+                // Bug M: safe u32 conversion — positions beyond u32::MAX
+                // cannot appear in a RoaringBitmap, so skip the DV check.
+                if let Ok(pos32) = u32::try_from(global_pos) {
+                    if dv.contains(pos32) {
+                        continue;
+                    }
                 }
             }
             if ikey.seq > read_seq {
