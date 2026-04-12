@@ -115,9 +115,13 @@ pub fn rows_to_record_batch(
         col_arrays.push(blob_col);
     }
 
-    // Typed user columns, in schema order.
+    // Typed user columns, in schema order. Non-nullable columns need
+    // type-appropriate defaults for tombstone rows whose `Row` is empty
+    // (Bug K: `Row::default()` produces zero fields, which `build_column`
+    // maps to `None` → Arrow NULL → rejected by `RecordBatch::try_new`
+    // when the column is declared non-nullable).
     for (col_idx, col_def) in schema.columns.iter().enumerate() {
-        let arr = build_column(rows, col_idx, &col_def.col_type)?;
+        let arr = build_column(rows, col_idx, &col_def.col_type, col_def.nullable)?;
         col_arrays.push(arr);
     }
 
@@ -125,6 +129,14 @@ pub fn rows_to_record_batch(
 }
 
 /// Build one Arrow column from the `col_idx`-th field of every row.
+///
+/// # Nullability
+///
+/// When `nullable` is `false` and a row's field at `col_idx` is absent
+/// (tombstone rows carry `Row::default()` with zero fields), the column
+/// emits a type-appropriate default value instead of NULL. This prevents
+/// Arrow from rejecting the batch for nulls in a non-nullable column
+/// (Bug K regression).
 ///
 /// # Type-mismatch policy
 ///
@@ -138,6 +150,7 @@ fn build_column(
     rows: &[(InternalKey, Row)],
     col_idx: usize,
     col_type: &ColumnType,
+    nullable: bool,
 ) -> Result<ArrayRef> {
     /// Shorthand for "type mismatch at row `i`, expected X, got Y".
     fn mismatch(col_idx: usize, row_idx: usize, expected: &str, got: &FieldValue) -> MeruError {
@@ -153,6 +166,7 @@ fn build_column(
             let mut vals: Vec<Option<bool>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(false)),
                     None => vals.push(None),
                     Some(FieldValue::Boolean(b)) => vals.push(Some(*b)),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Boolean", other)),
@@ -164,6 +178,7 @@ fn build_column(
             let mut vals: Vec<Option<i32>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(0)),
                     None => vals.push(None),
                     Some(FieldValue::Int32(i)) => vals.push(Some(*i)),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Int32", other)),
@@ -175,6 +190,7 @@ fn build_column(
             let mut vals: Vec<Option<i64>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(0)),
                     None => vals.push(None),
                     Some(FieldValue::Int64(i)) => vals.push(Some(*i)),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Int64", other)),
@@ -186,6 +202,7 @@ fn build_column(
             let mut vals: Vec<Option<f32>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(0.0)),
                     None => vals.push(None),
                     Some(FieldValue::Float(f)) => vals.push(Some(*f)),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Float", other)),
@@ -197,6 +214,7 @@ fn build_column(
             let mut vals: Vec<Option<f64>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(0.0)),
                     None => vals.push(None),
                     Some(FieldValue::Double(d)) => vals.push(Some(*d)),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Double", other)),
@@ -205,9 +223,12 @@ fn build_column(
             Ok(Arc::new(Float64Array::from(vals)))
         }
         ColumnType::ByteArray => {
+            // For non-nullable ByteArray, use a static empty sentinel.
+            static EMPTY: &[u8] = &[];
             let mut vals: Vec<Option<&[u8]>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(EMPTY)),
                     None => vals.push(None),
                     Some(FieldValue::Bytes(b)) => vals.push(Some(b.as_ref())),
                     Some(other) => return Err(mismatch(col_idx, row_idx, "Bytes", other)),
@@ -225,6 +246,7 @@ fn build_column(
             let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(rows.len());
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 match row.get(col_idx) {
+                    None if !nullable => vals.push(Some(vec![0u8; expected_len])),
                     None => vals.push(None),
                     Some(FieldValue::Bytes(b)) => {
                         if b.len() != expected_len {

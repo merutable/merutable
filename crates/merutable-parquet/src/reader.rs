@@ -11,11 +11,7 @@
 use std::sync::Arc;
 
 use merutable_types::{
-    key::InternalKey,
-    level::ParquetFileMeta,
-    schema::TableSchema,
-    sequence::{OpType, SeqNum},
-    value::Row,
+    key::InternalKey, level::ParquetFileMeta, schema::TableSchema, sequence::SeqNum, value::Row,
     MeruError, Result,
 };
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
@@ -253,6 +249,14 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
     }
 
     /// Scan rows in key order with optional range and DV filtering.
+    ///
+    /// Tombstone entries (`OpType::Delete`) are **included** in the output
+    /// so that the cross-file merge in `read_path::range_scan` can see
+    /// them and correctly shadow older Puts from other files (or the
+    /// memtable). Bug J: previously tombstones were dropped here, which
+    /// caused a Delete in one file to be silently lost while an older
+    /// Put from a different file survived the global dedup — resurrecting
+    /// deleted rows.
     pub fn scan(
         &self,
         start_user_key: Option<&[u8]>,
@@ -290,9 +294,8 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
                 }
             }
             last_uk = Some(uk);
-            if ikey.op_type == OpType::Delete {
-                continue;
-            }
+            // Tombstones are NOT dropped here — the caller handles them
+            // in the global cross-file merge. See Bug J.
             results.push((ikey, row));
         }
         Ok(results)
@@ -486,6 +489,7 @@ mod tests {
     use merutable_types::{
         level::Level,
         schema::{ColumnDef, ColumnType},
+        sequence::OpType,
         value::{FieldValue, Row},
     };
     fn test_schema() -> TableSchema {

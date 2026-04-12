@@ -365,3 +365,75 @@ async fn compaction_rewrites_l0_to_l1_and_reads_survive() {
         "scan should still find id=1 via L1"
     );
 }
+
+/// **Bug J regression**: tombstone flushed to a separate L0 file must hide
+/// the Put that lives in a different L0 file. Before the fix,
+/// `ParquetReader::scan()` silently dropped `OpType::Delete` entries before
+/// they reached the cross-file merge in `range_scan()`, so a Delete in file
+/// B was invisible and the old Put in file A resurrected.
+///
+/// The critical invariant: per-file scan must preserve tombstones so the
+/// global sort+dedup in `read_path::range_scan` can see them and suppress
+/// the corresponding Put from a different file.
+#[tokio::test]
+async fn bug_j_flushed_tombstone_hides_flushed_put_across_l0_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+
+    // File A: write key 99, flush.
+    engine
+        .put(vec![FieldValue::Int64(99)], make_row(99))
+        .await
+        .unwrap();
+    engine.flush().await.unwrap();
+
+    // File B: delete key 99, flush to a separate L0 file.
+    engine.delete(vec![FieldValue::Int64(99)]).await.unwrap();
+    engine.flush().await.unwrap();
+
+    // Point lookup must see the tombstone and return None.
+    let got = engine.get(&[FieldValue::Int64(99)]).unwrap();
+    assert!(
+        got.is_none(),
+        "Bug J: flushed tombstone in file B must mask flushed Put in file A; got {got:?}"
+    );
+
+    // Scan must also respect the cross-file tombstone.
+    let results = engine.scan(None, None).unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|(_, r)| !matches!(r.get(0), Some(FieldValue::Int64(99)))),
+        "Bug J: scan leaked a tombstoned key across L0 files"
+    );
+
+    // Broader scenario: interleave Puts and Deletes across multiple
+    // flushes to stress the cross-file merge.
+    for i in 200..=210i64 {
+        engine
+            .put(vec![FieldValue::Int64(i)], make_row(i))
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap(); // File C: keys 200..=210
+
+    // Delete even-numbered keys
+    for i in (200..=210i64).step_by(2) {
+        engine.delete(vec![FieldValue::Int64(i)]).await.unwrap();
+    }
+    engine.flush().await.unwrap(); // File D: tombstones for 200,202,...,210
+
+    let results = engine.scan(None, None).unwrap();
+    let ids: Vec<i64> = results
+        .iter()
+        .filter_map(|(_, r)| match r.get(0) {
+            Some(FieldValue::Int64(v)) if *v >= 200 && *v <= 210 => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![201, 203, 205, 207, 209],
+        "Bug J: even-numbered keys should be hidden by flushed tombstones"
+    );
+}
