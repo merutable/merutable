@@ -86,6 +86,23 @@ pub fn pick_compaction(version: &Version, config: &EngineConfig) -> Option<Compa
     })
 }
 
+/// Whether tombstones should be dropped when compacting to `output_level`.
+///
+/// Safe only when writing to the **true bottom level** — the level beyond
+/// all configured `level_target_bytes` entries, which the picker never
+/// triggers compaction from (so data accumulates there permanently).
+///
+/// With default config `level_target_bytes = [L1, L2, L3, L4]` (len=4),
+/// the bottom level is L5, so `should_drop_tombstones(Level(5), 4) = true`.
+///
+/// Bug I fixed an off-by-one (`>=` → `>`) that dropped tombstones one
+/// level too early, allowing deleted data to resurrect via a subsequent
+/// compaction to the real bottom level.
+#[inline]
+pub fn should_drop_tombstones(output_level: Level, num_configured_levels: usize) -> bool {
+    output_level.0 as usize > num_configured_levels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +168,36 @@ mod tests {
         assert_eq!(pick.input_level, Level(0));
         assert_eq!(pick.output_level, Level(1));
         assert_eq!(pick.input_files.len(), 5);
+    }
+
+    /// Bug I regression: tombstones must NOT be dropped when writing to a
+    /// level that has a configured size target (data can flow deeper).
+    /// They should only be dropped at the true bottom level (one beyond
+    /// all configured levels).
+    #[test]
+    fn tombstone_drop_only_at_true_bottom_level() {
+        // Default: 4 entries → L1..L4 have targets, L5 is bottom.
+        let n = 4;
+        // L0→L1 through L3→L4: MUST preserve tombstones.
+        for output in 1..=n {
+            assert!(
+                !should_drop_tombstones(Level(output as u8), n),
+                "output L{output} must NOT drop tombstones (L{n} still has a target)"
+            );
+        }
+        // L4→L5: safe to drop.
+        assert!(
+            should_drop_tombstones(Level((n + 1) as u8), n),
+            "output L{} must drop tombstones (true bottom level)",
+            n + 1
+        );
+
+        // Edge case: no configured levels → L0→L1 is the bottom.
+        assert!(!should_drop_tombstones(Level(0), 0));
+        assert!(should_drop_tombstones(Level(1), 0));
+
+        // Edge case: 1 level target → L2 is the bottom.
+        assert!(!should_drop_tombstones(Level(1), 1));
+        assert!(should_drop_tombstones(Level(2), 1));
     }
 }

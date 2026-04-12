@@ -194,7 +194,10 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
 
     // Build compaction iterator.
     let read_seq = engine.read_seq();
-    let drop_tombstones = pick.output_level.0 as usize >= engine.config.level_target_bytes.len();
+    let drop_tombstones = picker::should_drop_tombstones(
+        pick.output_level,
+        engine.config.level_target_bytes.len(),
+    );
     let iter = CompactionIterator::new(file_entries, read_seq, drop_tombstones);
 
     if iter.is_empty() {
