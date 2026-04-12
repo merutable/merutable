@@ -7,9 +7,8 @@
 //!   since our encoding puts higher seq first for the same PK).
 //! - Skips entries with `seq > read_seq`.
 //!
-//! The iterator does NOT expose `OpType::Delete` entries to the caller —
-//! the merge iterator layer (Phase 7) handles tombstone semantics.
-//! This iterator exposes them so the merge iterator can decide.
+//! The iterator DOES yield `OpType::Delete` entries (tombstones) so
+//! the merge layer and range-scan dedup can decide tombstone semantics.
 
 use bytes::Bytes;
 use merutable_types::sequence::SeqNum;

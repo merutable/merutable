@@ -30,10 +30,12 @@ pub struct ParquetFileMeta {
     pub seq_min: u64,
     /// Maximum sequence number of any row in this file.
     pub seq_max: u64,
-    /// Encoded InternalKey bytes of the smallest key in this file.
+    /// PK-encoded user key bytes (without the InternalKey tag) of the
+    /// smallest user key in this file. Used for file-level range gating.
     #[serde(with = "hex_bytes")]
     pub key_min: Vec<u8>,
-    /// Encoded InternalKey bytes of the largest key in this file.
+    /// PK-encoded user key bytes (without the InternalKey tag) of the
+    /// largest user key in this file.
     #[serde(with = "hex_bytes")]
     pub key_max: Vec<u8>,
     pub num_rows: u64,
