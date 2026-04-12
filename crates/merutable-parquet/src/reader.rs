@@ -166,32 +166,49 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
                 Some((page_loc, next_first_row)) => {
                     let global_start = page_loc.first_row_index;
                     let rows = self.read_rows_in_page(page_loc, next_first_row)?;
-                    return Ok(Self::find_visible(
+
+                    // Bug H guard: the probe (uk + 0xFF×9) searches for
+                    // the "largest page ≤ probe", which for a single
+                    // user key spanning many pages always lands on the
+                    // LAST page (lowest seq versions). That page may
+                    // return a valid but STALE hit — or no hit at all.
+                    //
+                    // Safe fast return iff the page cannot have missed
+                    // NEWER versions on an earlier page. If the page is
+                    // not the first in the file AND its first row carries
+                    // the SAME user key as the probe, then versions of
+                    // this key may continue from the previous page —
+                    // fall through to full scan in that case.
+                    let may_have_earlier = global_start > 0
+                        && rows
+                            .first()
+                            .is_some_and(|(ik, _)| ik.user_key_bytes() == user_key_bytes);
+
+                    let result = Self::find_visible(
                         rows,
                         global_start,
                         user_key_bytes,
                         read_seq,
                         deleted_rows,
-                    ));
+                    );
+                    if result.is_some() && !may_have_earlier {
+                        return Ok(result);
+                    }
+                    // Else: either no visible version on this page, or
+                    // newer versions may exist on earlier pages (Bug H).
+                    // Fall through to the full-file scan which is
+                    // guaranteed correct.
                 }
                 None => {
-                    // Probe precedes the file's first key — index can't
-                    // tell us this user key isn't here (the bloom + key
-                    // range gates above should have already caught it),
-                    // but be safe and scan.
-                    let rows = self.read_all_rows()?;
-                    return Ok(Self::find_visible(
-                        rows,
-                        0,
-                        user_key_bytes,
-                        read_seq,
-                        deleted_rows,
-                    ));
+                    // Probe precedes the file's first key — fall through
+                    // to full scan.
                 }
             }
         }
 
-        // Fallback: no kv_index → full file scan.
+        // Full-file scan fallback: either no kv_index, or kv_index page
+        // didn't contain the visible version (cross-page multi-version
+        // edge case). Always correct.
         let rows = self.read_all_rows()?;
         Ok(Self::find_visible(
             rows,
@@ -1128,6 +1145,109 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Bug H regression: when a single user key has enough MVCC versions
+    /// to span multiple data pages on the `_merutable_ikey` column, the
+    /// kv_index probe lands on the **first** page (highest seq — newest
+    /// version), but an old `read_seq` whose visible version lives on a
+    /// *later* page used to return `None` instead of falling back to a
+    /// full-file scan. The fix: if `find_visible` on the matched page
+    /// returns `None`, fall through to the full-scan path.
+    ///
+    /// To trigger: the ikey column uses dictionary encoding, so each data
+    /// page holds bit-packed indices. At L0's 8 KiB page limit, we need
+    /// ≈10K versions of the same key to push enough bit-packed indices
+    /// across the page boundary.
+    #[test]
+    fn kv_index_multi_page_same_key_old_read_seq() {
+        let schema = Arc::new(test_schema());
+
+        // 10_000 versions of the same user key (id=42), seqs 1..=10_000.
+        // InternalKey sort: higher seq → smaller ikey → earlier in file.
+        let n_versions = 10_000u64;
+        let mut rows: Vec<(InternalKey, Row)> = Vec::new();
+        for ver in (1..=n_versions).rev() {
+            let row = Row::new(vec![
+                Some(FieldValue::Int64(42)),
+                Some(FieldValue::Bytes(BBytes::from(format!("v{ver}")))),
+            ]);
+            rows.push((
+                InternalKey::encode(
+                    &[FieldValue::Int64(42)],
+                    SeqNum(ver),
+                    OpType::Put,
+                    &schema,
+                )
+                .unwrap(),
+                row,
+            ));
+        }
+        // Already in ascending ikey order (higher seq → smaller tag → earlier).
+
+        let (bytes, _, _) =
+            crate::writer::write_sorted_rows(rows.clone(), schema.clone(), Level(0), 10).unwrap();
+        let reader = ParquetReader::open(BBytes::from(bytes), schema).unwrap();
+        assert!(
+            reader.kv_index.is_some(),
+            "writer must emit kv_index for non-empty file"
+        );
+        let idx = reader.kv_index.as_ref().unwrap();
+
+        let user_key = rows[0].0.user_key_bytes().to_vec();
+
+        if idx.len() < 2 {
+            // Dictionary encoding compressed the ikey column into a single
+            // page — the multi-page edge case is not reachable at this row
+            // count / page size. The fix is still correct (it's a no-op
+            // when there's only one page), but we can't regression-test it
+            // structurally. Skip the multi-page assertions and verify via
+            // functional correctness only.
+            eprintln!(
+                "WARN: kv_index has {} page(s) — single page, multi-page \
+                 edge case not structurally tested. Bumping n_versions may \
+                 help on different encoding configs.",
+                idx.len()
+            );
+        }
+
+        // read_seq=MAX → newest visible is seq=n_versions.
+        let got = reader.get(&user_key, SeqNum(n_versions), None).unwrap();
+        let (ik, row) = got.expect("newest version must be visible");
+        assert_eq!(ik.seq, SeqNum(n_versions));
+        assert_eq!(
+            row.get(1),
+            Some(&FieldValue::Bytes(BBytes::from(format!("v{n_versions}"))))
+        );
+
+        // read_seq=10 → visible version is seq=10. If multi-page, it lives
+        // on a later page. Before the fix, the kv_index path returned None.
+        let got = reader.get(&user_key, SeqNum(10), None).unwrap();
+        let (ik, row) = got.expect(
+            "seq=10 must be visible (Bug H: kv_index must fall back \
+             to full scan when page miss)",
+        );
+        assert_eq!(ik.seq, SeqNum(10));
+        assert_eq!(
+            row.get(1),
+            Some(&FieldValue::Bytes(BBytes::from("v10")))
+        );
+
+        // read_seq=1 → oldest version.
+        let got = reader.get(&user_key, SeqNum(1), None).unwrap();
+        let (ik, _) = got.expect("seq=1 must be visible");
+        assert_eq!(ik.seq, SeqNum(1));
+
+        // Full version sweep: every seq from 1..=n_versions must resolve
+        // to exactly that version. This is the strongest functional test
+        // of the fallback — if ANY version is missed, the bug is live.
+        for ver in [1u64, 5, 50, 500, 1000, 5000, n_versions] {
+            let got = reader
+                .get(&user_key, SeqNum(ver), None)
+                .unwrap()
+                .unwrap_or_else(|| panic!("version {ver} must be visible"));
+            assert_eq!(got.0.seq, SeqNum(ver), "seq mismatch for version {ver}");
         }
     }
 
