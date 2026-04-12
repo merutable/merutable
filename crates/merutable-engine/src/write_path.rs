@@ -138,6 +138,10 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
             if engine.memtable.active_should_flush() {
                 let next_seq = engine.global_seq.current().next();
                 engine.memtable.rotate(next_seq);
+                {
+                    let mut wal = engine.wal.lock().await;
+                    wal.rotate()?;
+                }
                 let engine = Arc::clone(engine);
                 tokio::spawn(async move {
                     if let Err(e) = crate::flush::run_flush(&engine).await {

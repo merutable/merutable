@@ -10,7 +10,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use merutable_types::{sequence::SeqNum, MeruError, Result};
@@ -22,11 +25,26 @@ use crate::{
     writer::{FileSink, WalWriter},
 };
 
+/// A closed (rotated-out) WAL file that is a candidate for GC once its
+/// `max_seq` has been durably flushed to Parquet.
+#[derive(Debug, Clone, Copy)]
+struct ClosedLog {
+    log_number: u64,
+    max_seq: SeqNum,
+}
+
 pub struct WalManager {
     dir: PathBuf,
     current: WalWriter,
     log_number: u64,
     next_log: AtomicU64,
+    /// Max sequence number observed in the currently-open log. Tracked so
+    /// that on rotate we can remember "log N holds seqs up to M" and GC
+    /// the file once the engine confirms M has been flushed.
+    current_log_max_seq: AtomicU64,
+    /// FIFO of closed logs awaiting GC. Append-on-rotate, drain-on-flush
+    /// via `mark_flushed_seq`.
+    closed_logs: Mutex<Vec<ClosedLog>>,
     /// Max sequence number that has been durably flushed to Parquet.
     /// WAL files with `max_seq <= flushed_seq` are safe to delete.
     flushed_seq: AtomicU64,
@@ -46,20 +64,45 @@ impl WalManager {
             current: writer,
             log_number,
             next_log: AtomicU64::new(log_number + 1),
+            current_log_max_seq: AtomicU64::new(0),
+            closed_logs: Mutex::new(Vec::new()),
             flushed_seq: AtomicU64::new(0),
         })
     }
 
-    /// Append a `WriteBatch` to the current WAL and fsync.
+    /// Append a `WriteBatch` to the current WAL and fsync. Tracks the
+    /// highest sequence number observed in this log file so a later
+    /// `rotate()` can record (log, max_seq) as a GC candidate.
     pub fn append(&mut self, batch: &WriteBatch) -> Result<()> {
         let encoded = batch.encode();
         self.current.add_record(&encoded)?;
-        self.current.sync()
+        self.current.sync()?;
+        let last = batch.last_seq().0;
+        // fetch_max via CAS loop since AtomicU64 doesn't have fetch_max
+        // until Rust 1.45+ is confirmed; use compare_exchange_weak for
+        // portability with MSRV targets.
+        let mut cur = self.current_log_max_seq.load(Ordering::Relaxed);
+        while last > cur {
+            match self.current_log_max_seq.compare_exchange_weak(
+                cur,
+                last,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
+        Ok(())
     }
 
     /// Rotate: close the current WAL and open a new one.
     /// Returns the log number of the file that was closed (the caller
     /// associates it with the immutable memtable that needs flushing).
+    /// The closed log is pushed onto the internal GC candidate list along
+    /// with the max sequence number observed in it — a subsequent
+    /// `mark_flushed_seq` will delete the file once that seq is durably
+    /// flushed.
     pub fn rotate(&mut self) -> Result<u64> {
         let old_log = self.log_number;
         let new_log = self.next_log.fetch_add(1, Ordering::Relaxed);
@@ -71,11 +114,29 @@ impl WalManager {
         let sink = FileSink::create(&path)?;
         self.current = WalWriter::new(Box::new(sink), new_log, false);
         self.log_number = new_log;
+
+        // Snapshot and reset the per-log max_seq counter. A log that never
+        // received any writes is still a real file on disk and should be
+        // GC'd eventually — record it with max_seq = 0, which will be
+        // GC'd at the first `mark_flushed_seq` since the flushed seq is
+        // always ≥ 0.
+        let old_max = SeqNum(self.current_log_max_seq.swap(0, Ordering::AcqRel));
+        let mut closed = self.closed_logs.lock().unwrap();
+        closed.push(ClosedLog {
+            log_number: old_log,
+            max_seq: old_max,
+        });
+        drop(closed);
+
         Ok(old_log)
     }
 
-    /// Mark that all sequences up to (and including) `seq` have been persisted
-    /// to Parquet. This allows GC of WAL files whose `max_seq <= seq`.
+    /// Mark that all sequences up to (and including) `seq` have been
+    /// persisted to Parquet. Bumps the flushed high-water mark AND
+    /// immediately GCs any closed WAL files whose `max_seq <= seq` — this
+    /// is the only place WAL GC happens. Before Bug D was fixed the
+    /// matching `gc_logs_before` was defined but never called by the
+    /// engine, so the WAL directory grew without bound.
     pub fn mark_flushed_seq(&self, seq: SeqNum) {
         let mut current = self.flushed_seq.load(Ordering::Acquire);
         loop {
@@ -90,6 +151,38 @@ impl WalManager {
             ) {
                 Ok(_) => break,
                 Err(now) => current = now,
+            }
+        }
+
+        // GC any closed log whose contents are now durable.
+        let flushed_seq = seq.0;
+        let mut closed = self.closed_logs.lock().unwrap();
+        let (to_delete, keep): (Vec<ClosedLog>, Vec<ClosedLog>) =
+            closed.drain(..).partition(|c| c.max_seq.0 <= flushed_seq);
+        *closed = keep;
+        drop(closed);
+
+        for entry in to_delete {
+            let path = log_path(&self.dir, entry.log_number);
+            debug!(
+                log = entry.log_number,
+                max_seq = entry.max_seq.0,
+                path = %path.display(),
+                "GC WAL file"
+            );
+            if let Err(e) = std::fs::remove_file(&path) {
+                // Treat "not found" as success — the file was already
+                // removed (possibly by a prior flush). Log the real errors
+                // at warn level; we don't fail the flush over a GC miss.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        log = entry.log_number,
+                        error = %e,
+                        "failed to GC WAL file; will retry on next flush"
+                    );
+                    // Re-queue so a later flush can retry.
+                    self.closed_logs.lock().unwrap().push(entry);
+                }
             }
         }
     }

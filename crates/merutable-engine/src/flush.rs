@@ -28,7 +28,14 @@ use tracing::{debug, info};
 use crate::engine::MeruEngine;
 
 /// Run one flush job: takes the oldest immutable memtable and writes it to L0.
+///
+/// Serialized by `engine.flush_mutex` so that two concurrently-spawned
+/// auto-flush tasks don't both observe the same `oldest_immutable()`,
+/// double-flush it to two L0 Parquet files with identical data, and
+/// double-commit competing Iceberg snapshots (Bug G regression).
 pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
+    let _flush_guard = engine.flush_mutex.lock().await;
+
     let immutable = match engine.memtable.oldest_immutable() {
         Some(m) => m,
         None => return Ok(()), // nothing to flush

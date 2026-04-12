@@ -34,6 +34,11 @@ pub struct MeruEngine {
     /// (b) race and seal empty memtables. The fix is `try_lock` + double
     /// check under the lock: the loser drops through, the winner rotates.
     pub(crate) rotation_lock: Mutex<()>,
+    /// Serializes `run_flush` so two concurrently-spawned auto-flush tasks
+    /// don't both call `oldest_immutable()`, see the same sealed memtable,
+    /// and write two L0 Parquet files containing identical rows (followed
+    /// by two competing catalog commits). Bug G regression.
+    pub(crate) flush_mutex: Mutex<()>,
 }
 
 impl MeruEngine {
@@ -103,6 +108,7 @@ impl MeruEngine {
             version_set,
             catalog,
             rotation_lock: Mutex::new(()),
+            flush_mutex: Mutex::new(()),
         });
 
         Ok(engine)
@@ -180,6 +186,12 @@ impl MeruEngine {
                 if self.memtable.active_should_flush() {
                     let next_seq = self.global_seq.current().next();
                     self.memtable.rotate(next_seq);
+                    // Rotate the WAL as well so the sealed memtable's
+                    // writes live in a closed log that GC can reclaim.
+                    {
+                        let mut wal = self.wal.lock().await;
+                        wal.rotate()?;
+                    }
                     let engine = Arc::clone(self);
                     tokio::spawn(async move {
                         if let Err(e) = crate::flush::run_flush(&engine).await {
@@ -215,10 +227,20 @@ impl MeruEngine {
 
     /// Force flush all immutable memtables and the active memtable.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
-        // Rotate active to immutable.
+        // Rotate active memtable AND the WAL together so that (a) the
+        // sealed memtable's writes live in a closed WAL file that can be
+        // GC'd once the flush commits, and (b) new writes after this call
+        // land in a fresh WAL file. Bug D regression: before this, the WAL
+        // never rotated under any flush path, so the log directory grew
+        // without bound and recovery replayed already-flushed batches.
         let next_seq = self.global_seq.current().next();
         self.memtable.rotate(next_seq);
-        // Flush all immutables.
+        {
+            let mut wal = self.wal.lock().await;
+            wal.rotate()?;
+        }
+        // Flush all immutables. `run_flush` calls `mark_flushed_seq` which
+        // GCs the matching closed WAL file as a side effect.
         while self.memtable.oldest_immutable().is_some() {
             crate::flush::run_flush(self).await?;
         }
