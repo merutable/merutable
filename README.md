@@ -61,8 +61,8 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 The LSM tree uses level-aware Parquet tuning to serve both OLTP and OLAP workloads:
 
-| Level | Row group | Page size | Encoding | Use case |
-|-------|-----------|-----------|----------|----------|
+| Level | Row group | Page size | Encoding | Tuning biased for |
+|-------|-----------|-----------|----------|-------------------|
 | L0 | 4 MiB | 8 KiB | PLAIN (all columns) | Rowstore — point lookups, memtable flush |
 | L1 | 32 MiB | 32 KiB | Per-column (see below) | Warm — transitional |
 | L2+ | 128 MiB | 128 KiB | Per-column (see below) | Columnstore — analytics scans |
