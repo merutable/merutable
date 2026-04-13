@@ -30,6 +30,7 @@ use std::{
 
 use merutable_types::{level::Level, schema::TableSchema, MeruError, Result};
 use tokio::sync::Mutex;
+use tracing::{debug, info};
 
 use crate::{
     deletion_vector::DeletionVector,
@@ -85,6 +86,7 @@ impl IcebergCatalog {
             (Manifest::empty(schema), 1)
         };
 
+        info!(base_path = %base.display(), "catalog opened");
         Ok(Self {
             base_path: base,
             current: Mutex::new(manifest),
@@ -109,6 +111,7 @@ impl IcebergCatalog {
         let mut next_ver = self.next_version.lock().await;
 
         let new_snapshot_id = *next_ver;
+        debug!(snapshot_id = new_snapshot_id, "committing snapshot");
 
         // Upload puffin files for DV updates AND record their real
         // on-storage blob coordinates so the manifest can point at the
@@ -282,6 +285,37 @@ impl IcebergCatalog {
         // Update in-memory state.
         *current = new_manifest;
         *next_ver = new_snapshot_id + 1;
+
+        Ok(version)
+    }
+
+    /// Re-read the current manifest from disk. Used by read-only replicas
+    /// to pick up new snapshots written by the primary.
+    ///
+    /// Reads `version-hint.text` -> loads the corresponding `v{N}.metadata.json`
+    /// -> updates the in-memory manifest. Returns the new `Version`.
+    pub async fn refresh(&self, schema: Arc<TableSchema>) -> Result<Version> {
+        let hint_path = self.base_path.join("version-hint.text");
+        let hint = tokio::fs::read_to_string(&hint_path)
+            .await
+            .map_err(MeruError::Io)?;
+        let ver: i64 = hint
+            .trim()
+            .parse()
+            .map_err(|_| MeruError::Corruption("bad version-hint on refresh".into()))?;
+
+        let meta_path = self
+            .base_path
+            .join("metadata")
+            .join(format!("v{ver}.metadata.json"));
+        let data = tokio::fs::read(&meta_path).await.map_err(MeruError::Io)?;
+        let manifest = Manifest::from_json(&data)?;
+        let version = manifest.to_version(schema);
+
+        let mut current = self.current.lock().await;
+        *current = manifest;
+        let mut next_ver = self.next_version.lock().await;
+        *next_ver = ver + 1;
 
         Ok(version)
     }

@@ -14,7 +14,7 @@ use merutable_types::{
 };
 use merutable_wal::{batch::WriteBatch, manager::WalManager};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::config::EngineConfig;
 
@@ -45,6 +45,10 @@ pub struct MeruEngine {
     /// files at the output level, and commit competing snapshots —
     /// producing duplicate rows visible to readers.
     pub(crate) compaction_mutex: Mutex<()>,
+    /// Row-level LRU cache for point lookups. `None` if disabled (capacity=0).
+    pub(crate) row_cache: Option<crate::cache::RowCache>,
+    /// True if opened in read-only mode. Write ops will return `MeruError::ReadOnly`.
+    pub(crate) read_only: bool,
 }
 
 impl MeruEngine {
@@ -54,6 +58,7 @@ impl MeruEngine {
     /// 2. Replay recovered batches into a fresh memtable.
     /// 3. Open Iceberg catalog and load current version.
     /// 4. Initialize global seq to `max(wal_max_seq, iceberg_max_seq) + 1`.
+    #[instrument(skip(config), fields(table = %config.schema.table_name))]
     pub async fn open(config: EngineConfig) -> Result<Arc<Self>> {
         // Bug SC2 fix: validate the schema upfront so misconfigured schemas
         // (out-of-bounds PK indices, nullable PKs, empty columns) produce a
@@ -62,12 +67,19 @@ impl MeruEngine {
 
         let schema = Arc::new(config.schema.clone());
 
-        // WAL recovery.
+        let read_only = config.read_only;
+
+        // WAL recovery — in read-only mode, skip if WAL dir doesn't exist.
         let (recovered_batches, wal_max_seq, max_log_number) =
-            WalManager::recover_from_dir(&config.wal_dir)?;
+            if read_only && !config.wal_dir.exists() {
+                (Vec::new(), SeqNum(0), 0u64)
+            } else {
+                WalManager::recover_from_dir(&config.wal_dir)?
+            };
         info!(
             recovered = recovered_batches.len(),
             wal_max_seq = wal_max_seq.0,
+            read_only,
             "WAL recovery complete"
         );
 
@@ -113,7 +125,18 @@ impl MeruEngine {
         // the new WAL file to collide with (and truncate) an existing file.
         // A second crash before flush would then lose the overwritten data.
         let next_log = max_log_number + 1;
+        // In read-only mode, ensure WAL dir exists for WalManager::open
+        // (it won't be used since write ops are guarded).
+        if read_only {
+            std::fs::create_dir_all(&config.wal_dir).map_err(MeruError::Io)?;
+        }
         let wal = WalManager::open(&config.wal_dir, next_log)?;
+
+        let row_cache = if config.row_cache_capacity > 0 {
+            Some(crate::cache::RowCache::new(config.row_cache_capacity))
+        } else {
+            None
+        };
 
         let engine = Arc::new(Self {
             config,
@@ -126,6 +149,8 @@ impl MeruEngine {
             rotation_lock: Mutex::new(()),
             flush_mutex: Mutex::new(()),
             compaction_mutex: Mutex::new(()),
+            row_cache,
+            read_only,
         });
 
         Ok(engine)
@@ -135,15 +160,24 @@ impl MeruEngine {
 
     /// Insert a row. `pk_values` are the primary key fields; `row` is the full
     /// row (including PK columns).
+    #[instrument(skip(self, row), fields(op = "put"))]
     pub async fn put(self: &Arc<Self>, pk_values: Vec<FieldValue>, row: Row) -> Result<SeqNum> {
+        if self.read_only {
+            return Err(MeruError::ReadOnly);
+        }
         self.write_internal(pk_values, Some(row), OpType::Put).await
     }
 
     /// Delete by primary key.
+    #[instrument(skip(self), fields(op = "delete"))]
     pub async fn delete(self: &Arc<Self>, pk_values: Vec<FieldValue>) -> Result<SeqNum> {
+        if self.read_only {
+            return Err(MeruError::ReadOnly);
+        }
         self.write_internal(pk_values, None, OpType::Delete).await
     }
 
+    #[instrument(skip(self, pk_values, row), fields(op_type = ?op_type))]
     async fn write_internal(
         self: &Arc<Self>,
         pk_values: Vec<FieldValue>,
@@ -186,6 +220,9 @@ impl MeruEngine {
             }
             None => None,
         };
+        // Keep a copy for cache invalidation before moving into the batch.
+        let user_key_for_cache = user_key_bytes.clone();
+
         match op_type {
             OpType::Put => batch.put(
                 bytes::Bytes::from(user_key_bytes),
@@ -202,6 +239,11 @@ impl MeruEngine {
 
         // Apply to memtable.
         let should_flush = self.memtable.apply_batch(&batch)?;
+
+        // Invalidate row cache so post-flush reads don't serve stale data.
+        if let Some(ref cache) = self.row_cache {
+            cache.invalidate(&user_key_for_cache);
+        }
 
         // Trigger flush if threshold crossed. The flush requires a rotate
         // (active → immutable) so that `run_flush` has something to find in
@@ -241,6 +283,7 @@ impl MeruEngine {
     // ── Read path ────────────────────────────────────────────────────────
 
     /// Point lookup by primary key. Returns the row if found (not deleted).
+    #[instrument(skip(self), fields(op = "get"))]
     pub fn get(&self, pk_values: &[FieldValue]) -> Result<Option<Row>> {
         crate::read_path::point_lookup(self, pk_values)
     }
@@ -248,6 +291,7 @@ impl MeruEngine {
     /// Range scan. Returns rows in PK order where `start_pk <= pk < end_pk`.
     /// If `start_pk` is `None`, scan from the beginning.
     /// If `end_pk` is `None`, scan to the end.
+    #[instrument(skip(self), fields(op = "scan"))]
     pub fn scan(
         &self,
         start_pk: Option<&[FieldValue]>,
@@ -259,7 +303,11 @@ impl MeruEngine {
     // ── Admin ────────────────────────────────────────────────────────────
 
     /// Force flush all immutable memtables and the active memtable.
+    #[instrument(skip(self), fields(op = "flush"))]
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
+        if self.read_only {
+            return Err(MeruError::ReadOnly);
+        }
         // Bug R fix: hold `rotation_lock` while rotating so a concurrent
         // auto-flush task from `write_internal` doesn't race on `rotate()`
         // and seal an empty (freshly-created) memtable.
@@ -287,7 +335,11 @@ impl MeruEngine {
     }
 
     /// Trigger a manual compaction. Picks the best level and runs one job.
+    #[instrument(skip(self), fields(op = "compact"))]
     pub async fn compact(self: &Arc<Self>) -> Result<()> {
+        if self.read_only {
+            return Err(MeruError::ReadOnly);
+        }
         crate::compaction::job::run_compaction(self).await
     }
 
@@ -303,6 +355,15 @@ impl MeruEngine {
     /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()
+    }
+
+    /// Re-read the Iceberg manifest from disk and install a new version.
+    /// Used by read-only replicas to pick up snapshots written by the primary.
+    pub async fn refresh(&self) -> Result<()> {
+        let new_version = self.catalog.refresh(self.schema.clone()).await?;
+        self.version_set.install(new_version);
+        info!("version refreshed from disk");
+        Ok(())
     }
 
     /// Snapshot of engine statistics. Lock-free on the version side (ArcSwap),
@@ -345,11 +406,27 @@ impl MeruEngine {
             immutable_count: self.memtable.immutable_count(),
         };
 
+        let cache = match &self.row_cache {
+            Some(c) => crate::stats::CacheStats {
+                capacity: c.cap(),
+                size: c.len(),
+                hit_count: c.hit_count(),
+                miss_count: c.miss_count(),
+            },
+            None => crate::stats::CacheStats {
+                capacity: 0,
+                size: 0,
+                hit_count: 0,
+                miss_count: 0,
+            },
+        };
+
         crate::stats::EngineStats {
             snapshot_id: version.snapshot_id,
             current_seq: self.global_seq.current().0,
             levels,
             memtable,
+            cache,
         }
     }
 }

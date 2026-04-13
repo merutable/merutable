@@ -35,6 +35,7 @@ use merutable_types::{
     MeruError, Result,
 };
 use roaring::RoaringBitmap;
+use tracing::{debug, instrument, trace};
 
 use crate::engine::MeruEngine;
 
@@ -89,6 +90,7 @@ fn open_file(
 // ── Point lookup ─────────────────────────────────────────────────────────────
 
 /// 3-stop point lookup: memtable → L0 → L1..LN.
+#[instrument(skip(engine), fields(op = "point_lookup"))]
 pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Option<Row>> {
     let read_seq = engine.read_seq();
 
@@ -107,7 +109,19 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         } else {
             serde_json::from_slice(&entry.value).unwrap_or_default()
         };
+        trace!(source = "memtable", "cache hit");
         return Ok(Some(row));
+    }
+
+    // Stop 1.5: Row cache (between memtable and file I/O).
+    if let Some(ref cache) = engine.row_cache {
+        if let Some(entry) = cache.get(&user_key_bytes) {
+            if entry.op_type == OpType::Delete {
+                return Ok(None);
+            }
+            trace!(source = "row_cache", "cache hit");
+            return Ok(Some(entry.row));
+        }
     }
 
     let version = engine.version_set.current();
@@ -122,9 +136,20 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         }
         let (reader, dv) = open_file(base, file, engine.schema.clone())?;
         if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
+            // Populate cache before returning.
+            if let Some(ref cache) = engine.row_cache {
+                cache.insert(
+                    user_key_bytes.clone(),
+                    crate::cache::CacheEntry {
+                        op_type: hit_ikey.op_type,
+                        row: row.clone(),
+                    },
+                );
+            }
             if hit_ikey.op_type == OpType::Delete {
                 return Ok(None);
             }
+            debug!(source = "L0", file = %file.path, "point lookup hit");
             return Ok(Some(row));
         }
     }
@@ -138,13 +163,25 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         };
         let (reader, dv) = open_file(base, file, engine.schema.clone())?;
         if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
+            // Populate cache before returning.
+            if let Some(ref cache) = engine.row_cache {
+                cache.insert(
+                    user_key_bytes.clone(),
+                    crate::cache::CacheEntry {
+                        op_type: hit_ikey.op_type,
+                        row: row.clone(),
+                    },
+                );
+            }
             if hit_ikey.op_type == OpType::Delete {
                 return Ok(None);
             }
+            debug!(source = %format!("L{}", lvl), file = %file.path, "point lookup hit");
             return Ok(Some(row));
         }
     }
 
+    trace!("point lookup miss");
     Ok(None)
 }
 
@@ -162,6 +199,7 @@ fn range_contains(key_min: &[u8], key_max: &[u8], probe: &[u8]) -> bool {
 
 /// Range scan with K-way merge across memtables and every live Parquet file.
 /// Dedups by `user_key`, drops tombstones, and honors Deletion Vectors.
+#[instrument(skip(engine), fields(op = "range_scan"))]
 pub fn range_scan(
     engine: &MeruEngine,
     start_pk: Option<&[FieldValue]>,
@@ -285,5 +323,6 @@ pub fn range_scan(
         results.push((ikey, row));
     }
 
+    debug!(result_count = results.len(), "range scan complete");
     Ok(results)
 }

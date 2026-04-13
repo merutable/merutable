@@ -14,4 +14,4 @@ pub use merutable_types::schema;
 pub use merutable_types::value;
 
 // Re-export stats types for introspection.
-pub use merutable_engine::{EngineStats, FileStats, LevelStats, MemtableStats};
+pub use merutable_engine::{CacheStats, EngineStats, FileStats, LevelStats, MemtableStats};

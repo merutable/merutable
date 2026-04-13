@@ -23,7 +23,7 @@ use merutable_types::{
     value::Row,
     MeruError, Result,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 use crate::engine::MeruEngine;
 
@@ -33,6 +33,7 @@ use crate::engine::MeruEngine;
 /// auto-flush tasks don't both observe the same `oldest_immutable()`,
 /// double-flush it to two L0 Parquet files with identical data, and
 /// double-commit competing Iceberg snapshots (Bug G regression).
+#[instrument(skip(engine), fields(op = "flush"))]
 pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     let _flush_guard = engine.flush_mutex.lock().await;
 

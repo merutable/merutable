@@ -8,6 +8,8 @@ pub struct OpenOptions {
     pub object_store_url: String,
     pub wal_dir: PathBuf,
     pub memtable_size_mb: usize,
+    pub row_cache_capacity: usize,
+    pub read_only: bool,
 }
 
 impl OpenOptions {
@@ -18,6 +20,8 @@ impl OpenOptions {
             object_store_url: String::new(),
             wal_dir: PathBuf::from("./meru-wal"),
             memtable_size_mb: 64,
+            row_cache_capacity: 10_000,
+            read_only: false,
         }
     }
 
@@ -38,6 +42,16 @@ impl OpenOptions {
 
     pub fn memtable_size_mb(mut self, mb: usize) -> Self {
         self.memtable_size_mb = mb;
+        self
+    }
+
+    pub fn row_cache_capacity(mut self, capacity: usize) -> Self {
+        self.row_cache_capacity = capacity;
+        self
+    }
+
+    pub fn read_only(mut self, enabled: bool) -> Self {
+        self.read_only = enabled;
         self
     }
 }

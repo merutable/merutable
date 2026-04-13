@@ -17,7 +17,7 @@ use std::{
 };
 
 use merutable_types::{sequence::SeqNum, MeruError, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     batch::WriteBatch,
@@ -74,6 +74,11 @@ impl WalManager {
     /// highest sequence number observed in this log file so a later
     /// `rotate()` can record (log, max_seq) as a GC candidate.
     pub fn append(&mut self, batch: &WriteBatch) -> Result<()> {
+        trace!(
+            seq = batch.sequence.0,
+            records = batch.records.len(),
+            "WAL append"
+        );
         let encoded = batch.encode();
         self.current.add_record(&encoded)?;
         self.current.sync()?;
@@ -138,6 +143,7 @@ impl WalManager {
     /// matching `gc_logs_before` was defined but never called by the
     /// engine, so the WAL directory grew without bound.
     pub fn mark_flushed_seq(&self, seq: SeqNum) {
+        debug!(seq = seq.0, "WAL mark flushed");
         let mut current = self.flushed_seq.load(Ordering::Acquire);
         loop {
             if seq.0 <= current {

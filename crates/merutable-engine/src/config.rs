@@ -16,6 +16,10 @@ pub struct EngineConfig {
     /// Max number of immutable memtables before write stall. Default: 4.
     pub max_immutable_count: usize,
 
+    // Row cache
+    /// Row cache capacity (number of rows). 0 = disabled. Default: 10_000.
+    pub row_cache_capacity: usize,
+
     // Compaction
     /// Target bytes per level for L1..LN. Index 0 = L1 target.
     /// Default: [256 MiB, 2 GiB, 16 GiB, 128 GiB].
@@ -38,6 +42,9 @@ pub struct EngineConfig {
     // Background parallelism
     pub flush_parallelism: usize,
     pub compaction_parallelism: usize,
+
+    /// Open in read-only mode. No WAL, no memtable writes. Default: false.
+    pub read_only: bool,
 }
 
 impl Default for EngineConfig {
@@ -53,6 +60,7 @@ impl Default for EngineConfig {
             wal_dir: PathBuf::from("./meru-wal"),
             memtable_size_bytes: 64 * 1024 * 1024,
             max_immutable_count: 4,
+            row_cache_capacity: 10_000,
             level_target_bytes: vec![
                 256 * 1024 * 1024,
                 2 * 1024 * 1024 * 1024,
@@ -66,6 +74,7 @@ impl Default for EngineConfig {
             max_compaction_bytes: 256 * 1024 * 1024,
             flush_parallelism: 1,
             compaction_parallelism: 2,
+            read_only: false,
         }
     }
 }

@@ -1,4 +1,5 @@
 pub mod background;
+pub mod cache;
 pub mod compaction;
 pub mod config;
 pub mod engine;
@@ -9,4 +10,4 @@ pub mod write_path;
 
 pub use config::EngineConfig;
 pub use engine::MeruEngine;
-pub use stats::{EngineStats, FileStats, LevelStats, MemtableStats};
+pub use stats::{CacheStats, EngineStats, FileStats, LevelStats, MemtableStats};

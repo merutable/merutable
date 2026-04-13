@@ -59,12 +59,22 @@ impl MeruDB {
             object_store_prefix: options.catalog_uri.clone(),
             wal_dir: options.wal_dir.clone(),
             memtable_size_bytes: options.memtable_size_mb * 1024 * 1024,
+            row_cache_capacity: options.row_cache_capacity,
+            read_only: options.read_only,
             ..EngineConfig::default()
         };
 
         let engine = MeruEngine::open(config).await?;
 
         Ok(Self { engine })
+    }
+
+    /// Open a read-only replica. No WAL, no writes. Call `refresh()` to
+    /// pick up new snapshots from the primary.
+    pub async fn open_read_only(options: OpenOptions) -> Result<Self> {
+        let mut opts = options;
+        opts.read_only = true;
+        Self::open(opts).await
     }
 
     /// Insert or update a row. PK is extracted from the row.
@@ -133,6 +143,12 @@ impl MeruDB {
     /// Catalog base directory path (for HTAP file access).
     pub fn catalog_path(&self) -> String {
         self.engine.catalog_path()
+    }
+
+    /// Re-read the Iceberg manifest from disk. Only meaningful for
+    /// read-only replicas; on a read-write instance this is a no-op.
+    pub async fn refresh(&self) -> Result<()> {
+        self.engine.refresh().await
     }
 }
 
@@ -330,5 +346,62 @@ mod tests {
 
         let found = db.get(&[FieldValue::Int64(1)]).unwrap().unwrap();
         assert!(found.get(1).is_none()); // name column is NULL
+    }
+
+    #[tokio::test]
+    async fn read_only_blocks_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write some data with a read-write instance first.
+        {
+            let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+            db.put(make_row(1, "alice")).await.unwrap();
+            db.flush().await.unwrap();
+        }
+
+        // Open read-only.
+        let ro_opts = test_options(&tmp).read_only(true);
+        let db = MeruDB::open(ro_opts).await.unwrap();
+
+        // Reads should work.
+        let row = db.get(&[FieldValue::Int64(1)]).unwrap();
+        assert!(row.is_some());
+
+        // Writes should fail.
+        let err = db.put(make_row(2, "bob")).await;
+        assert!(err.is_err());
+
+        // Scan should work.
+        let results = db.scan(None, None).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write and flush with read-write instance.
+        let rw_db = MeruDB::open(test_options(&tmp)).await.unwrap();
+        rw_db.put(make_row(1, "alice")).await.unwrap();
+        rw_db.flush().await.unwrap();
+
+        // Open read-only replica.
+        let ro_opts = test_options(&tmp).read_only(true);
+        let ro_db = MeruDB::open(ro_opts).await.unwrap();
+        let row = ro_db.get(&[FieldValue::Int64(1)]).unwrap();
+        assert!(row.is_some());
+
+        // Write more data with the primary.
+        rw_db.put(make_row(2, "bob")).await.unwrap();
+        rw_db.flush().await.unwrap();
+
+        // Before refresh, replica doesn't see key 2 (it's only in the new snapshot).
+        // After refresh, it should.
+        ro_db.refresh().await.unwrap();
+        let row2 = ro_db.get(&[FieldValue::Int64(2)]).unwrap();
+        assert!(
+            row2.is_some(),
+            "read-only replica should see key 2 after refresh"
+        );
     }
 }

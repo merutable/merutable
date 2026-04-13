@@ -21,7 +21,7 @@ use merutable_iceberg::{
 use merutable_parquet::reader::ParquetReader;
 use merutable_types::{level::ParquetFileMeta, schema::TableSchema, MeruError, Result};
 use roaring::RoaringBitmap;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 use crate::{
     compaction::{
@@ -112,6 +112,7 @@ fn compute_union_range(files: &[DataFileMeta]) -> (Option<Vec<u8>>, Option<Vec<u
 /// Bug T fix: serialized by `engine.compaction_mutex` so two background
 /// workers don't both pick the same level, read the same files, and write
 /// duplicate output to the output level.
+#[instrument(skip(engine), fields(op = "compaction"))]
 pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     let _compaction_guard = engine.compaction_mutex.lock().await;
 

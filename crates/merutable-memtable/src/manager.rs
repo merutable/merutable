@@ -21,6 +21,7 @@ use std::{
 
 use merutable_types::{sequence::SeqNum, Result};
 use merutable_wal::batch::WriteBatch;
+use tracing::debug;
 
 use crate::{iterator::MemEntry, memtable::Memtable, skiplist::EntryValue};
 
@@ -70,6 +71,7 @@ impl MemtableManager {
     /// new active memtable starting at `new_first_seq`.
     /// Returns the sealed (now-immutable) memtable for the flush job.
     pub fn rotate(&self, new_first_seq: SeqNum) -> Arc<Memtable> {
+        debug!(new_first_seq = new_first_seq.0, "rotating memtable");
         let mut set = self.inner.write().unwrap();
         set.active.seal();
         let sealed = set.active.clone();
@@ -85,6 +87,7 @@ impl MemtableManager {
     /// Remove the oldest immutable memtable after its flush job succeeds.
     /// Notifies stalled writers.
     pub fn drop_flushed(&self, first_seq: SeqNum) {
+        debug!(first_seq = first_seq.0, "dropping flushed memtable");
         let mut set = self.inner.write().unwrap();
         set.immutable.retain(|m| m.first_seq != first_seq);
         // Wake any writer that was stalled waiting for immutable queue space.

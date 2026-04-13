@@ -31,6 +31,9 @@ pub enum MeruError {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error("operation not permitted: database is read-only")]
+    ReadOnly,
 }
 
 pub type Result<T> = std::result::Result<T, MeruError>;

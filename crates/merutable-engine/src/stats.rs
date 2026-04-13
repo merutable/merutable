@@ -33,6 +33,15 @@ pub struct MemtableStats {
     pub immutable_count: usize,
 }
 
+/// Row cache statistics.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub capacity: usize,
+    pub size: usize,
+    pub hit_count: u64,
+    pub miss_count: u64,
+}
+
 /// Top-level engine statistics snapshot.
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -40,4 +49,5 @@ pub struct EngineStats {
     pub current_seq: u64,
     pub levels: Vec<LevelStats>,
     pub memtable: MemtableStats,
+    pub cache: CacheStats,
 }

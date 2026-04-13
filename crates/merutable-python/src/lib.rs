@@ -52,13 +52,14 @@ impl PyMeruDB {
     ///     primary_key: List of PK column names. Defaults to [first column].
     ///     memtable_size_mb: Memtable flush threshold in MiB. Default 64.
     #[new]
-    #[pyo3(signature = (path, table_name, columns, primary_key=None, memtable_size_mb=64))]
+    #[pyo3(signature = (path, table_name, columns, primary_key=None, memtable_size_mb=64, read_only=false))]
     fn new(
         path: &str,
         table_name: &str,
         columns: Vec<(String, String, bool)>,
         primary_key: Option<Vec<String>>,
         memtable_size_mb: usize,
+        read_only: bool,
     ) -> PyResult<Self> {
         let col_defs: Vec<ColumnDef> = columns
             .iter()
@@ -115,7 +116,8 @@ impl PyMeruDB {
         let options = ::merutable::OpenOptions::new((*schema).clone())
             .catalog_uri(path)
             .wal_dir(wal_dir)
-            .memtable_size_mb(memtable_size_mb);
+            .memtable_size_mb(memtable_size_mb)
+            .read_only(read_only);
 
         let inner = runtime
             .block_on(async { RustMeruDB::open(options).await })
@@ -289,7 +291,23 @@ impl PyMeruDB {
         }
         dict.set_item("levels", &levels_list)?;
 
+        // Cache.
+        let cache_dict = PyDict::new_bound(py);
+        cache_dict.set_item("capacity", s.cache.capacity)?;
+        cache_dict.set_item("size", s.cache.size)?;
+        cache_dict.set_item("hit_count", s.cache.hit_count)?;
+        cache_dict.set_item("miss_count", s.cache.miss_count)?;
+        dict.set_item("cache", &cache_dict)?;
+
         Ok(dict.unbind().into())
+    }
+
+    /// Re-read Iceberg manifest from disk. For read-only replicas.
+    fn refresh(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        let rt = Arc::clone(&self.runtime);
+        py.allow_threads(move || rt.block_on(async { inner.refresh().await }))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
     /// Catalog base directory path. Point DuckDB at `{catalog_path}/data/L1/*.parquet`.

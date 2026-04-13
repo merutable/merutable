@@ -14,6 +14,7 @@ use merutable_types::{
     Result,
 };
 use merutable_wal::batch::WriteBatch;
+use tracing::{debug, instrument};
 
 use crate::engine::MeruEngine;
 
@@ -68,9 +69,14 @@ impl Default for MutationBatch {
 /// Apply a `MutationBatch` to the engine atomically.
 /// All mutations share the same WAL record and are applied to the memtable
 /// in a single `WriteBatch`.
+#[instrument(skip(engine, batch), fields(op = "apply_batch", batch_size = batch.ops.len()))]
 pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Result<SeqNum> {
     if batch.is_empty() {
         return Ok(engine.global_seq.current());
+    }
+
+    if engine.read_only {
+        return Err(merutable_types::MeruError::ReadOnly);
     }
 
     // Flow control.
@@ -86,7 +92,14 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
     // overwrites one of the two entries at (same user_key, same seq) and
     // drops a record. Bug A regression: `apply_batch_advances_seq_by_record_count`.
     let base_seq = engine.global_seq.allocate_n(batch.ops.len() as u64);
+    debug!(
+        base_seq = base_seq.0,
+        count = batch.ops.len(),
+        "batch seq allocated"
+    );
     let mut wal_batch = WriteBatch::new(base_seq);
+
+    let mut user_keys: Vec<Vec<u8>> = Vec::with_capacity(batch.ops.len());
 
     for (i, mutation) in batch.ops.iter().enumerate() {
         // Per-record seq: base_seq + i. This matches what
@@ -99,6 +112,7 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
             &engine.schema,
         )?;
         let user_key_bytes = Bytes::from(ikey.user_key_bytes().to_vec());
+        user_keys.push(user_key_bytes.to_vec());
 
         match mutation.op_type {
             OpType::Put => {
@@ -126,6 +140,13 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
 
     // Apply to memtable.
     let should_flush = engine.memtable.apply_batch(&wal_batch)?;
+
+    // Invalidate row cache for every key in the batch.
+    if let Some(ref cache) = engine.row_cache {
+        for uk in &user_keys {
+            cache.invalidate(uk);
+        }
+    }
 
     // Auto-flush when the threshold is crossed. Must rotate the active
     // memtable to the immutable queue BEFORE spawning `run_flush`, or the
