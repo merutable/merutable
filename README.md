@@ -14,6 +14,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 - **No ETL pipeline**: Every commit (flush or compaction) produces a spec-compliant Iceberg v3 snapshot. Analytical readers see consistent data at any snapshot without a separate ingestion step.
 - **Deletion Vectors, not physical deletes**: Promoted rows are masked via Puffin-format roaring bitmaps (Iceberg v3 `deletion-vector-v1`). Source files remain readable throughout compaction.
 - **SIMD-optimized bloom filter**: AVX2/NEON runtime-dispatched cache-line-aligned bloom filter for fast negative lookups on the read path.
+- **Prefix-compressed sparse index**: Each Parquet file carries a `KvSparseIndex` in the footer KV — a front-coded `user_key → page_location` map with binary-searchable restart points (LevelDB/RocksDB index-block style). Point lookups binary-search the restarts then linear-scan at most one restart interval, skipping all non-matching pages. Full keys, no 64-byte truncation.
 - **Pluggable storage**: Local filesystem for development, S3 with LRU disk cache for production.
 
 ## Architecture
@@ -31,7 +32,9 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
               |               |
        [ParquetWriter]  [Manifest + DV]
               |               |
-         [ObjectStore]   [Puffin files]
+       [Bloom + KvSparseIndex] [Puffin files]
+              |
+         [ObjectStore]
               |
        L0/ L1/ L2/ ... (Parquet files)
 ```
@@ -40,7 +43,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 **Write path**: Sequence assign → WAL append → memtable insert → flush when threshold crossed. Each flush produces a new Iceberg v3 snapshot.
 
-**Read path**: Memtable (active + immutable queue) → L0 files (bloom + scan) → L1..LN (bloom + binary search).
+**Read path**: Memtable (active + immutable queue) → L0 files (bloom → `KvSparseIndex` page skip → scan) → L1..LN (bloom → `KvSparseIndex` → binary search).
 
 **Compaction**: Leveled compaction with Deletion Vector tracking. Fully compacted files are removed from the manifest; partially compacted files get a DV update. Each compaction commit is a new Iceberg snapshot — external readers (Spark, Trino, DuckDB) always see a consistent, spec-compliant table at any snapshot.
 
@@ -51,7 +54,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 | `merutable-types` | `InternalKey` encoding, `TableSchema`, `FieldValue`, `SeqNum`, `OpType`, `MeruError` |
 | `merutable-wal` | 32 KiB block format WAL with CRC32, recovery, rotation |
 | `merutable-memtable` | `crossbeam` skip-list memtable, `bumpalo` arena, rotation, flow control |
-| `merutable-parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, footer KV metadata |
+| `merutable-parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, `KvSparseIndex`, footer KV metadata |
 | `merutable-iceberg` | Iceberg v3 table management: manifest, snapshots, `VersionSet` (ArcSwap), `DeletionVector` (Puffin). Not a catalog — catalog integration (Hive, Glue, REST) is external. |
 | `merutable-store` | Pluggable object store: local FS, S3, LRU disk cache |
 | `merutable-engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, read/write paths |
