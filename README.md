@@ -99,7 +99,7 @@ The [`lab/lab_merutable.ipynb`](lab/lab_merutable.ipynb) notebook is a live, run
 cd lab && bash setup.sh
 ```
 
-The notebook covers: write/flush/inspect, compaction with Deletion Vectors, **HTAP with DuckDB** (SQL queries on merutable's Parquet files — zero ETL), acceleration structures (bloom filter + KvSparseIndex), and a benchmark against SQLite and RocksDB.
+The notebook covers: write/flush/inspect, compaction with Deletion Vectors, **HTAP with DuckDB** (SQL queries on merutable's Parquet files — zero ETL), acceleration structures (bloom filter + KvSparseIndex), and write/read performance benchmarks.
 
 ## Python bindings
 

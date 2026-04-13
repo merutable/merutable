@@ -167,8 +167,8 @@ def benchmark_chart(results: dict):
     Dual-panel chart: write throughput (left) and read latency (right).
 
     results: {
-        "write": {"merutable": [...], "sqlite": [...], "rocksdb": [...] | None},
-        "read":  {"merutable": [...], "sqlite": [...], "rocksdb": [...] | None},
+        "write": {"merutable": [...]},
+        "read":  {"merutable": [...]},
         "sizes": [1000, 10000, 50000, 100000],
     }
     """
@@ -191,32 +191,39 @@ def benchmark_chart(results: dict):
 
     # Left: write throughput (rows/sec).
     x = np.arange(len(sizes))
-    width = 0.8 / len(engines)
+    width = 0.5 if len(engines) == 1 else 0.8 / len(engines)
     for i, (name, color) in enumerate(zip(engines, colors)):
         vals = results["write"][name]
-        ax1.bar(x + i * width - 0.4 + width / 2, vals, width,
-                label=name, color=color, alpha=0.85)
+        offset = 0 if len(engines) == 1 else i * width - 0.4 + width / 2
+        bars = ax1.bar(x + offset, vals, width,
+                       label=name, color=color, alpha=0.85)
+        # Add value labels on top of bars
+        for bar, val in zip(bars, vals):
+            ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{val:,}", ha="center", va="bottom", fontsize=8)
 
-    ax1.set_xlabel("Row Count")
+    ax1.set_xlabel("Dataset Size (rows)")
     ax1.set_ylabel("Rows/sec")
-    ax1.set_title("Write Throughput", fontweight="bold")
+    ax1.set_title("Write Throughput (put_batch)", fontweight="bold")
     ax1.set_xticks(x)
     ax1.set_xticklabels([f"{s:,}" for s in sizes])
-    ax1.legend()
     ax1.grid(axis="y", alpha=0.3)
 
     # Right: read latency (µs/lookup).
     for i, (name, color) in enumerate(zip(engines, colors)):
         vals = results["read"][name]
-        ax2.bar(x + i * width - 0.4 + width / 2, vals, width,
-                label=name, color=color, alpha=0.85)
+        offset = 0 if len(engines) == 1 else i * width - 0.4 + width / 2
+        bars = ax2.bar(x + offset, vals, width,
+                       label=name, color=color, alpha=0.85)
+        for bar, val in zip(bars, vals):
+            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{val}", ha="center", va="bottom", fontsize=8)
 
-    ax2.set_xlabel("Row Count")
+    ax2.set_xlabel("Dataset Size (rows)")
     ax2.set_ylabel("µs / lookup")
-    ax2.set_title("Point Read Latency", fontweight="bold")
+    ax2.set_title("Point Read Latency (get)", fontweight="bold")
     ax2.set_xticks(x)
     ax2.set_xticklabels([f"{s:,}" for s in sizes])
-    ax2.legend()
     ax2.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
