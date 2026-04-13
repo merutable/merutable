@@ -299,6 +299,59 @@ impl MeruEngine {
     pub fn schema(&self) -> &TableSchema {
         &self.schema
     }
+
+    /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
+    pub fn catalog_path(&self) -> String {
+        self.catalog.base_path().to_string_lossy().to_string()
+    }
+
+    /// Snapshot of engine statistics. Lock-free on the version side (ArcSwap),
+    /// brief read lock on memtable. Zero overhead on the hot path — only runs
+    /// when explicitly called.
+    pub fn stats(&self) -> crate::stats::EngineStats {
+        let version = self.version_set.current();
+        let max_level = version.max_level().0;
+
+        let mut levels = Vec::new();
+        for l in 0..=max_level {
+            let level = merutable_types::level::Level(l);
+            let files = version.files_at(level);
+            if files.is_empty() {
+                continue;
+            }
+            let file_stats: Vec<crate::stats::FileStats> = files
+                .iter()
+                .map(|f| crate::stats::FileStats {
+                    path: f.path.clone(),
+                    file_size: f.meta.file_size,
+                    num_rows: f.meta.num_rows,
+                    seq_range: (f.meta.seq_min, f.meta.seq_max),
+                    has_dv: f.has_dv(),
+                })
+                .collect();
+            levels.push(crate::stats::LevelStats {
+                level: l,
+                file_count: files.len(),
+                total_bytes: version.level_bytes(level),
+                total_rows: files.iter().map(|f| f.meta.num_rows).sum(),
+                files: file_stats,
+            });
+        }
+
+        let memtable = crate::stats::MemtableStats {
+            active_size_bytes: self.memtable.active_size_bytes(),
+            active_entry_count: self.memtable.active_entry_count(),
+            flush_threshold: self.memtable.flush_threshold(),
+            immutable_count: self.memtable.immutable_count(),
+        };
+
+        crate::stats::EngineStats {
+            snapshot_id: version.snapshot_id,
+            current_seq: self.global_seq.current().0,
+            levels,
+            memtable,
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

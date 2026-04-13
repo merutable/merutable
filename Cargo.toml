@@ -9,6 +9,7 @@ members = [
     "crates/merutable-store",
     "crates/merutable-engine",
     "crates/merutable",
+    "crates/merutable-python",
 ]
 
 [workspace.dependencies]
@@ -64,6 +65,9 @@ postcard   = { version = "1", features = ["use-std"] }
 # One-time init
 once_cell = { version = "1" }
 hex       = { version = "0.4" }
+
+# Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"] }
 
 # Testing
 proptest = { version = "1" }

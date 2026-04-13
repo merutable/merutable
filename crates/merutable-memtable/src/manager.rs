@@ -117,6 +117,21 @@ impl MemtableManager {
         self.inner.read().unwrap().active.should_flush()
     }
 
+    /// Approximate byte size of the active memtable.
+    pub fn active_size_bytes(&self) -> usize {
+        self.inner.read().unwrap().active.size_bytes()
+    }
+
+    /// Number of entries in the active memtable.
+    pub fn active_entry_count(&self) -> u64 {
+        self.inner.read().unwrap().active.entry_count()
+    }
+
+    /// Flush threshold in bytes.
+    pub fn flush_threshold(&self) -> usize {
+        self.flush_threshold
+    }
+
     /// Multi-level point lookup: check active first, then immutable queue newest→oldest.
     pub fn get(&self, user_key_bytes: &[u8], read_seq: SeqNum) -> Option<EntryValue> {
         let set = self.inner.read().unwrap();

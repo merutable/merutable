@@ -111,6 +111,16 @@ impl MeruDB {
     pub fn read_seq(&self) -> SeqNum {
         self.engine.read_seq()
     }
+
+    /// Engine statistics snapshot. Zero hot-path overhead.
+    pub fn stats(&self) -> merutable_engine::EngineStats {
+        self.engine.stats()
+    }
+
+    /// Catalog base directory path (for HTAP file access).
+    pub fn catalog_path(&self) -> String {
+        self.engine.catalog_path()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

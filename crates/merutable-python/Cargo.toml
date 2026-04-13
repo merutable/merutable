@@ -1,0 +1,18 @@
+[package]
+name    = "merutable-python"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for merutable via PyO3"
+license = "Apache-2.0"
+
+[lib]
+name = "merutable"
+crate-type = ["cdylib"]
+
+[dependencies]
+merutable        = { path = "../merutable" }
+merutable-types  = { path = "../merutable-types" }
+merutable-engine = { path = "../merutable-engine" }
+pyo3             = { workspace = true }
+tokio            = { workspace = true }
+bytes            = { workspace = true }
