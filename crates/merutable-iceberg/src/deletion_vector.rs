@@ -302,9 +302,20 @@ impl DeletionVector {
                 MeruError::Corruption("Puffin file has no deletion-vector-v1 blob".into())
             })?;
 
+        if blob_meta.offset < 0 || blob_meta.length < 0 {
+            return Err(MeruError::Corruption(format!(
+                "Puffin blob has negative offset ({}) or length ({})",
+                blob_meta.offset, blob_meta.length
+            )));
+        }
         let offset = blob_meta.offset as usize;
         let length = blob_meta.length as usize;
-        if offset + length > data.len() {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            MeruError::Corruption(format!(
+                "Puffin blob offset {offset} + length {length} overflows usize"
+            ))
+        })?;
+        if end > data.len() {
             return Err(MeruError::Corruption(format!(
                 "Puffin blob at offset {offset} length {length} exceeds file size {}",
                 data.len()

@@ -10,7 +10,7 @@ use merutable_types::{
     schema::TableSchema,
     sequence::{GlobalSeq, OpType, SeqNum},
     value::{FieldValue, Row},
-    Result,
+    MeruError, Result,
 };
 use merutable_wal::{batch::WriteBatch, manager::WalManager};
 use tokio::sync::Mutex;
@@ -175,12 +175,17 @@ impl MeruEngine {
 
         // Build WAL batch.
         let mut batch = WriteBatch::new(seq);
-        let value_bytes = row.map(|r| {
-            // Serialize row values to bytes. For now, use JSON as a simple encoding.
-            // Phase 4 completion wires up the proper codec.
-            let json = serde_json::to_vec(&r).unwrap_or_default();
-            bytes::Bytes::from(json)
-        });
+        let value_bytes = match row {
+            Some(r) => {
+                // Serialize row values to bytes. For now, use JSON as a simple encoding.
+                // Phase 4 completion wires up the proper codec.
+                let json = serde_json::to_vec(&r).map_err(|e| {
+                    MeruError::InvalidArgument(format!("row serialize failed: {e}"))
+                })?;
+                Some(bytes::Bytes::from(json))
+            }
+            None => None,
+        };
         match op_type {
             OpType::Put => batch.put(
                 bytes::Bytes::from(user_key_bytes),

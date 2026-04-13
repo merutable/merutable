@@ -135,9 +135,23 @@ impl IcebergCatalog {
                     let puffin_data = tokio::fs::read(&existing_puffin_path)
                         .await
                         .map_err(MeruError::Io)?;
-                    let offset = entry.dv_offset.unwrap() as usize;
-                    let length = entry.dv_length.unwrap() as usize;
-                    if offset + length > puffin_data.len() {
+                    let offset_raw = entry.dv_offset.unwrap();
+                    let length_raw = entry.dv_length.unwrap();
+                    if offset_raw < 0 || length_raw < 0 {
+                        return Err(MeruError::Corruption(format!(
+                            "existing DV for '{}' has negative offset ({offset_raw}) or length ({length_raw})",
+                            parquet_path,
+                        )));
+                    }
+                    let offset = offset_raw as usize;
+                    let length = length_raw as usize;
+                    let end = offset.checked_add(length).ok_or_else(|| {
+                        MeruError::Corruption(format!(
+                            "existing DV for '{}' offset {offset} + length {length} overflows usize",
+                            parquet_path,
+                        ))
+                    })?;
+                    if end > puffin_data.len() {
                         return Err(MeruError::Corruption(format!(
                             "existing DV blob for '{}' at offset {offset} length {length} \
                              exceeds puffin file size {}",

@@ -49,6 +49,12 @@ fn open_source_file(
         (Some(dv_path), Some(offset), Some(length)) => {
             let abs_dv = base.join(dv_path);
             let puffin_bytes = std::fs::read(&abs_dv).map_err(MeruError::Io)?;
+            if offset < 0 || length < 0 {
+                return Err(MeruError::Corruption(format!(
+                    "DV has negative offset ({offset}) or length ({length}) on file {}",
+                    file.path,
+                )));
+            }
             let start = offset as usize;
             let end = start
                 .checked_add(length as usize)
