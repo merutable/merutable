@@ -94,7 +94,26 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         let row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
             serde_json::from_slice(&entry.entry.value).unwrap_or_default()
         } else {
-            Row::default()
+            // Bug N fix: tombstone rows must carry the correct PK values in
+            // their typed columns so HTAP readers (Spark/DuckDB) can identify
+            // which key was deleted. Previously Row::default() produced zero
+            // fields, which the codec's Bug K fix filled with sentinel values
+            // (session_id=0, turn_id=0, etc.) — making tombstones look like
+            // phantom rows with PK (0,0) in external queries.
+            //
+            // Build a Row with PK columns populated from the InternalKey and
+            // non-PK columns set to None (the codec will fill sentinels for
+            // non-nullable non-PK columns, which is acceptable since external
+            // readers filter tombstones via the _merutable_ikey op_type tag).
+            let pk_values = ikey.pk_values();
+            let mut fields: Vec<Option<merutable_types::value::FieldValue>> =
+                vec![None; engine.schema.columns.len()];
+            for (pk_idx, &col_idx) in engine.schema.primary_key.iter().enumerate() {
+                if pk_idx < pk_values.len() {
+                    fields[col_idx] = Some(pk_values[pk_idx].clone());
+                }
+            }
+            Row::new(fields)
         };
 
         rows.push((ikey, row));
