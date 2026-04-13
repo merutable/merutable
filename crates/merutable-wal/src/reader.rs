@@ -199,90 +199,95 @@ impl WalReader {
             HEADER_SIZE
         };
 
-        // Skip zero-padded block tail if not enough space for a header.
-        if BLOCK_SIZE - self.block_offset < header_size {
-            let skip = BLOCK_SIZE - self.block_offset;
-            self.file_offset += skip as u64;
-            self.block_offset = 0;
-        }
-
-        // Read header.
-        let mut header = [0u8; RECYCLABLE_HEADER_SIZE];
-        let n = self
-            .source
-            .read_at(self.file_offset, &mut header[..header_size])?;
-        if n == 0 {
-            return Ok(None);
-        }
-        if n < header_size {
-            return Err(MeruError::Corruption("truncated WAL header".into()));
-        }
-
-        let stored_crc = u32::from_le_bytes(header[..4].try_into().unwrap());
-        let length = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
-        let type_byte = header[6];
-
-        // Check for zero-pad sentinel.
-        if stored_crc == 0 && length == 0 && type_byte == 0 {
-            // Zero-padded tail block — skip to next block.
-            let skip = BLOCK_SIZE - self.block_offset;
-            self.file_offset += skip as u64;
-            self.block_offset = 0;
-            return self.read_physical_record();
-        }
-
-        let rtype = RecordType::from_byte(type_byte)
-            .ok_or_else(|| MeruError::Corruption(format!("unknown record type {type_byte:#x}")))?;
-
-        // Recyclable format carries a 4-byte log number after the type
-        // byte. A mismatch means the record is left over from a previous
-        // generation of a recycled log file; signal as clean EOF so the
-        // caller stops recovery here (matches RocksDB's semantics).
-        if self.recyclable {
-            if !rtype.is_recyclable() {
-                return Err(MeruError::Corruption(format!(
-                    "non-recyclable record type {type_byte:#x} in recyclable log"
-                )));
+        // Bug F17 fix: the old code recursed on zero-pad sentinels, which
+        // stack-overflows on a large all-zero WAL file (~32K recursive calls
+        // for a 1 GB file). Loop instead.
+        loop {
+            // Skip zero-padded block tail if not enough space for a header.
+            if BLOCK_SIZE - self.block_offset < header_size {
+                let skip = BLOCK_SIZE - self.block_offset;
+                self.file_offset += skip as u64;
+                self.block_offset = 0;
             }
-            let embedded_log =
-                u32::from_le_bytes(header[7..RECYCLABLE_HEADER_SIZE].try_into().unwrap());
-            if embedded_log != self.expected_log_number {
+
+            // Read header.
+            let mut header = [0u8; RECYCLABLE_HEADER_SIZE];
+            let n = self
+                .source
+                .read_at(self.file_offset, &mut header[..header_size])?;
+            if n == 0 {
                 return Ok(None);
             }
-        } else if rtype.is_recyclable() {
-            return Err(MeruError::Corruption(format!(
-                "recyclable record type {type_byte:#x} in non-recyclable log"
-            )));
-        }
+            if n < header_size {
+                return Err(MeruError::Corruption("truncated WAL header".into()));
+            }
 
-        // Read payload.
-        let payload_offset = self.file_offset + header_size as u64;
-        let mut payload = vec![0u8; length];
-        if length > 0 {
-            let n = self.source.read_at(payload_offset, &mut payload)?;
-            if n < length {
+            let stored_crc = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let length = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
+            let type_byte = header[6];
+
+            // Check for zero-pad sentinel — skip to next block and retry.
+            if stored_crc == 0 && length == 0 && type_byte == 0 {
+                let skip = BLOCK_SIZE - self.block_offset;
+                self.file_offset += skip as u64;
+                self.block_offset = 0;
+                continue;
+            }
+
+            let rtype = RecordType::from_byte(type_byte).ok_or_else(|| {
+                MeruError::Corruption(format!("unknown record type {type_byte:#x}"))
+            })?;
+
+            // Recyclable format carries a 4-byte log number after the type
+            // byte. A mismatch means the record is left over from a previous
+            // generation of a recycled log file; signal as clean EOF so the
+            // caller stops recovery here (matches RocksDB's semantics).
+            if self.recyclable {
+                if !rtype.is_recyclable() {
+                    return Err(MeruError::Corruption(format!(
+                        "non-recyclable record type {type_byte:#x} in recyclable log"
+                    )));
+                }
+                let embedded_log =
+                    u32::from_le_bytes(header[7..RECYCLABLE_HEADER_SIZE].try_into().unwrap());
+                if embedded_log != self.expected_log_number {
+                    return Ok(None);
+                }
+            } else if rtype.is_recyclable() {
                 return Err(MeruError::Corruption(format!(
-                    "truncated WAL payload: need {length}, got {n}"
+                    "recyclable record type {type_byte:#x} in non-recyclable log"
                 )));
             }
-        }
 
-        // Verify CRC.
-        let mut hasher = Crc32::new();
-        hasher.update(&[type_byte]);
-        hasher.update(&payload);
-        let computed_crc = hasher.finalize();
-        if computed_crc != stored_crc {
-            return Err(MeruError::Corruption(format!(
-                "WAL CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"
-            )));
-        }
+            // Read payload.
+            let payload_offset = self.file_offset + header_size as u64;
+            let mut payload = vec![0u8; length];
+            if length > 0 {
+                let n = self.source.read_at(payload_offset, &mut payload)?;
+                if n < length {
+                    return Err(MeruError::Corruption(format!(
+                        "truncated WAL payload: need {length}, got {n}"
+                    )));
+                }
+            }
 
-        let total = header_size + length;
-        self.file_offset += total as u64;
-        self.block_offset = (self.block_offset + total) % BLOCK_SIZE;
+            // Verify CRC.
+            let mut hasher = Crc32::new();
+            hasher.update(&[type_byte]);
+            hasher.update(&payload);
+            let computed_crc = hasher.finalize();
+            if computed_crc != stored_crc {
+                return Err(MeruError::Corruption(format!(
+                    "WAL CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"
+                )));
+            }
 
-        Ok(Some((rtype, payload)))
+            let total = header_size + length;
+            self.file_offset += total as u64;
+            self.block_offset = (self.block_offset + total) % BLOCK_SIZE;
+
+            return Ok(Some((rtype, payload)));
+        } // end loop (Bug F17)
     }
 }
 

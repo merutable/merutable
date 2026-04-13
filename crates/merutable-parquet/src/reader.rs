@@ -403,7 +403,15 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
         let mut cum: u64 = 0;
         let mut found: Option<(usize, u64, u64)> = None; // (rg_idx, rg_start, rg_end)
         for (rg_idx, rg) in metadata.row_groups().iter().enumerate() {
-            let rg_rows = rg.num_rows() as u64;
+            let rg_num_rows = rg.num_rows();
+            // Bug P5 fix: validate non-negative num_rows before u64 cast.
+            if rg_num_rows < 0 {
+                return Err(MeruError::Corruption(format!(
+                    "negative num_rows {} in row group {rg_idx}",
+                    rg_num_rows
+                )));
+            }
+            let rg_rows = rg_num_rows as u64;
             let rg_start = cum;
             let rg_end = cum + rg_rows;
             if page_loc.first_row_index >= rg_start && page_loc.first_row_index < rg_end {

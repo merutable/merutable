@@ -206,15 +206,23 @@ impl WalManager {
     }
 
     /// Recover all valid `WriteBatch`es from a WAL directory in log-number order.
-    /// Returns the batches and the maximum sequence number seen.
-    pub fn recover_from_dir(dir: &Path) -> Result<(Vec<WriteBatch>, SeqNum)> {
+    /// Returns `(batches, max_seq, max_log_number)`:
+    /// - `batches`: all successfully decoded `WriteBatch`es in log order.
+    /// - `max_seq`: the highest sequence number seen across all batches.
+    /// - `max_log_number`: the highest WAL file number on disk (used by
+    ///   the engine to compute a collision-free `next_log`; Bug W fix).
+    pub fn recover_from_dir(dir: &Path) -> Result<(Vec<WriteBatch>, SeqNum, u64)> {
         let mut log_files = wal_files_in_dir(dir)?;
         log_files.sort_by_key(|(num, _)| *num);
 
         let mut batches = Vec::new();
         let mut max_seq = SeqNum(0);
+        let mut max_log_number: u64 = 0;
 
         for (log_num, path) in log_files {
+            if log_num > max_log_number {
+                max_log_number = log_num;
+            }
             info!(log_num, path = %path.display(), "recovering WAL");
             let source = FileSource::open(&path)?;
             let mut reader = WalReader::new(source);
@@ -232,20 +240,20 @@ impl WalManager {
                             Err(e) => {
                                 // Corrupt batch in an otherwise valid record — stop recovery.
                                 tracing::warn!(error = %e, "corrupt WriteBatch during recovery, stopping");
-                                return Ok((batches, max_seq));
+                                return Ok((batches, max_seq, max_log_number));
                             }
                         }
                     }
                     Err(e) => {
                         // CRC mismatch / truncation — stop cleanly (partial tail is expected).
                         tracing::warn!(error = %e, "WAL read error during recovery, stopping at this point");
-                        return Ok((batches, max_seq));
+                        return Ok((batches, max_seq, max_log_number));
                     }
                 }
             }
         }
 
-        Ok((batches, max_seq))
+        Ok((batches, max_seq, max_log_number))
     }
 }
 
@@ -300,11 +308,12 @@ mod tests {
             mgr.append(&batch2).unwrap();
         }
 
-        let (batches, max_seq) = WalManager::recover_from_dir(dir.path()).unwrap();
+        let (batches, max_seq, max_log) = WalManager::recover_from_dir(dir.path()).unwrap();
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].sequence, SeqNum(1));
         assert_eq!(batches[1].sequence, SeqNum(2));
         assert_eq!(max_seq, SeqNum(2));
+        assert_eq!(max_log, 1);
     }
 
     #[test]
@@ -324,8 +333,9 @@ mod tests {
         b2.put(Bytes::from("k2"), Bytes::from("v2"));
         mgr.append(&b2).unwrap();
 
-        let (batches, _) = WalManager::recover_from_dir(dir.path()).unwrap();
+        let (batches, _, max_log) = WalManager::recover_from_dir(dir.path()).unwrap();
         assert_eq!(batches.len(), 2);
+        assert_eq!(max_log, 2);
     }
 
     #[test]
@@ -348,7 +358,7 @@ mod tests {
         f.set_len(truncated_len).unwrap();
 
         // Recovery should not panic; it returns whatever it successfully read.
-        let (batches, _) = WalManager::recover_from_dir(dir.path()).unwrap();
+        let (batches, _, _) = WalManager::recover_from_dir(dir.path()).unwrap();
         // May get 0 or 1 batches depending on where truncation fell.
         let _ = batches;
     }

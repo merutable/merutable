@@ -477,7 +477,7 @@ fn manager_recovery_matches_raw_byte_reassembly() {
         .map(|p| WriteBatch::decode(p).unwrap())
         .collect();
 
-    let (recovered, _max_seq) = WalManager::recover_from_dir(dir.path()).unwrap();
+    let (recovered, _max_seq, _max_log) = WalManager::recover_from_dir(dir.path()).unwrap();
 
     assert_eq!(recovered.len(), raw_decoded.len());
     for (a, b) in recovered.iter().zip(raw_decoded.iter()) {

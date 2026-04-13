@@ -39,6 +39,12 @@ pub struct MeruEngine {
     /// and write two L0 Parquet files containing identical rows (followed
     /// by two competing catalog commits). Bug G regression.
     pub(crate) flush_mutex: Mutex<()>,
+    /// Bug T fix: serializes `run_compaction` so two background compaction
+    /// workers (default `compaction_parallelism=2`) don't both pick the
+    /// same level, read the same files, write duplicate output Parquet
+    /// files at the output level, and commit competing snapshots —
+    /// producing duplicate rows visible to readers.
+    pub(crate) compaction_mutex: Mutex<()>,
 }
 
 impl MeruEngine {
@@ -49,10 +55,16 @@ impl MeruEngine {
     /// 3. Open Iceberg catalog and load current version.
     /// 4. Initialize global seq to `max(wal_max_seq, iceberg_max_seq) + 1`.
     pub async fn open(config: EngineConfig) -> Result<Arc<Self>> {
+        // Bug SC2 fix: validate the schema upfront so misconfigured schemas
+        // (out-of-bounds PK indices, nullable PKs, empty columns) produce a
+        // clear error here instead of panicking deep inside encode/decode.
+        config.schema.validate()?;
+
         let schema = Arc::new(config.schema.clone());
 
         // WAL recovery.
-        let (recovered_batches, wal_max_seq) = WalManager::recover_from_dir(&config.wal_dir)?;
+        let (recovered_batches, wal_max_seq, max_log_number) =
+            WalManager::recover_from_dir(&config.wal_dir)?;
         info!(
             recovered = recovered_batches.len(),
             wal_max_seq = wal_max_seq.0,
@@ -95,8 +107,12 @@ impl MeruEngine {
             );
         }
 
-        // Open a fresh WAL for new writes.
-        let next_log = recovered_batches.len() as u64 + 1;
+        // Bug W fix: compute `next_log` from the highest WAL file number on
+        // disk, NOT from the batch count. After partial WAL GC, the batch
+        // count can be smaller than the highest surviving log number, causing
+        // the new WAL file to collide with (and truncate) an existing file.
+        // A second crash before flush would then lose the overwritten data.
+        let next_log = max_log_number + 1;
         let wal = WalManager::open(&config.wal_dir, next_log)?;
 
         let engine = Arc::new(Self {
@@ -109,6 +125,7 @@ impl MeruEngine {
             catalog,
             rotation_lock: Mutex::new(()),
             flush_mutex: Mutex::new(()),
+            compaction_mutex: Mutex::new(()),
         });
 
         Ok(engine)
@@ -134,8 +151,19 @@ impl MeruEngine {
         op_type: OpType,
     ) -> Result<SeqNum> {
         // Flow control: stall if immutable queue is full.
-        while self.memtable.should_stall() {
-            self.memtable.flush_complete.notified().await;
+        //
+        // Bug Z fix: register the `notified()` future BEFORE checking the
+        // condition. The old `while should_stall() { notified().await }`
+        // pattern has a TOCTOU race: if a flush completes (calling
+        // `notify_waiters()`) between the `should_stall()` check and the
+        // `notified()` registration, the notification is lost and the writer
+        // hangs indefinitely until another unrelated flush happens.
+        loop {
+            let notify = self.memtable.flush_complete.notified();
+            if !self.memtable.should_stall() {
+                break;
+            }
+            notify.await;
         }
 
         // Allocate sequence number.
@@ -227,20 +255,26 @@ impl MeruEngine {
 
     /// Force flush all immutable memtables and the active memtable.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
-        // Rotate active memtable AND the WAL together so that (a) the
-        // sealed memtable's writes live in a closed WAL file that can be
-        // GC'd once the flush commits, and (b) new writes after this call
-        // land in a fresh WAL file. Bug D regression: before this, the WAL
-        // never rotated under any flush path, so the log directory grew
-        // without bound and recovery replayed already-flushed batches.
-        let next_seq = self.global_seq.current().next();
-        self.memtable.rotate(next_seq);
+        // Bug R fix: hold `rotation_lock` while rotating so a concurrent
+        // auto-flush task from `write_internal` doesn't race on `rotate()`
+        // and seal an empty (freshly-created) memtable.
         {
-            let mut wal = self.wal.lock().await;
-            wal.rotate()?;
-        }
-        // Flush all immutables. `run_flush` calls `mark_flushed_seq` which
-        // GCs the matching closed WAL file as a side effect.
+            let _rotation_guard = self.rotation_lock.lock().await;
+            // Rotate active memtable AND the WAL together so that (a) the
+            // sealed memtable's writes live in a closed WAL file that can be
+            // GC'd once the flush commits, and (b) new writes after this call
+            // land in a fresh WAL file. Bug D regression: before this, the WAL
+            // never rotated under any flush path, so the log directory grew
+            // without bound and recovery replayed already-flushed batches.
+            let next_seq = self.global_seq.current().next();
+            self.memtable.rotate(next_seq);
+            {
+                let mut wal = self.wal.lock().await;
+                wal.rotate()?;
+            }
+        } // rotation_lock dropped
+          // Flush all immutables. `run_flush` calls `mark_flushed_seq` which
+          // GCs the matching closed WAL file as a side effect.
         while self.memtable.oldest_immutable().is_some() {
             crate::flush::run_flush(self).await?;
         }

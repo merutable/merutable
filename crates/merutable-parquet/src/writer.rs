@@ -269,6 +269,27 @@ fn extract_kv_index_entries(
         })?;
 
         for page_loc in ikey_offsets.page_locations() {
+            // Bug P1-P4 fix: validate sign of Parquet thrift i64/i32 fields
+            // before casting to u64/u32. Same class as Bug L/M — negative
+            // values from corrupt files wrap to huge unsigned values.
+            if page_loc.first_row_index < 0 {
+                return Err(MeruError::Corruption(format!(
+                    "negative first_row_index {} in row group {rg_idx}",
+                    page_loc.first_row_index
+                )));
+            }
+            if page_loc.offset < 0 {
+                return Err(MeruError::Corruption(format!(
+                    "negative page offset {} in row group {rg_idx}",
+                    page_loc.offset
+                )));
+            }
+            if page_loc.compressed_page_size < 0 {
+                return Err(MeruError::Corruption(format!(
+                    "negative compressed_page_size {} in row group {rg_idx}",
+                    page_loc.compressed_page_size
+                )));
+            }
             let global_first_row = row_group_start + page_loc.first_row_index as u64;
             let row = rows.get(global_first_row as usize).ok_or_else(|| {
                 MeruError::Parquet(format!(
@@ -287,7 +308,14 @@ fn extract_kv_index_entries(
             ));
         }
 
-        let rg_num_rows = metadata.row_group(rg_idx).num_rows() as u64;
+        let rg_num_rows = metadata.row_group(rg_idx).num_rows();
+        if rg_num_rows < 0 {
+            return Err(MeruError::Corruption(format!(
+                "negative num_rows {} in row group {rg_idx}",
+                rg_num_rows
+            )));
+        }
+        let rg_num_rows = rg_num_rows as u64;
         row_group_start += rg_num_rows;
     }
 

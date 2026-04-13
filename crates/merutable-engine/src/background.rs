@@ -70,13 +70,16 @@ impl BackgroundWorkers {
 async fn flush_worker(engine: Arc<MeruEngine>, shutdown: Arc<Notify>, id: usize) {
     debug!(worker = id, "flush worker started");
     loop {
-        // Wait for either: immutable memtable available, or shutdown.
+        // Bug S fix: wait on `immutable_available` (fired by rotate()),
+        // not `flush_complete` (fired by drop_flushed()). The old code
+        // created a chicken-and-egg: the flush worker only woke when a
+        // prior flush completed, but nobody triggered the first flush.
         tokio::select! {
             _ = shutdown.notified() => {
                 info!(worker = id, "flush worker shutting down");
                 break;
             }
-            _ = engine.memtable.flush_complete.notified() => {}
+            _ = engine.memtable.immutable_available.notified() => {}
         }
 
         // Drain all pending flushes.
@@ -104,15 +107,15 @@ async fn compaction_worker(engine: Arc<MeruEngine>, shutdown: Arc<Notify>, id: u
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
 
-        // Check if compaction is needed.
-        let version = engine.version_set.current();
-        let l0_count = version.l0_file_count();
-        if l0_count >= engine.config.l0_compaction_trigger {
-            match crate::compaction::job::run_compaction(&engine).await {
-                Ok(_) => debug!(worker = id, "compaction completed"),
-                Err(e) => {
-                    warn!(worker = id, error = %e, "compaction failed, will retry");
-                }
+        // Bug Y fix: always call `run_compaction` — it calls
+        // `pick_compaction` internally which scores ALL levels (L0 and
+        // L1+) and returns `None` if no compaction is needed. The old
+        // code only gated on L0 count, so L1+ compactions never
+        // triggered from the background worker.
+        match crate::compaction::job::run_compaction(&engine).await {
+            Ok(_) => debug!(worker = id, "compaction completed"),
+            Err(e) => {
+                warn!(worker = id, error = %e, "compaction failed, will retry");
             }
         }
     }

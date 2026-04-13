@@ -74,7 +74,7 @@ impl InternalKey {
     ) -> Result<Self> {
         let mut buf = Vec::with_capacity(64);
         encode_pk_fields(pk_values, schema, &mut buf)?;
-        encode_tag(seq, op_type, &mut buf);
+        encode_tag(seq, op_type, &mut buf)?;
         Ok(Self {
             encoded: Bytes::from(buf),
             seq,
@@ -109,6 +109,15 @@ impl InternalKey {
         let tag = u64::from_be_bytes(tag_bytes.try_into().unwrap());
         let inverted_seq = tag >> 8;
         let op_byte = (tag & 0xFF) as u8;
+        // Bug K3 fix: validate inverted_seq doesn't exceed SEQNUM_MAX.
+        // On corrupt data, this subtraction would underflow, producing a
+        // garbage SeqNum that breaks MVCC ordering.
+        if inverted_seq > SEQNUM_MAX.0 {
+            return Err(MeruError::Corruption(format!(
+                "inverted_seq {inverted_seq} exceeds SEQNUM_MAX ({})",
+                SEQNUM_MAX.0
+            )));
+        }
         let seq = SeqNum(SEQNUM_MAX.0 - inverted_seq);
         let op_type = match op_byte {
             0x00 => OpType::Delete,
@@ -250,10 +259,20 @@ fn order_preserving_f64(v: f64) -> [u8; 8] {
     encoded.to_be_bytes()
 }
 
-fn encode_tag(seq: SeqNum, op_type: OpType, buf: &mut Vec<u8>) {
+fn encode_tag(seq: SeqNum, op_type: OpType, buf: &mut Vec<u8>) -> Result<()> {
+    // Bug K2 fix: guard against seq > SEQNUM_MAX. Without this check,
+    // the subtraction wraps (u64 underflow in release, panic in debug),
+    // producing a corrupted tag that breaks sort-order invariants.
+    if seq.0 > SEQNUM_MAX.0 {
+        return Err(MeruError::InvalidArgument(format!(
+            "sequence number {} exceeds SEQNUM_MAX ({})",
+            seq.0, SEQNUM_MAX.0
+        )));
+    }
     let inverted = SEQNUM_MAX.0 - seq.0;
     let tag = (inverted << 8) | (op_type as u64);
     buf.extend_from_slice(&tag.to_be_bytes());
+    Ok(())
 }
 
 // ── Decoding ─────────────────────────────────────────────────────────────────

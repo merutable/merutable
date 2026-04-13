@@ -102,7 +102,13 @@ fn compute_union_range(files: &[DataFileMeta]) -> (Option<Vec<u8>>, Option<Vec<u
 }
 
 /// Run one compaction job. Picks the best level and compacts.
+///
+/// Bug T fix: serialized by `engine.compaction_mutex` so two background
+/// workers don't both pick the same level, read the same files, and write
+/// duplicate output to the output level.
 pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
+    let _compaction_guard = engine.compaction_mutex.lock().await;
+
     let version = engine.version_set.current();
     let pick = match picker::pick_compaction(&version, &engine.config) {
         Some(p) => p,
@@ -120,10 +126,11 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         "starting compaction"
     );
 
-    // Snapshot the version once so every subsequent index into
-    // `files_at(input_level)` refers to the same file list used when
-    // building `FileEntries` below.
-    let version = engine.version_set.current();
+    // Bug Q fix: reuse the same version snapshot used for picking. The old
+    // code re-snapshotted `version_set.current()` here, which could return
+    // a different version if a concurrent flush committed between pick and
+    // this point — causing the compaction to read a file set inconsistent
+    // with what the picker evaluated.
     let input_file_metas: Vec<DataFileMeta> = version.files_at(pick.input_level).to_vec();
     if input_file_metas.is_empty() {
         debug!("compaction picked an empty input level");

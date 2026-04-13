@@ -35,6 +35,13 @@ pub struct MemtableManager {
     max_immutable: usize,
     /// Notified when an immutable memtable is dropped (flush complete).
     pub flush_complete: Arc<tokio::sync::Notify>,
+    /// Bug S fix: notified when a new immutable memtable becomes available
+    /// (i.e., after `rotate()`). Background flush workers should wait on
+    /// this signal, NOT on `flush_complete` which fires when a flush
+    /// finishes — the old code created a chicken-and-egg problem where
+    /// the flush worker only woke when a *prior* flush completed, but
+    /// nothing triggered the *first* flush from the background worker.
+    pub immutable_available: Arc<tokio::sync::Notify>,
 }
 
 impl MemtableManager {
@@ -48,6 +55,7 @@ impl MemtableManager {
             flush_threshold,
             max_immutable,
             flush_complete: Arc::new(tokio::sync::Notify::new()),
+            immutable_available: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -67,6 +75,10 @@ impl MemtableManager {
         let sealed = set.active.clone();
         set.active = Arc::new(Memtable::new(new_first_seq, self.flush_threshold));
         set.immutable.push_back(sealed.clone());
+        drop(set);
+        // Bug S fix: wake any background flush workers waiting for an
+        // immutable memtable to become available.
+        self.immutable_available.notify_waiters();
         sealed
     }
 
