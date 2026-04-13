@@ -15,6 +15,9 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 - **Deletion Vectors, not physical deletes**: Promoted rows are masked via Puffin-format roaring bitmaps (Iceberg v3 `deletion-vector-v1`). Source files remain readable throughout compaction.
 - **SIMD-optimized bloom filter**: AVX2/NEON runtime-dispatched cache-line-aligned bloom filter for fast negative lookups on the read path.
 - **Prefix-compressed sparse index**: Each Parquet file carries a `KvSparseIndex` in the footer KV — a front-coded `user_key → page_location` map with binary-searchable restart points (LevelDB/RocksDB index-block style). Point lookups binary-search the restarts then linear-scan at most one restart interval, skipping all non-matching pages. Full keys, no 64-byte truncation.
+- **Row cache**: LRU buffer cache (10K entries default) between memtable and Parquet I/O. Eliminates disk reads for hot-key workloads. Invalidated on every write — never stale.
+- **Read-only replica**: `MeruDB.open_read_only()` opens the same catalog directory for reads only. Call `refresh()` to pick up new Iceberg snapshots from the primary — no coordination, no locks.
+- **Structured tracing**: `#[instrument]` spans on every engine operation (open, put, get, scan, flush, compact, batch). Filter by operation type, level, file path. Drop in `tracing-subscriber` to activate.
 - **Pluggable storage**: Local filesystem for development, S3 with LRU disk cache for production.
 
 ## Architecture
@@ -41,7 +44,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 | `merutable-parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, `KvSparseIndex`, footer KV metadata |
 | `merutable-iceberg` | Iceberg v3 table management: manifest, snapshots, `VersionSet` (ArcSwap), `DeletionVector` (Puffin). Not a catalog — catalog integration (Hive, Glue, REST) is external. |
 | `merutable-store` | Pluggable object store: local FS, S3, LRU disk cache |
-| `merutable-engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, read/write paths |
+| `merutable-engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, `RowCache`, read/write paths |
 | `merutable` | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator` |
 
 ## Storage tuning
@@ -123,10 +126,16 @@ db.put_batch([
 
 db.flush()              # → L0 Parquet file + Iceberg v3 snapshot
 db.compact()            # → L1 columnstore + Deletion Vectors
+print(db.stats())       # includes cache hit/miss counters
 
 # HTAP: DuckDB reads the same Parquet files
 import duckdb
 duckdb.sql(f"SELECT * FROM read_parquet('{db.catalog_path()}/data/L1/*.parquet')").show()
+
+# Read-only replica — opens same catalog, no WAL, no writes
+replica = MeruDB("/tmp/mydb", "events", [...], read_only=True)
+replica.get(1)          # reads from Parquet files
+replica.refresh()       # picks up new snapshots from the primary
 ```
 
 Build with [maturin](https://www.maturin.rs/):

@@ -146,8 +146,8 @@
   <text x="700" y="490" font-size="9" fill="#37474F" font-style="italic">Read: memtable → L0 (bloom → KvSparseIndex) → L1+</text>
   <text x="700" y="504" font-size="9" fill="#37474F" font-style="italic">Write: WAL → memtable → flush → Iceberg snapshot</text>
 
-  <text x="155" y="550" text-anchor="middle" font-size="10" fill="#F57F17" font-weight="600">Every flush and compaction produces a spec-compliant Iceberg v3 snapshot.</text>
-  <text x="155" y="563" text-anchor="middle" font-size="9" fill="#795548">External readers see consistent data at any snapshot — no separate ingestion step.</text>
+  <text x="550" y="550" text-anchor="middle" font-size="10" fill="#F57F17" font-weight="600">Every flush and compaction produces a spec-compliant Iceberg v3 snapshot.</text>
+  <text x="550" y="563" text-anchor="middle" font-size="9" fill="#795548">External readers see consistent data at any snapshot — no separate ingestion step.</text>
 
   <!-- ═══════════════════════════════════════════════════════ -->
   <!-- ROW 3 (y=600..790): Per-Level Parquet Format — detail -->
