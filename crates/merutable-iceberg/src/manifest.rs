@@ -79,6 +79,9 @@ impl ManifestEntry {
 /// This is the embedded FS catalog's equivalent of an Iceberg manifest list.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// Iceberg format version. Must be 3 for v3 with deletion vectors.
+    #[serde(default = "default_format_version")]
+    pub format_version: i32,
     /// Monotonically increasing snapshot ID.
     pub snapshot_id: i64,
     /// Schema of the table at this snapshot.
@@ -88,6 +91,10 @@ pub struct Manifest {
     /// Snapshot summary properties.
     #[serde(default)]
     pub properties: HashMap<String, String>,
+}
+
+fn default_format_version() -> i32 {
+    3
 }
 
 impl Manifest {
@@ -137,6 +144,7 @@ impl Manifest {
     /// Create an empty initial manifest.
     pub fn empty(schema: TableSchema) -> Self {
         Self {
+            format_version: 3,
             snapshot_id: 0,
             schema,
             entries: Vec::new(),
@@ -220,6 +228,7 @@ impl Manifest {
         props.extend(txn.props.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         Ok(Manifest {
+            format_version: self.format_version,
             snapshot_id: new_snapshot_id,
             schema: self.schema.clone(),
             entries: new_entries,
@@ -291,11 +300,31 @@ mod tests {
     #[test]
     fn empty_manifest_roundtrip() {
         let m = Manifest::empty(test_schema());
+        assert_eq!(m.format_version, 3, "new manifests must be format-version 3");
         let json = m.to_json().unwrap();
         let decoded = Manifest::from_json(&json).unwrap();
+        assert_eq!(decoded.format_version, 3);
         assert_eq!(decoded.snapshot_id, 0);
         assert_eq!(decoded.entries.len(), 0);
         assert_eq!(decoded.schema.table_name, "test");
+    }
+
+    /// Deserializing a legacy manifest (no format_version field) defaults to 3.
+    #[test]
+    fn legacy_manifest_defaults_to_v3() {
+        let json = r#"{"snapshot_id":5,"schema":{"table_name":"t","columns":[],"primary_key":[]},"entries":[]}"#;
+        let m = Manifest::from_json(json.as_bytes()).unwrap();
+        assert_eq!(m.format_version, 3);
+    }
+
+    /// `apply` carries forward format_version.
+    #[test]
+    fn apply_preserves_format_version() {
+        let m = Manifest::empty(test_schema());
+        assert_eq!(m.format_version, 3);
+        let txn = SnapshotTransaction::new();
+        let m2 = m.apply(&txn, 1, &HashMap::new()).unwrap();
+        assert_eq!(m2.format_version, 3);
     }
 
     #[test]

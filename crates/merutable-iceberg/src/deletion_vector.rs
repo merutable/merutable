@@ -5,13 +5,13 @@
 //! file. Implemented from the Puffin spec — we do not rely on `iceberg`-rust's
 //! Puffin support which may be incomplete.
 //!
-//! # Puffin wire format
+//! # Puffin wire format (file envelope)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────┐
 //! │ magic: 4 bytes  = "PFA1"                │
 //! ├─────────────────────────────────────────┤
-//! │ blob data (raw roaring bitmap bytes)    │
+//! │ blob data (DV blob body, see below)     │
 //! ├─────────────────────────────────────────┤
 //! │ footer payload: UTF-8 JSON              │
 //! ├─────────────────────────────────────────┤
@@ -20,14 +20,36 @@
 //! │ magic: 4 bytes  = "PFA1"                │
 //! └─────────────────────────────────────────┘
 //! ```
+//!
+//! # DV blob body (Iceberg v3 `deletion-vector-v1`)
+//!
+//! ```text
+//! ┌─────────────────────────────────────────┐
+//! │ length: u32 BE  (magic+data+CRC size)   │
+//! ├─────────────────────────────────────────┤
+//! │ magic: 4 bytes  = D1 D3 39 64           │
+//! ├─────────────────────────────────────────┤
+//! │ 64-bit Roaring portable:                │
+//! │   bitmap_count: u64 LE                  │
+//! │   per bitmap:                           │
+//! │     key: u32 LE (upper 32 bits)         │
+//! │     32-bit Roaring (portable format)    │
+//! ├─────────────────────────────────────────┤
+//! │ CRC32: u32 BE  (of magic + data)        │
+//! └─────────────────────────────────────────┘
+//! ```
 
 use bytes::{BufMut, Bytes, BytesMut};
+use crc32fast::Hasher as Crc32;
 use merutable_types::{MeruError, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 /// Puffin file magic bytes: "PFA1".
 const PUFFIN_MAGIC: [u8; 4] = [0x50, 0x46, 0x41, 0x31];
+
+/// Iceberg v3 deletion-vector-v1 blob magic: `D1 D3 39 64`.
+const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 
 /// Minimum valid Puffin file: magic(4) + footer_len(4) + magic(4) = 12 bytes.
 const PUFFIN_MIN_SIZE: usize = 12;
@@ -126,13 +148,42 @@ impl DeletionVector {
         snapshot_id: i64,
         sequence_number: i64,
     ) -> Result<PuffinEncoded> {
-        // Serialize roaring bitmap to portable format.
-        let mut blob_data = Vec::new();
+        // ── Step 1: Serialize 32-bit Roaring bitmap to portable format ──
+        let mut roaring32_bytes = Vec::new();
         self.bitmap
-            .serialize_into(&mut blob_data)
+            .serialize_into(&mut roaring32_bytes)
             .map_err(|e| MeruError::Iceberg(format!("DV bitmap serialize: {e}")))?;
 
-        // Blob offset = right after the opening magic.
+        // ── Step 2: Wrap in 64-bit Roaring portable format ──
+        // bitmap_count (u64 LE) + key (u32 LE) + 32-bit portable Roaring
+        let mut roaring64_data = Vec::with_capacity(12 + roaring32_bytes.len());
+        roaring64_data.extend_from_slice(&1u64.to_le_bytes()); // bitmap_count = 1
+        roaring64_data.extend_from_slice(&0u32.to_le_bytes()); // key = 0 (all positions < 2^32)
+        roaring64_data.extend_from_slice(&roaring32_bytes);
+
+        // ── Step 3: Build DV blob envelope per Iceberg v3 spec ──
+        // length(u32 BE) + magic(4) + roaring64_data + CRC32(u32 BE)
+        // `length` = size of magic + roaring64_data + CRC32.
+        let inner_len = DV_MAGIC.len() + roaring64_data.len() + 4;
+        let length = u32::try_from(inner_len).map_err(|_| {
+            MeruError::Iceberg(format!("DV blob too large for u32 length: {inner_len}"))
+        })?;
+
+        // CRC32 covers magic + roaring64_data.
+        let mut hasher = Crc32::new();
+        hasher.update(&DV_MAGIC);
+        hasher.update(&roaring64_data);
+        let crc = hasher.finalize();
+
+        let blob_body_len = 4 + inner_len; // length field + inner_len
+        let mut blob_data = Vec::with_capacity(blob_body_len);
+        blob_data.extend_from_slice(&length.to_be_bytes());
+        blob_data.extend_from_slice(&DV_MAGIC);
+        blob_data.extend_from_slice(&roaring64_data);
+        blob_data.extend_from_slice(&crc.to_be_bytes());
+
+        // ── Step 4: Assemble Puffin file ──
+        // Blob offset = right after the opening Puffin magic.
         let blob_offset = PUFFIN_MAGIC.len() as i64;
         let blob_length = blob_data.len() as i64;
 
@@ -142,6 +193,7 @@ impl DeletionVector {
                 blob_type: "deletion-vector-v1".to_string(),
                 fields: PuffinBlobFields {
                     referenced_data_file: parquet_path.to_string(),
+                    cardinality: self.bitmap.len() as i64,
                 },
                 snapshot_id,
                 sequence_number,
@@ -260,17 +312,17 @@ impl DeletionVector {
         }
 
         let blob_bytes = &data[offset..offset + length];
-        let bitmap = RoaringBitmap::deserialize_from(blob_bytes)
-            .map_err(|e| MeruError::Corruption(format!("DV bitmap deserialize: {e}")))?;
+        let bitmap = decode_dv_blob(blob_bytes)?;
 
         Ok(Self { bitmap })
     }
 
     /// Deserialize a DV from a slice of a Puffin file (given blob offset + length).
     /// Used when the Puffin file has already been partially read.
+    /// The blob bytes must be in Iceberg v3 DV format:
+    /// `length(u32 BE) + magic(D1 D3 39 64) + 64-bit Roaring + CRC32(u32 BE)`.
     pub fn from_puffin_blob(blob_bytes: &[u8]) -> Result<Self> {
-        let bitmap = RoaringBitmap::deserialize_from(blob_bytes)
-            .map_err(|e| MeruError::Corruption(format!("DV bitmap deserialize: {e}")))?;
+        let bitmap = decode_dv_blob(blob_bytes)?;
         Ok(Self { bitmap })
     }
 
@@ -316,6 +368,92 @@ struct PuffinBlobMeta {
 struct PuffinBlobFields {
     #[serde(rename = "referenced-data-file")]
     referenced_data_file: String,
+    /// Number of deleted row positions in this DV (Iceberg v3 spec field).
+    #[serde(default)]
+    cardinality: i64,
+}
+
+/// Decode a DV blob in Iceberg v3 `deletion-vector-v1` format.
+///
+/// Blob body: `length(u32 BE) + magic(D1 D3 39 64) + 64-bit Roaring + CRC32(u32 BE)`.
+/// The `length` field covers magic + roaring data + CRC32.
+fn decode_dv_blob(blob_bytes: &[u8]) -> Result<RoaringBitmap> {
+    // Minimum: length(4) + magic(4) + CRC(4) = 12 bytes.
+    if blob_bytes.len() < 12 {
+        return Err(MeruError::Corruption(format!(
+            "DV blob too short: {} bytes (minimum 12)",
+            blob_bytes.len()
+        )));
+    }
+
+    // Read length (u32 BE).
+    let length = u32::from_be_bytes(blob_bytes[..4].try_into().unwrap()) as usize;
+    if 4 + length != blob_bytes.len() {
+        return Err(MeruError::Corruption(format!(
+            "DV blob length field ({length}) doesn't match actual remaining size ({})",
+            blob_bytes.len() - 4
+        )));
+    }
+
+    // Validate DV magic.
+    if blob_bytes[4..8] != DV_MAGIC {
+        return Err(MeruError::Corruption(format!(
+            "DV blob magic mismatch: expected D1D33964, got {:02X}{:02X}{:02X}{:02X}",
+            blob_bytes[4], blob_bytes[5], blob_bytes[6], blob_bytes[7]
+        )));
+    }
+
+    // Extract vector_data and stored CRC32.
+    let crc_offset = blob_bytes.len() - 4;
+    let stored_crc = u32::from_be_bytes(blob_bytes[crc_offset..].try_into().unwrap());
+    let magic_and_data = &blob_bytes[4..crc_offset]; // magic + roaring64_data
+
+    // Verify CRC32 of (magic + roaring64_data).
+    let mut hasher = Crc32::new();
+    hasher.update(magic_and_data);
+    let computed_crc = hasher.finalize();
+    if computed_crc != stored_crc {
+        return Err(MeruError::Corruption(format!(
+            "DV blob CRC mismatch: stored {stored_crc:#x}, computed {computed_crc:#x}"
+        )));
+    }
+
+    // Parse 64-bit Roaring: bitmap_count(u64 LE) + per-bitmap(key u32 LE + portable Roaring).
+    let roaring64_data = &blob_bytes[8..crc_offset];
+    if roaring64_data.len() < 8 {
+        return Err(MeruError::Corruption(
+            "DV 64-bit Roaring data too short for bitmap_count".into(),
+        ));
+    }
+
+    let bitmap_count = u64::from_le_bytes(roaring64_data[..8].try_into().unwrap());
+    if bitmap_count == 0 {
+        return Ok(RoaringBitmap::new());
+    }
+    if bitmap_count > 1 {
+        return Err(MeruError::Corruption(format!(
+            "DV 64-bit Roaring has {bitmap_count} bitmaps; \
+             merutable only supports row positions < 2^32"
+        )));
+    }
+
+    // Single bitmap: read key(u32 LE) + 32-bit portable Roaring.
+    if roaring64_data.len() < 12 {
+        return Err(MeruError::Corruption(
+            "DV 64-bit Roaring data too short for key field".into(),
+        ));
+    }
+    let key = u32::from_le_bytes(roaring64_data[8..12].try_into().unwrap());
+    if key != 0 {
+        return Err(MeruError::Corruption(format!(
+            "DV 64-bit Roaring key is {key}; \
+             merutable only supports key=0 (row positions < 2^32)"
+        )));
+    }
+
+    let roaring_bytes = &roaring64_data[12..];
+    RoaringBitmap::deserialize_from(roaring_bytes)
+        .map_err(|e| MeruError::Corruption(format!("DV 32-bit Roaring deserialize: {e}")))
 }
 
 /// Parse the footer from a complete Puffin file (shared by multiple methods).
@@ -496,5 +634,127 @@ mod tests {
         assert!(decoded.is_deleted(0));
         assert!(!decoded.is_deleted(1));
         assert!(decoded.is_deleted(199_998));
+    }
+
+    // ── Iceberg v3 DV spec compliance tests ─────────────────────────
+
+    /// Verify the DV blob body starts with the Iceberg v3 envelope:
+    /// length(u32 BE) + magic(D1 D3 39 64) + 64-bit Roaring + CRC32(u32 BE).
+    #[test]
+    fn dv_blob_has_iceberg_v3_envelope() {
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(7);
+        dv.mark_deleted(42);
+
+        let encoded = dv
+            .encode_puffin("data/L0/test.parquet", 1, 1)
+            .unwrap();
+
+        // Extract blob from the Puffin file.
+        let blob_offset = encoded.blob_offset as usize;
+        let blob_length = encoded.blob_length as usize;
+        let blob = &encoded.bytes[blob_offset..blob_offset + blob_length];
+
+        // First 4 bytes: length (u32 BE) = total_blob_len - 4.
+        let length = u32::from_be_bytes(blob[..4].try_into().unwrap()) as usize;
+        assert_eq!(length, blob.len() - 4, "length field must cover magic+data+CRC");
+
+        // Next 4 bytes: DV magic.
+        assert_eq!(&blob[4..8], &DV_MAGIC, "DV magic D1D33964 must follow length");
+
+        // Last 4 bytes: CRC32 (u32 BE).
+        let crc_offset = blob.len() - 4;
+        let stored_crc = u32::from_be_bytes(blob[crc_offset..].try_into().unwrap());
+        let mut hasher = Crc32::new();
+        hasher.update(&blob[4..crc_offset]); // magic + roaring64_data
+        let computed = hasher.finalize();
+        assert_eq!(stored_crc, computed, "CRC32 must match");
+
+        // 64-bit Roaring header inside the envelope.
+        let roaring64 = &blob[8..crc_offset];
+        let bitmap_count = u64::from_le_bytes(roaring64[..8].try_into().unwrap());
+        assert_eq!(bitmap_count, 1, "bitmap_count must be 1");
+        let key = u32::from_le_bytes(roaring64[8..12].try_into().unwrap());
+        assert_eq!(key, 0, "key must be 0 for row positions < 2^32");
+    }
+
+    /// Verify CRC corruption in the DV blob body is detected.
+    #[test]
+    fn dv_blob_crc_corruption_detected() {
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(1);
+
+        let encoded = dv.encode_puffin("data/L0/test.parquet", 1, 1).unwrap();
+        let mut puffin = encoded.bytes.to_vec();
+
+        // Corrupt one byte inside the blob body (after DV magic, before CRC).
+        let blob_offset = encoded.blob_offset as usize;
+        puffin[blob_offset + 10] ^= 0xFF;
+
+        let err = DeletionVector::from_puffin_bytes(&puffin).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("CRC"), "expected CRC error: {msg}");
+    }
+
+    /// Verify the Puffin footer includes cardinality field.
+    #[test]
+    fn puffin_footer_has_cardinality() {
+        let mut dv = DeletionVector::new();
+        for i in 0..25u32 {
+            dv.mark_deleted(i);
+        }
+
+        let puffin = dv.to_puffin_bytes("data/test.parquet", 1, 1).unwrap();
+        let footer = parse_puffin_footer(&puffin).unwrap();
+        let blob_meta = footer
+            .blobs
+            .iter()
+            .find(|b| b.blob_type == "deletion-vector-v1")
+            .unwrap();
+        assert_eq!(blob_meta.fields.cardinality, 25);
+    }
+
+    /// The from_puffin_blob path (used by catalog.rs for DV union)
+    /// must also correctly decode the v3 envelope.
+    #[test]
+    fn from_puffin_blob_decodes_v3_envelope() {
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(10);
+        dv.mark_deleted(20);
+        dv.mark_deleted(30);
+
+        let encoded = dv.encode_puffin("data/test.parquet", 1, 1).unwrap();
+        let blob_offset = encoded.blob_offset as usize;
+        let blob_length = encoded.blob_length as usize;
+        let blob_slice = &encoded.bytes[blob_offset..blob_offset + blob_length];
+
+        let decoded = DeletionVector::from_puffin_blob(blob_slice).unwrap();
+        assert_eq!(decoded.cardinality(), 3);
+        assert!(decoded.is_deleted(10));
+        assert!(decoded.is_deleted(20));
+        assert!(decoded.is_deleted(30));
+        assert!(!decoded.is_deleted(15));
+    }
+
+    /// Empty DV still produces valid v3 envelope (bitmap_count=1, key=0,
+    /// empty 32-bit Roaring).
+    #[test]
+    fn empty_dv_v3_envelope_roundtrip() {
+        let dv = DeletionVector::new();
+        let encoded = dv.encode_puffin("data/test.parquet", 1, 1).unwrap();
+
+        let blob_offset = encoded.blob_offset as usize;
+        let blob_length = encoded.blob_length as usize;
+        let blob = &encoded.bytes[blob_offset..blob_offset + blob_length];
+
+        // Verify envelope structure.
+        assert_eq!(&blob[4..8], &DV_MAGIC);
+        let roaring64 = &blob[8..blob.len() - 4];
+        let bitmap_count = u64::from_le_bytes(roaring64[..8].try_into().unwrap());
+        assert_eq!(bitmap_count, 1);
+
+        // Roundtrip.
+        let decoded = DeletionVector::from_puffin_blob(blob).unwrap();
+        assert!(decoded.is_empty());
     }
 }

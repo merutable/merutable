@@ -2125,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "crc32fast",
  "iceberg",
  "merutable-parquet",
  "merutable-types",
