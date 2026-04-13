@@ -3,6 +3,20 @@
 //! Used for arena-allocating raw bytes within a memtable's lifetime.
 //! The arena is tied to one `Memtable` instance and is dropped when
 //! the memtable is flushed and released.
+//!
+//! # Note on `alloc_bytes` removal
+//!
+//! A previous `alloc_bytes(&self, n: usize) -> &mut [u8]` method was unsound:
+//! it acquired the inner `Mutex`, allocated from the `Bump`, dropped the
+//! `MutexGuard`, then returned a `&mut [u8]` with the lifetime of `&self` via
+//! `unsafe` pointer cast. Two concurrent calls could produce overlapping
+//! `&mut [u8]` slices, violating Rust's aliasing rules. The method had zero
+//! callers in the codebase (the skip-list hot path uses `bytes::Bytes`), so it
+//! was removed rather than made safe.
+//!
+//! If arena-backed allocation is needed in the future, the safe approach is to
+//! return an `(offset, len)` pair and provide a separate shared accessor, or to
+//! require `&mut self` so the borrow checker enforces exclusivity.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// as `bytes::Bytes` (reference-counted). The arena is here for future use
 /// (e.g., arena-backed key storage to reduce allocator pressure).
 pub struct Arena {
+    #[allow(dead_code)]
     inner: std::sync::Mutex<bumpalo::Bump>,
     allocated: AtomicUsize,
 }
@@ -22,21 +37,6 @@ impl Arena {
             inner: std::sync::Mutex::new(bumpalo::Bump::new()),
             allocated: AtomicUsize::new(0),
         }
-    }
-
-    /// Allocate `n` bytes. Returns a mutable slice backed by the arena.
-    /// The slice is valid for the lifetime of the `Arena`.
-    #[allow(clippy::mut_from_ref)]
-    pub fn alloc_bytes(&self, n: usize) -> &mut [u8] {
-        let bump = self.inner.lock().unwrap();
-        self.allocated.fetch_add(n, Ordering::Relaxed);
-        // SAFETY: We extend the lifetime to 'static here, but the caller
-        // must not outlive the Arena. This is safe because Arena holds
-        // the Bump and is the sole owner of the allocated memory.
-        // In practice, callers copy data into Bytes immediately.
-        let slice = bump.alloc_slice_fill_default::<u8>(n);
-        // SAFETY: The Bump is heap-allocated and pinned for the Arena's lifetime.
-        unsafe { &mut *(slice as *mut [u8]) }
     }
 
     /// Total bytes allocated through this arena.

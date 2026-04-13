@@ -12,18 +12,19 @@ use bytes::Bytes;
 use merutable_types::{
     key::InternalKey,
     level::{Level, ParquetFileMeta},
-    schema::TableSchema,
+    schema::{ColumnType, TableSchema},
     value::Row,
     MeruError, Result,
 };
 use parquet::{
     arrow::ArrowWriter,
-    basic::Compression,
+    basic::{Compression, Encoding},
     file::{
-        properties::WriterProperties,
+        properties::{WriterProperties, WriterPropertiesBuilder},
         reader::FileReader,
         serialized_reader::{ReadOptionsBuilder, SerializedFileReader},
     },
+    schema::types::ColumnPath,
 };
 
 use crate::{
@@ -55,18 +56,103 @@ pub fn target_row_group_bytes(level: Level) -> usize {
 
 /// Target data-page **byte** size per LSM level. Same hot→cold rationale
 /// as `target_row_group_bytes`: small pages favor selective reads at L0,
-/// large pages favor scan throughput at L2+. The schedule is a 4× geometric
-/// progression: each level's page is 4× the previous level's. Cold-tier
-/// at 128 KiB is 8× smaller than the Parquet default of 1 MiB — large
-/// enough that snappy/dictionary compression and I/O amortization both
-/// work, small enough that even cold-tier point lookups don't have to
-/// decompress hundreds of KiB to extract a single row.
+/// large pages favor scan throughput at L2+.
+///
+/// ## Per-column page-size rationale
+///
+/// Parquet-rs (v53) does NOT support per-column `data_page_size_limit` —
+/// the setting is global across all columns within a file. To approximate
+/// per-column tuning:
+///
+/// - **L0** (rowstore): 8 KiB globally. All columns (`_merutable_ikey`,
+///   `_merutable_value`, typed cols) use small pages for fast point lookups.
+///   The `_merutable_ikey` and `_merutable_value` columns carry the KV
+///   store's hot-path data; small pages minimize decompression per lookup.
+///
+/// - **L1+** (columnstore): 128 KiB globally for analytical scan throughput
+///   on typed columns. The `_merutable_ikey` column uses PLAIN encoding
+///   (set by `build_column_encoding_props`) so its pages remain direct-access
+///   friendly even at the larger page size — PLAIN-encoded binary keys
+///   decompress with zero overhead vs. dictionary/RLE.
+///
+/// The per-column ENCODING settings (`build_column_encoding_props`) provide
+/// the differentiation that per-column page sizes cannot:
+///   - `_merutable_ikey`: PLAIN — O(1) decode per key, ideal for lookups
+///   - `_merutable_value` (L0 only): PLAIN — opaque postcard blobs
+///   - Int32/Int64 typed cols: DELTA_BINARY_PACKED — optimal for sorted ints
+///   - Float/Double typed cols: BYTE_STREAM_SPLIT — IEEE 754 byte-transposition
+///   - ByteArray typed cols: RLE_DICTIONARY — high compression for strings
 pub fn target_data_page_bytes(level: Level) -> usize {
     match level.0 {
         0 => 8 * 1024,   // 8 KiB   — hot, OS-page-aligned, point-lookup tier
         1 => 32 * 1024,  // 32 KiB  — warm
         _ => 128 * 1024, // 128 KiB — cold (analytics-friendly without 1 MiB bloat)
     }
+}
+
+/// Apply per-column encoding + dictionary settings to a `WriterPropertiesBuilder`.
+///
+/// At L0 (rowstore): all columns use PLAIN encoding — no dictionary overhead,
+/// fastest decode for point lookups via `_merutable_ikey` and `_merutable_value`.
+///
+/// At L1+ (columnstore): `_merutable_ikey` stays PLAIN (key-lookup column),
+/// typed columns get analytics-optimized encodings.
+fn build_column_encoding_props(
+    mut builder: WriterPropertiesBuilder,
+    schema: &TableSchema,
+    level: Level,
+) -> WriterPropertiesBuilder {
+    let ikey_col = ColumnPath::new(vec!["_merutable_ikey".to_string()]);
+    builder = builder
+        .set_column_encoding(ikey_col.clone(), Encoding::PLAIN)
+        .set_column_dictionary_enabled(ikey_col, false);
+
+    if level.0 == 0 {
+        // L0: postcard value blob — PLAIN, no dictionary
+        let value_col = ColumnPath::new(vec!["_merutable_value".to_string()]);
+        builder = builder
+            .set_column_encoding(value_col.clone(), Encoding::PLAIN)
+            .set_column_dictionary_enabled(value_col, false);
+
+        // L0 typed columns: PLAIN for rowstore fast decode
+        for col_def in &schema.columns {
+            let col_path = ColumnPath::new(vec![col_def.name.clone()]);
+            builder = builder
+                .set_column_encoding(col_path.clone(), Encoding::PLAIN)
+                .set_column_dictionary_enabled(col_path, false);
+        }
+    } else {
+        // L1+: typed columns get analytics-optimized encodings
+        for col_def in &schema.columns {
+            let col_path = ColumnPath::new(vec![col_def.name.clone()]);
+            match col_def.col_type {
+                ColumnType::Int32 | ColumnType::Int64 => {
+                    builder = builder
+                        .set_column_encoding(col_path.clone(), Encoding::DELTA_BINARY_PACKED)
+                        .set_column_dictionary_enabled(col_path, false);
+                }
+                ColumnType::Float | ColumnType::Double => {
+                    builder = builder
+                        .set_column_encoding(col_path.clone(), Encoding::BYTE_STREAM_SPLIT)
+                        .set_column_dictionary_enabled(col_path, false);
+                }
+                ColumnType::ByteArray => {
+                    // RLE_DICTIONARY is parquet-rs's default and optimal for
+                    // string/categorical columns; just make sure it's enabled.
+                    builder = builder.set_column_dictionary_enabled(col_path, true);
+                }
+                ColumnType::Boolean => {
+                    builder = builder.set_column_encoding(col_path, Encoding::RLE);
+                }
+                ColumnType::FixedLenByteArray(_) => {
+                    builder = builder
+                        .set_column_encoding(col_path.clone(), Encoding::PLAIN)
+                        .set_column_dictionary_enabled(col_path, false);
+                }
+            }
+        }
+    }
+    builder
 }
 
 /// Row count to pass to `set_max_row_group_size` for a given level,
@@ -207,12 +293,13 @@ fn arrow_write_pass(
         })
         .collect();
 
-    let props = WriterProperties::builder()
+    let builder = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_max_row_group_size(target_rows_per_row_group(level))
         .set_data_page_size_limit(target_data_page_bytes(level))
-        .set_key_value_metadata(Some(kv_meta))
-        .build();
+        .set_key_value_metadata(Some(kv_meta));
+    let builder = build_column_encoding_props(builder, schema, level);
+    let props = builder.build();
 
     let buf: Vec<u8> = Vec::new();
     let mut writer = ArrowWriter::try_new(buf, arrow_schema.clone(), Some(props))

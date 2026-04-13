@@ -32,6 +32,7 @@ use merutable_types::{level::Level, schema::TableSchema, MeruError, Result};
 use tokio::sync::Mutex;
 
 use crate::{
+    deletion_vector::DeletionVector,
     manifest::{DvLocation, Manifest},
     snapshot::SnapshotTransaction,
     version::Version,
@@ -115,8 +116,46 @@ impl IcebergCatalog {
         // step was a real bug: the manifest used to stamp (0, 0)
         // placeholders and every deleted row reappeared on reload.
         let mut dv_locations: HashMap<String, DvLocation> = HashMap::new();
-        for (parquet_path, dv) in &txn.dvs {
-            let encoded = dv.encode_puffin(parquet_path, new_snapshot_id, new_snapshot_id)?;
+        for (parquet_path, new_dv) in &txn.dvs {
+            // If the file already has a DV from a prior partial compaction,
+            // load it and union with the new DV. Without this, the second
+            // partial compaction's DV replaces the first and rows deleted
+            // in the first compaction silently reappear.
+            let merged_dv = match current
+                .entries
+                .iter()
+                .find(|e| e.status != "deleted" && e.path == *parquet_path)
+            {
+                Some(entry)
+                    if entry.dv_path.is_some()
+                        && entry.dv_offset.is_some()
+                        && entry.dv_length.is_some() =>
+                {
+                    let existing_puffin_path = self.base_path.join(entry.dv_path.as_ref().unwrap());
+                    let puffin_data = tokio::fs::read(&existing_puffin_path)
+                        .await
+                        .map_err(MeruError::Io)?;
+                    let offset = entry.dv_offset.unwrap() as usize;
+                    let length = entry.dv_length.unwrap() as usize;
+                    if offset + length > puffin_data.len() {
+                        return Err(MeruError::Corruption(format!(
+                            "existing DV blob for '{}' at offset {offset} length {length} \
+                             exceeds puffin file size {}",
+                            parquet_path,
+                            puffin_data.len()
+                        )));
+                    }
+                    let existing_dv =
+                        DeletionVector::from_puffin_blob(&puffin_data[offset..offset + length])?;
+                    let mut merged = existing_dv;
+                    merged.union_with(new_dv);
+                    merged
+                }
+                _ => new_dv.clone(),
+            };
+
+            let encoded =
+                merged_dv.encode_puffin(parquet_path, new_snapshot_id, new_snapshot_id)?;
             let puffin_filename = format!(
                 "{}.dv-{new_snapshot_id}.puffin",
                 Path::new(parquet_path)
@@ -139,6 +178,22 @@ impl IcebergCatalog {
             tokio::fs::write(&abs_puffin_path, &encoded.bytes)
                 .await
                 .map_err(MeruError::Io)?;
+            // fsync the puffin file so deleted-row bitmaps survive a crash.
+            tokio::fs::File::open(&abs_puffin_path)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
+            // fsync the parent directory so the new directory entry is durable.
+            if let Some(parent) = abs_puffin_path.parent() {
+                tokio::fs::File::open(parent)
+                    .await
+                    .map_err(MeruError::Io)?
+                    .sync_all()
+                    .await
+                    .map_err(MeruError::Io)?;
+            }
 
             dv_locations.insert(
                 parquet_path.clone(),
@@ -165,6 +220,14 @@ impl IcebergCatalog {
         tokio::fs::write(&meta_path, &json)
             .await
             .map_err(MeruError::Io)?;
+        // fsync the metadata JSON so it is complete before the version-hint
+        // points at it. Without this, a crash can leave a truncated file.
+        tokio::fs::File::open(&meta_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
 
         // Update version hint (atomic: write tmp + rename).
         let hint_path = self.base_path.join("version-hint.text");
@@ -172,7 +235,30 @@ impl IcebergCatalog {
         tokio::fs::write(&tmp_hint, new_snapshot_id.to_string())
             .await
             .map_err(MeruError::Io)?;
+        // fsync the tmp hint file before rename so the content is durable.
+        tokio::fs::File::open(&tmp_hint)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
         tokio::fs::rename(&tmp_hint, &hint_path)
+            .await
+            .map_err(MeruError::Io)?;
+        // fsync the metadata directory so both the new metadata JSON entry
+        // and the version-hint rename are durable (required on ext4/btrfs).
+        let metadata_dir = self.base_path.join("metadata");
+        tokio::fs::File::open(&metadata_dir)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
+        // Also fsync the base directory (version-hint.text lives here).
+        tokio::fs::File::open(&self.base_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
             .await
             .map_err(MeruError::Io)?;
 
@@ -389,5 +475,106 @@ mod tests {
         let l0 = &v.files_at(Level(0))[0];
         assert!(l0.dv_path.is_some()); // but now has a DV
         assert_eq!(v.files_at(Level(1)).len(), 1);
+    }
+
+    /// Regression test: two successive partial compactions on the same
+    /// file must produce a DV that is the union of both. Before the fix,
+    /// the second DV replaced the first and rows deleted in the first
+    /// partial compaction silently reappeared.
+    #[tokio::test]
+    async fn successive_dv_updates_are_unioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+
+        // Flush a file with 100 rows.
+        let mut txn1 = SnapshotTransaction::new();
+        txn1.add_file(IcebergDataFile {
+            path: "data/L0/a.parquet".into(),
+            file_size: 1024,
+            num_rows: 100,
+            meta: test_meta(0),
+        });
+        catalog.commit(&txn1, schema.clone()).await.unwrap();
+
+        // First partial compaction: delete rows 0..10.
+        let mut txn2 = SnapshotTransaction::new();
+        let mut dv1 = DeletionVector::new();
+        for i in 0..10u32 {
+            dv1.mark_deleted(i);
+        }
+        txn2.add_dv("data/L0/a.parquet".into(), dv1);
+        txn2.add_file(IcebergDataFile {
+            path: "data/L1/batch1.parquet".into(),
+            file_size: 256,
+            num_rows: 10,
+            meta: test_meta(1),
+        });
+        let v2 = catalog.commit(&txn2, schema.clone()).await.unwrap();
+        let l0_after_first = &v2.files_at(Level(0))[0];
+        assert!(l0_after_first.dv_path.is_some());
+
+        // Read back the DV puffin written by the first partial compaction
+        // to confirm it has exactly 10 deleted rows.
+        let puffin_path_1 = tmp.path().join(l0_after_first.dv_path.as_ref().unwrap());
+        let puffin_data_1 = tokio::fs::read(&puffin_path_1).await.unwrap();
+        let dv_after_first = DeletionVector::from_puffin_bytes(&puffin_data_1).unwrap();
+        assert_eq!(dv_after_first.cardinality(), 10);
+
+        // Second partial compaction: delete rows 50..60 (disjoint from
+        // the first set). The commit must union with the existing DV.
+        let mut txn3 = SnapshotTransaction::new();
+        let mut dv2 = DeletionVector::new();
+        for i in 50..60u32 {
+            dv2.mark_deleted(i);
+        }
+        txn3.add_dv("data/L0/a.parquet".into(), dv2);
+        txn3.add_file(IcebergDataFile {
+            path: "data/L1/batch2.parquet".into(),
+            file_size: 256,
+            num_rows: 10,
+            meta: {
+                let mut m = test_meta(1);
+                m.seq_min = 11;
+                m.seq_max = 20;
+                m
+            },
+        });
+        let v3 = catalog.commit(&txn3, schema.clone()).await.unwrap();
+
+        // The L0 file must still exist with a DV.
+        assert_eq!(v3.l0_file_count(), 1);
+        let l0_after_second = &v3.files_at(Level(0))[0];
+        assert!(l0_after_second.dv_path.is_some());
+
+        // Read back the DV puffin and verify it is the UNION of both
+        // partial compactions: rows 0..10 AND 50..60 = 20 deleted rows.
+        let puffin_path_2 = tmp.path().join(l0_after_second.dv_path.as_ref().unwrap());
+        let puffin_data_2 = tokio::fs::read(&puffin_path_2).await.unwrap();
+        let dv_merged = DeletionVector::from_puffin_bytes(&puffin_data_2).unwrap();
+        assert_eq!(
+            dv_merged.cardinality(),
+            20,
+            "DV must be union of both partial compactions (10 + 10 = 20)"
+        );
+        // Verify specific row positions from both compactions.
+        for i in 0..10u32 {
+            assert!(
+                dv_merged.is_deleted(i),
+                "row {i} from first compaction missing"
+            );
+        }
+        for i in 50..60u32 {
+            assert!(
+                dv_merged.is_deleted(i),
+                "row {i} from second compaction missing"
+            );
+        }
+        // Rows outside both ranges must NOT be deleted.
+        for i in 10..50u32 {
+            assert!(!dv_merged.is_deleted(i), "row {i} should not be deleted");
+        }
     }
 }

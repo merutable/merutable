@@ -17,7 +17,7 @@ use std::{
 };
 
 use merutable_types::{sequence::SeqNum, MeruError, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     batch::WriteBatch,
@@ -238,16 +238,29 @@ impl WalManager {
                                 batches.push(batch);
                             }
                             Err(e) => {
-                                // Corrupt batch in an otherwise valid record — stop recovery.
-                                tracing::warn!(error = %e, "corrupt WriteBatch during recovery, stopping");
-                                return Ok((batches, max_seq, max_log_number));
+                                // Corrupt batch in an otherwise valid record —
+                                // stop reading THIS file (tail may be torn) but
+                                // continue to the next WAL file, which belongs
+                                // to an independent memtable generation.
+                                warn!(
+                                    log_num,
+                                    error = %e,
+                                    "corrupt WriteBatch in WAL file, skipping remainder of this file"
+                                );
+                                break;
                             }
                         }
                     }
                     Err(e) => {
-                        // CRC mismatch / truncation — stop cleanly (partial tail is expected).
-                        tracing::warn!(error = %e, "WAL read error during recovery, stopping at this point");
-                        return Ok((batches, max_seq, max_log_number));
+                        // CRC mismatch / truncation — stop reading this file
+                        // (partial tail is expected on crash) but continue to
+                        // the next WAL file.
+                        warn!(
+                            log_num,
+                            error = %e,
+                            "WAL read error, skipping remainder of this file"
+                        );
+                        break;
                     }
                 }
             }
@@ -361,6 +374,51 @@ mod tests {
         let (batches, _, _) = WalManager::recover_from_dir(dir.path()).unwrap();
         // May get 0 or 1 batches depending on where truncation fell.
         let _ = batches;
+    }
+
+    #[test]
+    fn corrupt_file_does_not_block_later_files() {
+        let dir = tmp_dir();
+        {
+            let mut mgr = WalManager::open(dir.path(), 1).unwrap();
+
+            // Write a batch to file 1.
+            let mut b1 = WriteBatch::new(SeqNum(1));
+            b1.put(Bytes::from("k1"), Bytes::from("v1"));
+            mgr.append(&b1).unwrap();
+
+            // Rotate → file 2.
+            mgr.rotate().unwrap();
+
+            // Write a batch to file 2.
+            let mut b2 = WriteBatch::new(SeqNum(2));
+            b2.put(Bytes::from("k2"), Bytes::from("v2"));
+            mgr.append(&b2).unwrap();
+        }
+
+        // Corrupt the middle of file 1 so the CRC check fails.
+        let wal1 = dir.path().join("000001.wal");
+        let mut bytes = std::fs::read(&wal1).unwrap();
+        assert!(bytes.len() > 10, "WAL file too short to corrupt");
+        // Flip bytes in the payload region (past the 7-byte header).
+        for i in 8..bytes.len().min(16) {
+            bytes[i] ^= 0xFF;
+        }
+        std::fs::write(&wal1, &bytes).unwrap();
+
+        // Recovery must still return the batch from file 2.
+        let (batches, max_seq, max_log) = WalManager::recover_from_dir(dir.path()).unwrap();
+
+        // File 1's batch may or may not survive depending on where
+        // corruption landed, but file 2's batch MUST be present.
+        let has_seq2 = batches.iter().any(|b| b.sequence == SeqNum(2));
+        assert!(
+            has_seq2,
+            "batch from file 2 must be recovered despite corruption in file 1; got sequences: {:?}",
+            batches.iter().map(|b| b.sequence).collect::<Vec<_>>()
+        );
+        assert_eq!(max_seq, SeqNum(2));
+        assert_eq!(max_log, 2);
     }
 
     #[test]
