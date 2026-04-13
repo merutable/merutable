@@ -300,7 +300,10 @@ mod tests {
     #[test]
     fn empty_manifest_roundtrip() {
         let m = Manifest::empty(test_schema());
-        assert_eq!(m.format_version, 3, "new manifests must be format-version 3");
+        assert_eq!(
+            m.format_version, 3,
+            "new manifests must be format-version 3"
+        );
         let json = m.to_json().unwrap();
         let decoded = Manifest::from_json(&json).unwrap();
         assert_eq!(decoded.format_version, 3);

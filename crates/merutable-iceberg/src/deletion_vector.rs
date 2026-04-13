@@ -657,9 +657,7 @@ mod tests {
         dv.mark_deleted(7);
         dv.mark_deleted(42);
 
-        let encoded = dv
-            .encode_puffin("data/L0/test.parquet", 1, 1)
-            .unwrap();
+        let encoded = dv.encode_puffin("data/L0/test.parquet", 1, 1).unwrap();
 
         // Extract blob from the Puffin file.
         let blob_offset = encoded.blob_offset as usize;
@@ -668,10 +666,18 @@ mod tests {
 
         // First 4 bytes: length (u32 BE) = total_blob_len - 4.
         let length = u32::from_be_bytes(blob[..4].try_into().unwrap()) as usize;
-        assert_eq!(length, blob.len() - 4, "length field must cover magic+data+CRC");
+        assert_eq!(
+            length,
+            blob.len() - 4,
+            "length field must cover magic+data+CRC"
+        );
 
         // Next 4 bytes: DV magic.
-        assert_eq!(&blob[4..8], &DV_MAGIC, "DV magic D1D33964 must follow length");
+        assert_eq!(
+            &blob[4..8],
+            &DV_MAGIC,
+            "DV magic D1D33964 must follow length"
+        );
 
         // Last 4 bytes: CRC32 (u32 BE).
         let crc_offset = blob.len() - 4;

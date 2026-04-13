@@ -12,6 +12,18 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 
+def _display_graphviz(dot):
+    """Display a Graphviz object, falling back to DOT source if `dot` binary is missing."""
+    try:
+        from IPython.display import display, SVG
+        svg_str = dot.pipe(format="svg", encoding="utf-8")
+        display(SVG(svg_str))
+    except Exception:
+        # Fallback: print DOT source when Graphviz binaries aren't installed.
+        print(dot.source)
+    return dot
+
+
 # ── Graphviz LSM tree rendering ──────────────────────────────────────────────
 
 def render_tree(stats: dict, title: str = "merutable LSM state"):
@@ -70,7 +82,7 @@ def render_tree(stats: dict, title: str = "merutable LSM state"):
         dot.edge(prev_cluster, first_file, style="dashed", color="#90A4AE")
         prev_cluster = first_file
 
-    return dot
+    return _display_graphviz(dot)
 
 
 def render_htap_flow():
@@ -104,7 +116,7 @@ def render_htap_flow():
     dot.edge("pq", "duck", label="read_parquet()", color="#C62828")
     dot.edge("iceberg", "duck", label="metadata", style="dashed", color="#6A1B9A")
 
-    return dot
+    return _display_graphviz(dot)
 
 
 # ── Matplotlib ────────────────────────────────────────────────────────────────
@@ -248,24 +260,23 @@ def file_anatomy(parquet_path: str):
     print()
 
     # Footer KV metadata.
+    # pyarrow returns metadata keys/values as bytes.
     kv = meta.metadata
     if kv:
         print("  Footer KV metadata:")
-        for key in sorted(kv.keys()):
-            val = kv[key]
+        for raw_key in sorted(kv.keys()):
+            raw_val = kv[raw_key]
+            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else str(raw_key)
             if key.startswith("merutable."):
-                # Show size for binary blobs.
-                if isinstance(val, bytes):
-                    print(f"    {key}: {len(val)} bytes")
-                else:
-                    # Try to decode as UTF-8.
-                    try:
-                        decoded = val.decode("utf-8") if isinstance(val, bytes) else val
-                        if len(decoded) > 200:
-                            decoded = decoded[:200] + "..."
-                        print(f"    {key}: {decoded}")
-                    except (UnicodeDecodeError, AttributeError):
-                        print(f"    {key}: {len(val)} bytes (binary)")
+                print(f"    {key}: {len(raw_val)} bytes")
+            else:
+                try:
+                    decoded = raw_val.decode("utf-8") if isinstance(raw_val, bytes) else str(raw_val)
+                    if len(decoded) > 200:
+                        decoded = decoded[:200] + "..."
+                    print(f"    {key}: {decoded}")
+                except (UnicodeDecodeError, AttributeError):
+                    print(f"    {key}: {len(raw_val)} bytes (binary)")
     else:
         print("  (no footer KV metadata)")
     print(f"{'─' * 60}")
@@ -280,7 +291,8 @@ def inspect_bloom(parquet_path: str):
 
     bloom_key = None
     for k in kv:
-        if "bloom" in k.lower():
+        k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+        if "bloom" in k_str.lower():
             bloom_key = k
             break
 
@@ -291,7 +303,8 @@ def inspect_bloom(parquet_path: str):
     blob = kv[bloom_key]
     if isinstance(blob, str):
         blob = blob.encode("latin-1")
-    print(f"  Bloom filter key: {bloom_key}")
+    key_str = bloom_key.decode("utf-8") if isinstance(bloom_key, bytes) else str(bloom_key)
+    print(f"  Bloom filter key: {key_str}")
     print(f"  Blob size: {len(blob)} bytes")
 
     # merutable bloom is FastLocalBloom: cache-line-aligned, 64-byte buckets.
@@ -314,7 +327,8 @@ def inspect_kv_index(parquet_path: str):
 
     idx_key = None
     for k in kv:
-        if "kv_index" in k.lower():
+        k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+        if "kv_index" in k_str.lower():
             idx_key = k
             break
 
@@ -325,7 +339,8 @@ def inspect_kv_index(parquet_path: str):
     blob = kv[idx_key]
     if isinstance(blob, str):
         blob = blob.encode("latin-1")
-    print(f"  KvSparseIndex key: {idx_key}")
+    key_str = idx_key.decode("utf-8") if isinstance(idx_key, bytes) else str(idx_key)
+    print(f"  KvSparseIndex key: {key_str}")
     print(f"  Blob size: {len(blob)} bytes")
 
     # KvSparseIndex header: num_entries (u32 LE), restart_interval (u32 LE).

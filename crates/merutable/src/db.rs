@@ -73,6 +73,19 @@ impl MeruDB {
         self.engine.put(pk_values, row).await
     }
 
+    /// Batch insert/update. All rows share a single WAL sync — N× faster than
+    /// individual `put()` calls.
+    pub async fn put_batch(&self, rows: Vec<Row>) -> Result<SeqNum> {
+        use merutable_engine::write_path::{self, MutationBatch};
+
+        let mut batch = MutationBatch::new();
+        for row in rows {
+            let pk_values = row.pk_values(&self.engine.schema().primary_key)?;
+            batch.put(pk_values, row);
+        }
+        write_path::apply_batch(&self.engine, batch).await
+    }
+
     /// Delete by primary key values.
     pub async fn delete(&self, pk_values: Vec<FieldValue>) -> Result<SeqNum> {
         self.engine.delete(pk_values).await
@@ -272,6 +285,24 @@ mod tests {
         assert!(db.get(&[FieldValue::Int64(0)]).unwrap().is_some());
         assert!(db.get(&[FieldValue::Int64(499)]).unwrap().is_some());
         assert!(db.get(&[FieldValue::Int64(500)]).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn put_batch_writes_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+
+        let rows = (0..100i64)
+            .map(|i| make_row(i, &format!("batch_{i}")))
+            .collect::<Vec<_>>();
+
+        db.put_batch(rows).await.unwrap();
+
+        // All 100 rows must be readable.
+        let results = db.scan(None, None).unwrap();
+        assert_eq!(results.len(), 100);
+        assert!(db.get(&[FieldValue::Int64(0)]).unwrap().is_some());
+        assert!(db.get(&[FieldValue::Int64(99)]).unwrap().is_some());
     }
 
     #[tokio::test]

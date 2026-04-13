@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 620" font-family="system-ui,-apple-system,Helvetica,Arial,sans-serif" font-size="12">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#546E7A"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#C62828"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="620" fill="#FAFAFA" rx="8"/>
+
+  <!-- Title -->
+  <text x="550" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#212121">merutable — LSM + Iceberg v3 Architecture</text>
+
+  <!-- ═══════════ LEFT: Write Path ═══════════ -->
+  <text x="50" y="60" font-size="11" font-weight="bold" fill="#1565C0">WRITE PATH</text>
+
+  <!-- API -->
+  <rect x="30" y="70" width="160" height="32" rx="4" fill="#E3F2FD" stroke="#1565C0" stroke-width="1.5"/>
+  <text x="110" y="91" text-anchor="middle" font-weight="600" fill="#0D47A1">MeruDB API</text>
+  <text x="110" y="91" text-anchor="middle" font-size="9" fill="#546E7A" dy="12">put / delete / get / scan</text>
+
+  <!-- WAL -->
+  <rect x="30" y="120" width="70" height="28" rx="4" fill="#FFF3E0" stroke="#E65100" stroke-width="1"/>
+  <text x="65" y="139" text-anchor="middle" font-size="10" fill="#BF360C">WAL</text>
+
+  <!-- Memtable -->
+  <rect x="120" y="120" width="90" height="28" rx="4" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1"/>
+  <text x="165" y="139" text-anchor="middle" font-size="10" fill="#1B5E20">Memtable</text>
+  <text x="165" y="139" text-anchor="middle" font-size="8" fill="#4CAF50" dy="10">skip-list (lock-free)</text>
+
+  <!-- Arrows: API → WAL, API → Memtable -->
+  <line x1="70" y1="102" x2="65" y2="118" stroke="#546E7A" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="150" y1="102" x2="165" y2="118" stroke="#546E7A" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- ═══════════ CENTER: LSM Levels ═══════════ -->
+  <text x="280" y="60" font-size="11" font-weight="bold" fill="#2E7D32">LSM LEVELS</text>
+
+  <!-- L0 -->
+  <rect x="240" y="70" width="310" height="85" rx="6" fill="none" stroke="#78909C" stroke-width="1" stroke-dasharray="4"/>
+  <text x="250" y="85" font-size="11" font-weight="bold" fill="#37474F">L0 — Rowstore</text>
+  <text x="250" y="98" font-size="9" fill="#607D8B">8 KiB pages · PLAIN encoding · 4 MiB row groups</text>
+
+  <!-- L0 file boxes -->
+  <rect x="250" y="105" width="140" height="40" rx="3" fill="#E3F2FD" stroke="#42A5F5" stroke-width="1"/>
+  <text x="320" y="119" text-anchor="middle" font-size="9" font-weight="600" fill="#1565C0">_merutable_ikey</text>
+  <text x="320" y="131" text-anchor="middle" font-size="8" fill="#1976D2">_merutable_value (blob)</text>
+  <text x="320" y="141" text-anchor="middle" font-size="8" fill="#42A5F5">+ typed columns</text>
+
+  <!-- Bloom + Index indicators on L0 -->
+  <rect x="400" y="105" width="60" height="18" rx="3" fill="#FCE4EC" stroke="#E91E63" stroke-width="0.5"/>
+  <text x="430" y="117" text-anchor="middle" font-size="8" fill="#C2185B">Bloom</text>
+  <rect x="400" y="127" width="60" height="18" rx="3" fill="#F3E5F5" stroke="#9C27B0" stroke-width="0.5"/>
+  <text x="430" y="139" text-anchor="middle" font-size="8" fill="#7B1FA2">KvSparseIdx</text>
+
+  <!-- L1 -->
+  <rect x="240" y="165" width="310" height="75" rx="6" fill="none" stroke="#78909C" stroke-width="1" stroke-dasharray="4"/>
+  <text x="250" y="180" font-size="11" font-weight="bold" fill="#37474F">L1 — Warm</text>
+  <text x="250" y="193" font-size="9" fill="#607D8B">32 KiB pages · per-column encodings · 32 MiB row groups</text>
+
+  <rect x="250" y="200" width="140" height="30" rx="3" fill="#E8F5E9" stroke="#66BB6A" stroke-width="1"/>
+  <text x="320" y="214" text-anchor="middle" font-size="9" font-weight="600" fill="#2E7D32">_merutable_ikey</text>
+  <text x="320" y="225" text-anchor="middle" font-size="8" fill="#43A047">typed columns only</text>
+
+  <rect x="400" y="200" width="60" height="13" rx="3" fill="#FCE4EC" stroke="#E91E63" stroke-width="0.5"/>
+  <text x="430" y="210" text-anchor="middle" font-size="7" fill="#C2185B">Bloom</text>
+  <rect x="400" y="216" width="60" height="13" rx="3" fill="#F3E5F5" stroke="#9C27B0" stroke-width="0.5"/>
+  <text x="430" y="226" text-anchor="middle" font-size="7" fill="#7B1FA2">KvSparseIdx</text>
+  <rect x="470" y="200" width="70" height="30" rx="3" fill="#FFF3E0" stroke="#FF9800" stroke-width="0.5"/>
+  <text x="505" y="214" text-anchor="middle" font-size="7" fill="#E65100">Deletion</text>
+  <text x="505" y="225" text-anchor="middle" font-size="7" fill="#E65100">Vector (DV)</text>
+
+  <!-- L2+ -->
+  <rect x="240" y="250" width="310" height="75" rx="6" fill="none" stroke="#78909C" stroke-width="1" stroke-dasharray="4"/>
+  <text x="250" y="265" font-size="11" font-weight="bold" fill="#37474F">L2+ — Columnstore</text>
+  <text x="250" y="278" font-size="9" fill="#607D8B">128 KiB pages · DELTA/SPLIT/DICT · 128 MiB row groups</text>
+
+  <rect x="250" y="285" width="250" height="30" rx="3" fill="#E8F5E9" stroke="#66BB6A" stroke-width="1"/>
+  <text x="375" y="299" text-anchor="middle" font-size="9" font-weight="600" fill="#2E7D32">Analytics-optimized typed columns</text>
+  <text x="375" y="310" text-anchor="middle" font-size="8" fill="#43A047">DELTA_BINARY_PACKED · BYTE_STREAM_SPLIT · RLE_DICTIONARY</text>
+
+  <!-- Arrows between levels -->
+  <line x1="395" y1="155" x2="395" y2="163" stroke="#546E7A" stroke-width="1" marker-end="url(#arrow)"/>
+  <line x1="395" y1="240" x2="395" y2="248" stroke="#546E7A" stroke-width="1" marker-end="url(#arrow)"/>
+  <text x="410" y="160" font-size="8" fill="#E65100">compact</text>
+  <text x="410" y="247" font-size="8" fill="#E65100">compact</text>
+
+  <!-- Arrow from Memtable to L0 -->
+  <line x1="165" y1="150" x2="248" y2="115" stroke="#546E7A" stroke-width="1" marker-end="url(#arrow)"/>
+  <text x="190" y="125" font-size="8" fill="#E65100">flush</text>
+
+  <!-- ═══════════ RIGHT: Iceberg + HTAP ═══════════ -->
+  <text x="620" y="60" font-size="11" font-weight="bold" fill="#6A1B9A">ICEBERG v3</text>
+
+  <!-- Manifest -->
+  <rect x="600" y="70" width="180" height="55" rx="4" fill="#F3E5F5" stroke="#6A1B9A" stroke-width="1.5"/>
+  <text x="690" y="88" text-anchor="middle" font-size="10" font-weight="600" fill="#4A148C">Manifest (format_version=3)</text>
+  <text x="690" y="101" text-anchor="middle" font-size="8" fill="#7B1FA2">snapshots · file entries · DV coords</text>
+  <text x="690" y="113" text-anchor="middle" font-size="8" fill="#7B1FA2">every commit = new snapshot</text>
+
+  <!-- Puffin DV -->
+  <rect x="600" y="135" width="180" height="40" rx="4" fill="#FFF3E0" stroke="#E65100" stroke-width="1"/>
+  <text x="690" y="153" text-anchor="middle" font-size="10" font-weight="600" fill="#BF360C">Puffin DV Files</text>
+  <text x="690" y="166" text-anchor="middle" font-size="8" fill="#E65100">deletion-vector-v1 · D1D33964 magic · CRC32</text>
+
+  <!-- Arrow: LSM → Manifest -->
+  <line x1="552" y1="97" x2="598" y2="97" stroke="#6A1B9A" stroke-width="1" marker-end="url(#arrow)"/>
+
+  <!-- ═══════════ HTAP Section ═══════════ -->
+  <rect x="590" y="200" width="500" height="130" rx="8" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.5"/>
+  <text x="840" y="220" text-anchor="middle" font-size="13" font-weight="bold" fill="#F57F17">HTAP — Zero ETL</text>
+
+  <!-- merutable writes -->
+  <rect x="610" y="235" width="130" height="35" rx="4" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1"/>
+  <text x="675" y="252" text-anchor="middle" font-size="9" font-weight="600" fill="#1B5E20">merutable</text>
+  <text x="675" y="263" text-anchor="middle" font-size="8" fill="#2E7D32">put() / flush()</text>
+
+  <!-- Parquet files (shared) -->
+  <rect x="770" y="235" width="100" height="35" rx="4" fill="#ECEFF1" stroke="#78909C" stroke-width="1.5"/>
+  <text x="820" y="252" text-anchor="middle" font-size="9" font-weight="bold" fill="#37474F">Parquet</text>
+  <text x="820" y="263" text-anchor="middle" font-size="8" fill="#546E7A">same bytes</text>
+
+  <!-- DuckDB / Spark / Trino -->
+  <rect x="900" y="228" width="170" height="50" rx="4" fill="#FCE4EC" stroke="#C62828" stroke-width="1"/>
+  <text x="985" y="248" text-anchor="middle" font-size="9" font-weight="600" fill="#B71C1C">DuckDB · Spark · Trino</text>
+  <text x="985" y="261" text-anchor="middle" font-size="8" fill="#C62828">SELECT * FROM read_parquet(...)</text>
+  <text x="985" y="273" text-anchor="middle" font-size="8" fill="#E53935">no ETL · no format conversion</text>
+
+  <!-- Arrows -->
+  <line x1="742" y1="252" x2="768" y2="252" stroke="#546E7A" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="872" y1="252" x2="898" y2="252" stroke="#C62828" stroke-width="1.5" marker-end="url(#arrow-red)"/>
+
+  <!-- Read path note -->
+  <text x="615" y="305" font-size="9" fill="#37474F" font-style="italic">Read path: memtable → L0 (bloom → KvSparseIndex → scan) → L1+ (bloom → binary search)</text>
+  <text x="615" y="318" font-size="9" fill="#37474F" font-style="italic">Write path: WAL append → memtable insert → flush to Parquet → Iceberg snapshot</text>
+
+  <!-- ═══════════ Acceleration Structures Detail ═══════════ -->
+  <rect x="590" y="350" width="500" height="110" rx="8" fill="#EDE7F6" stroke="#5E35B1" stroke-width="1"/>
+  <text x="840" y="370" text-anchor="middle" font-size="11" font-weight="bold" fill="#4527A0">Acceleration Structures</text>
+
+  <!-- Bloom -->
+  <rect x="610" y="380" width="220" height="30" rx="4" fill="#FCE4EC" stroke="#E91E63" stroke-width="1"/>
+  <text x="720" y="396" text-anchor="middle" font-size="9" font-weight="600" fill="#880E4F">FastLocalBloom (AVX2/NEON SIMD)</text>
+  <text x="720" y="406" text-anchor="middle" font-size="8" fill="#AD1457">64-byte cache-line-aligned buckets</text>
+
+  <!-- KvSparseIndex -->
+  <rect x="610" y="415" width="220" height="30" rx="4" fill="#F3E5F5" stroke="#9C27B0" stroke-width="1"/>
+  <text x="720" y="431" text-anchor="middle" font-size="9" font-weight="600" fill="#6A1B9A">KvSparseIndex (prefix-compressed)</text>
+  <text x="720" y="441" text-anchor="middle" font-size="8" fill="#7B1FA2">restart-point binary search · full keys</text>
+
+  <!-- Flow -->
+  <rect x="860" y="385" width="210" height="52" rx="4" fill="white" stroke="#5E35B1" stroke-width="0.5"/>
+  <text x="965" y="400" text-anchor="middle" font-size="8" fill="#311B92">Point lookup flow:</text>
+  <text x="965" y="412" text-anchor="middle" font-size="8" fill="#4527A0">1. Bloom → miss? skip entire file</text>
+  <text x="965" y="424" text-anchor="middle" font-size="8" fill="#4527A0">2. KvSparseIndex → skip pages</text>
+  <text x="965" y="435" text-anchor="middle" font-size="8" fill="#4527A0">3. Scan ≤ 1 restart interval</text>
+
+  <!-- ═══════════ Footer ═══════════ -->
+  <rect x="30" y="480" width="1040" height="130" rx="8" fill="#E3F2FD" stroke="#1565C0" stroke-width="1"/>
+  <text x="550" y="500" text-anchor="middle" font-size="11" font-weight="bold" fill="#0D47A1">Per-Level Parquet Format</text>
+
+  <!-- L0 detail -->
+  <rect x="50" y="510" width="300" height="90" rx="4" fill="white" stroke="#42A5F5" stroke-width="1"/>
+  <text x="200" y="526" text-anchor="middle" font-size="10" font-weight="bold" fill="#1565C0">L0 (Rowstore)</text>
+  <text x="60" y="542" font-size="9" fill="#37474F">Pages: 8 KiB · Row groups: 4 MiB</text>
+  <text x="60" y="555" font-size="9" fill="#37474F">Encoding: PLAIN on all columns</text>
+  <text x="60" y="568" font-size="9" fill="#37474F">Columns: _ikey + _value (blob) + typed</text>
+  <text x="60" y="581" font-size="9" fill="#E65100" font-weight="600">Bias: point lookups, fast flush</text>
+  <text x="60" y="594" font-size="8" fill="#78909C" font-style="italic">_merutable_value blob = postcard-encoded row</text>
+
+  <!-- L1 detail -->
+  <rect x="380" y="510" width="300" height="90" rx="4" fill="white" stroke="#66BB6A" stroke-width="1"/>
+  <text x="530" y="526" text-anchor="middle" font-size="10" font-weight="bold" fill="#2E7D32">L1 (Warm)</text>
+  <text x="390" y="542" font-size="9" fill="#37474F">Pages: 32 KiB · Row groups: 32 MiB</text>
+  <text x="390" y="555" font-size="9" fill="#37474F">Encoding: per-column (DELTA, SPLIT, DICT)</text>
+  <text x="390" y="568" font-size="9" fill="#37474F">Columns: _ikey + typed (no blob)</text>
+  <text x="390" y="581" font-size="9" fill="#E65100" font-weight="600">Bias: transitional, read+write balanced</text>
+  <text x="390" y="594" font-size="8" fill="#78909C" font-style="italic">Deletion Vectors track promoted rows</text>
+
+  <!-- L2+ detail -->
+  <rect x="710" y="510" width="340" height="90" rx="4" fill="white" stroke="#FF9800" stroke-width="1"/>
+  <text x="880" y="526" text-anchor="middle" font-size="10" font-weight="bold" fill="#E65100">L2+ (Columnstore)</text>
+  <text x="720" y="542" font-size="9" fill="#37474F">Pages: 128 KiB · Row groups: 128 MiB</text>
+  <text x="720" y="555" font-size="9" fill="#37474F">Int: DELTA_BINARY_PACKED · Float: BYTE_STREAM_SPLIT</text>
+  <text x="720" y="568" font-size="9" fill="#37474F">String: RLE_DICTIONARY · Bool: RLE</text>
+  <text x="720" y="581" font-size="9" fill="#E65100" font-weight="600">Bias: analytics scans, columnar compression</text>
+  <text x="720" y="594" font-size="8" fill="#78909C" font-style="italic">Native format for Spark / Trino / DuckDB queries</text>
+</svg>

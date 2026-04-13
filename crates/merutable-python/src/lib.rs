@@ -94,6 +94,10 @@ impl PyMeruDB {
             columns: col_defs,
             primary_key: pk_indices,
         };
+        // Validate schema upfront — clear Python errors instead of cryptic engine panics.
+        schema
+            .validate()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid schema: {e}")))?;
         let schema = Arc::new(schema);
 
         let runtime = Arc::new(
@@ -113,14 +117,11 @@ impl PyMeruDB {
             .wal_dir(wal_dir)
             .memtable_size_mb(memtable_size_mb);
 
-        let inner =
-            runtime
-                .block_on(async { RustMeruDB::open(options).await })
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to open MeruDB: {e}"
-                    ))
-                })?;
+        let inner = runtime
+            .block_on(async { RustMeruDB::open(options).await })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("failed to open MeruDB: {e}"))
+            })?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -143,6 +144,24 @@ impl PyMeruDB {
         Ok(seq.0)
     }
 
+    /// Batch insert/update. All rows share a single WAL sync — N× faster than
+    /// individual put() calls. Returns the base sequence number.
+    ///
+    /// Args:
+    ///     rows: list of dicts, each mapping column names to values.
+    fn put_batch(&self, py: Python<'_>, rows: Vec<Bound<'_, PyDict>>) -> PyResult<u64> {
+        let mut rust_rows = Vec::with_capacity(rows.len());
+        for dict in &rows {
+            rust_rows.push(convert::dict_to_row(dict, &self.schema)?);
+        }
+        let inner = Arc::clone(&self.inner);
+        let rt = Arc::clone(&self.runtime);
+        let seq = py
+            .allow_threads(move || rt.block_on(async { inner.put_batch(rust_rows).await }))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        Ok(seq.0)
+    }
+
     /// Point lookup by primary key value(s). Returns dict or None.
     ///
     /// Args:
@@ -154,9 +173,10 @@ impl PyMeruDB {
         pk_values: &Bound<'_, pyo3::types::PyTuple>,
     ) -> PyResult<Option<PyObject>> {
         let fvs = convert::pk_args_to_field_values(pk_values, &self.schema)?;
-        let row = self
-            .inner
-            .get(&fvs)
+        let inner = Arc::clone(&self.inner);
+        // Release GIL during point lookup (may involve Parquet file I/O).
+        let row = py
+            .allow_threads(move || inner.get(&fvs))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
         match row {
             None => Ok(None),
@@ -169,11 +189,7 @@ impl PyMeruDB {
 
     /// Delete by primary key value(s). Returns the sequence number.
     #[pyo3(signature = (*pk_values))]
-    fn delete(
-        &self,
-        py: Python<'_>,
-        pk_values: &Bound<'_, pyo3::types::PyTuple>,
-    ) -> PyResult<u64> {
+    fn delete(&self, py: Python<'_>, pk_values: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<u64> {
         let fvs = convert::pk_args_to_field_values(pk_values, &self.schema)?;
         let inner = Arc::clone(&self.inner);
         let rt = Arc::clone(&self.runtime);
@@ -204,9 +220,10 @@ impl PyMeruDB {
             None => None,
         };
 
-        let results = self
-            .inner
-            .scan(start_fvs.as_deref(), end_fvs.as_deref())
+        let inner = Arc::clone(&self.inner);
+        // Release GIL during scan (may involve Parquet file I/O).
+        let results = py
+            .allow_threads(move || inner.scan(start_fvs.as_deref(), end_fvs.as_deref()))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
 
         let mut out = Vec::with_capacity(results.len());
@@ -310,7 +327,11 @@ impl PyMeruDB {
         for (i, &col_idx) in self.schema.primary_key.iter().enumerate() {
             let col = &self.schema.columns[col_idx];
             let obj = vals[i].bind(py);
-            fvs.push(convert::py_to_field_value_pub(obj, &col.col_type, &col.name)?);
+            fvs.push(convert::py_to_field_value_pub(
+                obj,
+                &col.col_type,
+                &col.name,
+            )?);
         }
         Ok(fvs)
     }

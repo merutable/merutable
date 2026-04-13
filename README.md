@@ -19,25 +19,9 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 ## Architecture
 
-```
-         put/delete/get/scan
-                |
-         [ MeruDB API ]
-                |
-         [ MeruEngine ]
-           /    |    \
-     [WAL]  [Memtable]  [VersionSet]
-              |               |
-         [FlushJob]    [IcebergTable]
-              |               |
-       [ParquetWriter]  [Manifest + DV]
-              |               |
-       [Bloom + KvSparseIndex] [Puffin files]
-              |
-         [ObjectStore]
-              |
-       L0/ L1/ L2/ ... (Parquet files)
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="merutable architecture" width="900"/>
+</p>
 
 `IcebergTable` manages a single Iceberg v3 table (manifests, snapshots, version-hint). Catalog integration (Hive, Glue, REST, etc.) is an external layer on top — merutable provides the table, not the catalog.
 
@@ -102,6 +86,52 @@ async fn main() {
     let row = db.get(&[FieldValue::Int64(1)]).unwrap();
     println!("{row:?}");
 }
+```
+
+## Interactive notebook
+
+The [`lab/lab_merutable.ipynb`](lab/lab_merutable.ipynb) notebook is a live, runnable showcase — open it on GitHub to see pre-rendered outputs, or run it locally for the full interactive experience:
+
+```bash
+cd lab && bash setup.sh
+```
+
+The notebook covers: write/flush/inspect, compaction with Deletion Vectors, **HTAP with DuckDB** (SQL queries on merutable's Parquet files — zero ETL), acceleration structures (bloom filter + KvSparseIndex), and a benchmark against SQLite and RocksDB.
+
+## Python bindings
+
+merutable ships a PyO3 crate (`merutable-python`) that exposes the full API to Python:
+
+```python
+from merutable import MeruDB
+
+db = MeruDB("/tmp/mydb", "events", [
+    ("id",     "int64",  False),
+    ("name",   "string", True),
+    ("score",  "double", True),
+    ("active", "bool",   True),
+])
+
+db.put({"id": 1, "name": "alice", "score": 95.5, "active": True})
+row = db.get(1)         # {'id': 1, 'name': 'alice', 'score': 95.5, 'active': True}
+
+# Batch writes — single WAL sync per batch, 100-1000× faster than individual puts
+db.put_batch([
+    {"id": 2, "name": "bob",   "score": 88.0, "active": True},
+    {"id": 3, "name": "carol", "score": 92.1, "active": False},
+])
+
+db.flush()              # → L0 Parquet file + Iceberg v3 snapshot
+db.compact()            # → L1 columnstore + Deletion Vectors
+
+# HTAP: DuckDB reads the same Parquet files
+import duckdb
+duckdb.sql(f"SELECT * FROM read_parquet('{db.catalog_path()}/data/L1/*.parquet')").show()
+```
+
+Build with [maturin](https://www.maturin.rs/):
+```bash
+cd crates/merutable-python && maturin develop --release
 ```
 
 ## License

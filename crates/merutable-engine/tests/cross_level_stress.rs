@@ -117,7 +117,11 @@ async fn cross_level_data_integrity() {
             expected.insert(id, (tag, score));
         }
         engine.flush().await.unwrap();
-        eprintln!("phase {phase}: flushed batch [{}, {}]", base + 1, base + batch_size);
+        eprintln!(
+            "phase {phase}: flushed batch [{}, {}]",
+            base + 1,
+            base + batch_size
+        );
 
         // ── Overwrite some existing keys from earlier phases ──
         if phase > 0 {
@@ -148,10 +152,7 @@ async fn cross_level_data_integrity() {
                 if id < 1 {
                     continue;
                 }
-                engine
-                    .delete(vec![FieldValue::Int64(id)])
-                    .await
-                    .unwrap();
+                engine.delete(vec![FieldValue::Int64(id)]).await.unwrap();
                 deleted.insert(id);
             }
             engine.flush().await.unwrap();
@@ -215,9 +216,8 @@ async fn cross_level_data_integrity() {
                 match row.get(2) {
                     Some(FieldValue::Double(s)) => {
                         if (*s - expected_score).abs() > 1e-9 {
-                            get_failures.push(format!(
-                                "id {id}: score expected {expected_score}, got {s}"
-                            ));
+                            get_failures
+                                .push(format!("id {id}: score expected {expected_score}, got {s}"));
                         }
                     }
                     other => {
@@ -238,7 +238,10 @@ async fn cross_level_data_integrity() {
         get_failures.len(),
         get_failures.join("\n")
     );
-    eprintln!("PASS: all {} point lookups returned correct values", live_expected.len());
+    eprintln!(
+        "PASS: all {} point lookups returned correct values",
+        live_expected.len()
+    );
 
     // ── Verify 2: deleted keys return None ──
     let mut delete_failures: Vec<String> = Vec::new();
@@ -274,7 +277,9 @@ async fn cross_level_data_integrity() {
     // Check for duplicates.
     for (id, count) in &scan_ids {
         if *count > 1 {
-            scan_failures.push(format!("id {id}: appeared {count} times in scan (duplicate)"));
+            scan_failures.push(format!(
+                "id {id}: appeared {count} times in scan (duplicate)"
+            ));
         }
     }
 
@@ -332,9 +337,8 @@ async fn cross_level_data_integrity() {
                     }
                 }
                 other => {
-                    value_failures.push(format!(
-                        "scan id {id}: name expected Bytes, got {other:?}"
-                    ));
+                    value_failures
+                        .push(format!("scan id {id}: name expected Bytes, got {other:?}"));
                 }
             }
             match row.get(2) {
@@ -416,10 +420,7 @@ async fn cross_level_bounded_scan() {
     // Insert 200 rows across 2 flush cycles, compact in between.
     for i in 1..=100i64 {
         engine
-            .put(
-                vec![FieldValue::Int64(i)],
-                make_row(i, "batch1", i as f64),
-            )
+            .put(vec![FieldValue::Int64(i)], make_row(i, "batch1", i as f64))
             .await
             .unwrap();
     }
@@ -428,10 +429,7 @@ async fn cross_level_bounded_scan() {
 
     for i in 101..=200i64 {
         engine
-            .put(
-                vec![FieldValue::Int64(i)],
-                make_row(i, "batch2", i as f64),
-            )
+            .put(vec![FieldValue::Int64(i)], make_row(i, "batch2", i as f64))
             .await
             .unwrap();
     }
@@ -478,7 +476,8 @@ async fn cross_level_bounded_scan() {
     // (70..=75 deleted)
     let expected_ids: Vec<i64> = (40..80).filter(|i| !(70..=75).contains(i)).collect();
     assert_eq!(
-        ids, expected_ids,
+        ids,
+        expected_ids,
         "bounded scan mismatch: got {} rows, expected {}",
         ids.len(),
         expected_ids.len()
@@ -514,11 +513,6 @@ fn count_parquet_files(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|s| s.to_str())
-                == Some("parquet")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("parquet"))
         .count()
 }

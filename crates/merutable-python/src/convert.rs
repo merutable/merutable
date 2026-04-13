@@ -11,7 +11,20 @@ use pyo3::{
 };
 
 /// Convert a Python dict to a `Row`, using the schema for type dispatch.
+///
+/// Errors if the dict contains keys not in the schema (catches typos like
+/// `"nmae"` instead of `"name"` that would otherwise silently become NULL).
 pub fn dict_to_row(dict: &Bound<'_, PyDict>, schema: &TableSchema) -> PyResult<Row> {
+    // Reject extra keys early — catches typos that would silently NULL a column.
+    for key_obj in dict.keys() {
+        let key: String = key_obj.extract()?;
+        if schema.column_by_name(&key).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown column '{key}' in row dict (not in schema)"
+            )));
+        }
+    }
+
     let mut fields: Vec<Option<FieldValue>> = Vec::with_capacity(schema.columns.len());
     for col in &schema.columns {
         let key = &col.name;
@@ -83,8 +96,14 @@ fn py_to_field_value(
                 )))
             }
         }
-        ColumnType::FixedLenByteArray(_len) => {
+        ColumnType::FixedLenByteArray(expected_len) => {
             let b: Vec<u8> = obj.extract()?;
+            if b.len() != *expected_len as usize {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "column '{col_name}' (FixedLenByteArray({expected_len})) expects {expected_len} bytes, got {}",
+                    b.len()
+                )));
+            }
             Ok(FieldValue::Bytes(Bytes::from(b)))
         }
     }
