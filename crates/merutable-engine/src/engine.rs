@@ -203,32 +203,26 @@ impl MeruEngine {
         // Allocate sequence number.
         let seq = self.global_seq.allocate();
 
-        // Encode user key bytes (PK without tag).
-        let ikey = InternalKey::encode(&pk_values, seq, op_type, &self.schema)?;
-        let user_key_bytes = ikey.user_key_bytes().to_vec();
+        // Encode only the user-key (PK) bytes — no full InternalKey struct,
+        // no pk_values.to_vec() clone, no tag encoding. Hot-path optimization.
+        let user_key_bytes = InternalKey::encode_user_key(&pk_values, &self.schema)?;
 
         // Build WAL batch.
         let mut batch = WriteBatch::new(seq);
         let value_bytes = match row {
             Some(r) => {
-                // Serialize row values to bytes. For now, use JSON as a simple encoding.
-                // Phase 4 completion wires up the proper codec.
-                let json = serde_json::to_vec(&r).map_err(|e| {
-                    MeruError::InvalidArgument(format!("row serialize failed: {e}"))
-                })?;
-                Some(bytes::Bytes::from(json))
+                let encoded = crate::codec::encode_row(&r)?;
+                Some(bytes::Bytes::from(encoded))
             }
             None => None,
         };
-        // Keep a copy for cache invalidation before moving into the batch.
-        let user_key_for_cache = user_key_bytes.clone();
 
         match op_type {
             OpType::Put => batch.put(
-                bytes::Bytes::from(user_key_bytes),
+                bytes::Bytes::from(user_key_bytes.clone()),
                 value_bytes.unwrap_or_default(),
             ),
-            OpType::Delete => batch.delete(bytes::Bytes::from(user_key_bytes)),
+            OpType::Delete => batch.delete(bytes::Bytes::from(user_key_bytes.clone())),
         }
 
         // WAL first (durability).
@@ -242,7 +236,7 @@ impl MeruEngine {
 
         // Invalidate row cache so post-flush reads don't serve stale data.
         if let Some(ref cache) = self.row_cache {
-            cache.invalidate(&user_key_for_cache);
+            cache.invalidate(&user_key_bytes);
         }
 
         // Trigger flush if threshold crossed. The flush requires a rotate

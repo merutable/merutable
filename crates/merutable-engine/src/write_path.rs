@@ -16,6 +16,8 @@ use merutable_types::{
 use merutable_wal::batch::WriteBatch;
 use tracing::{debug, instrument};
 
+use crate::codec;
+
 use crate::engine::MeruEngine;
 
 /// A batch of mutations to apply atomically to the engine.
@@ -99,20 +101,21 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
     );
     let mut wal_batch = WriteBatch::new(base_seq);
 
-    let mut user_keys: Vec<Vec<u8>> = Vec::with_capacity(batch.ops.len());
+    // Only track user keys when the row cache needs invalidation.
+    let has_cache = engine.row_cache.is_some();
+    let mut user_keys: Vec<Vec<u8>> = if has_cache {
+        Vec::with_capacity(batch.ops.len())
+    } else {
+        Vec::new()
+    };
 
-    for (i, mutation) in batch.ops.iter().enumerate() {
-        // Per-record seq: base_seq + i. This matches what
-        // `Memtable::apply_batch` will stamp into the skiplist.
-        let record_seq = SeqNum(base_seq.0 + i as u64);
-        let ikey = InternalKey::encode(
-            &mutation.pk_values,
-            record_seq,
-            mutation.op_type,
-            &engine.schema,
-        )?;
-        let user_key_bytes = Bytes::from(ikey.user_key_bytes().to_vec());
-        user_keys.push(user_key_bytes.to_vec());
+    for mutation in &batch.ops {
+        // Hot-path: encode only the PK user-key bytes — no full InternalKey
+        // struct, no pk_values.to_vec() clone, no tag encoding.
+        let user_key_bytes = InternalKey::encode_user_key(&mutation.pk_values, &engine.schema)?;
+        if has_cache {
+            user_keys.push(user_key_bytes.clone());
+        }
 
         match mutation.op_type {
             OpType::Put => {
@@ -120,14 +123,14 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
                     .row
                     .as_ref()
                     .map(|r| {
-                        let json = serde_json::to_vec(r).unwrap_or_default();
-                        Bytes::from(json)
+                        let encoded = codec::encode_row(r).unwrap_or_default();
+                        Bytes::from(encoded)
                     })
                     .unwrap_or_default();
-                wal_batch.put(user_key_bytes, value_bytes);
+                wal_batch.put(Bytes::from(user_key_bytes), value_bytes);
             }
             OpType::Delete => {
-                wal_batch.delete(user_key_bytes);
+                wal_batch.delete(Bytes::from(user_key_bytes));
             }
         }
     }

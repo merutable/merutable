@@ -2126,6 +2126,7 @@ dependencies = [
  "merutable-wal",
  "object_store",
  "parquet",
+ "postcard",
  "proptest",
  "roaring",
  "serde",

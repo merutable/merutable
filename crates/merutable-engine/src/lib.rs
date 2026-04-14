@@ -1,5 +1,6 @@
 pub mod background;
 pub mod cache;
+pub mod codec;
 pub mod compaction;
 pub mod config;
 pub mod engine;

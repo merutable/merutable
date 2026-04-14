@@ -93,7 +93,7 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         // The row data is stored in EntryValue.value as serialized bytes.
         // Deserialize back to Row.
         let row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
-            serde_json::from_slice(&entry.entry.value).unwrap_or_default()
+            crate::codec::decode_row(&entry.entry.value)
         } else {
             // Bug N fix: tombstone rows must carry the correct PK values in
             // their typed columns so HTAP readers (Spark/DuckDB) can identify

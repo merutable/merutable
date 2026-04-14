@@ -142,6 +142,19 @@ impl InternalKey {
     pub fn user_key_bytes(&self) -> &[u8] {
         &self.encoded[..self.encoded.len() - 8]
     }
+
+    /// Encode only the user-key (PK) bytes — no tag, no struct allocation.
+    ///
+    /// This is the hot-path version for writes: the write path only needs
+    /// `user_key_bytes` for the WAL record key and cache invalidation. It
+    /// does NOT need `seq`, `op_type`, or `pk_values` stored in a struct.
+    /// Avoids the `pk_values.to_vec()` clone and the 8-byte tag encode that
+    /// `InternalKey::encode()` performs.
+    pub fn encode_user_key(pk_values: &[FieldValue], schema: &TableSchema) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(64);
+        encode_pk_fields(pk_values, schema, &mut buf)?;
+        Ok(buf)
+    }
 }
 
 impl PartialEq for InternalKey {

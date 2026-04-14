@@ -103,12 +103,7 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         if entry.op_type == OpType::Delete {
             return Ok(None); // tombstone
         }
-        // Deserialize row from value bytes.
-        let row: Row = if entry.value.is_empty() {
-            Row::default()
-        } else {
-            serde_json::from_slice(&entry.value).unwrap_or_default()
-        };
+        let row = crate::codec::decode_row(&entry.value);
         trace!(source = "memtable", "cache hit");
         return Ok(Some(row));
     }
@@ -256,7 +251,7 @@ pub fn range_scan(
         let ikey = InternalKey::decode(&wire, &engine.schema)?;
 
         let row: Row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
-            serde_json::from_slice(&entry.entry.value).unwrap_or_default()
+            crate::codec::decode_row(&entry.entry.value)
         } else {
             Row::default()
         };
