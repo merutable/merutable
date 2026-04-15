@@ -351,6 +351,19 @@ impl MeruEngine {
         self.catalog.base_path().to_string_lossy().to_string()
     }
 
+    /// Export the current catalog snapshot as an Apache Iceberg v2
+    /// `metadata.json` under `target_dir`. Delegates to
+    /// [`merutable_iceberg::IcebergCatalog::export_to_iceberg`] — see that
+    /// method's docs for the exact shape, field mapping, and limitations.
+    ///
+    /// Returns the absolute path of the emitted `v{N}.metadata.json`.
+    pub async fn export_iceberg(
+        &self,
+        target_dir: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf> {
+        self.catalog.export_to_iceberg(target_dir).await
+    }
+
     /// Re-read the Iceberg manifest from disk and install a new version.
     /// Used by read-only replicas to pick up snapshots written by the primary.
     pub async fn refresh(&self) -> Result<()> {

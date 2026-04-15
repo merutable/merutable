@@ -16,6 +16,11 @@ serde            = { workspace = true }
 bytes            = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-tokio    = { workspace = true, features = ["full"] }
+tempfile           = { workspace = true }
+tokio              = { workspace = true, features = ["full"] }
 tracing-subscriber = "0.3"
+# Used only by the Iceberg translator compatibility test — parses our
+# exported `metadata.json` back into a `TableMetadata` struct to pin
+# spec compliance.
+iceberg            = { workspace = true }
+serde_json         = { workspace = true }

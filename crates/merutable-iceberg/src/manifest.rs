@@ -76,14 +76,49 @@ impl ManifestEntry {
 // ── Manifest ─────────────────────────────────────────────────────────────────
 
 /// Serializable manifest — a list of file entries plus snapshot metadata.
-/// This is the embedded FS catalog's equivalent of an Iceberg manifest list.
+///
+/// This is merutable's native manifest format. It is intentionally a superset
+/// of what Apache Iceberg v2 `TableMetadata` carries so that
+/// [`crate::translate`] can project this struct onto a real Iceberg v2
+/// `metadata.json` without loss of information.
+///
+/// ## Iceberg-facing fields
+///
+/// The following fields exist purely to make Iceberg translation lossless:
+///
+/// - `table_uuid`          — Iceberg `table-uuid` (persists across snapshots)
+/// - `last_updated_ms`     — Iceberg `last-updated-ms` (set on every commit)
+/// - `parent_snapshot_id`  — Iceberg `snapshot.parent-snapshot-id`
+/// - `sequence_number`     — Iceberg `last-sequence-number` (bumped per commit)
+///
+/// All four are `#[serde(default)]` so older merutable deployments whose
+/// metadata files don't carry them still load cleanly; the catalog fills in
+/// sane defaults on the next commit.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
     /// Iceberg format version. Must be 3 for v3 with deletion vectors.
     #[serde(default = "default_format_version")]
     pub format_version: i32,
+    /// Stable, per-table identifier. Generated once when the catalog is
+    /// first created; every subsequent commit carries the same value.
+    /// Maps 1:1 to Iceberg's `table-uuid`.
+    #[serde(default)]
+    pub table_uuid: String,
+    /// Wall-clock epoch-millis at which this manifest was written.
+    /// Maps 1:1 to Iceberg's `last-updated-ms`.
+    #[serde(default)]
+    pub last_updated_ms: i64,
     /// Monotonically increasing snapshot ID.
     pub snapshot_id: i64,
+    /// Previous `snapshot_id`, or `None` for the very first commit.
+    /// Maps 1:1 to Iceberg snapshot `parent-snapshot-id`.
+    #[serde(default)]
+    pub parent_snapshot_id: Option<i64>,
+    /// Iceberg-style monotonic sequence number. Incremented on every commit.
+    /// Maps 1:1 to Iceberg's `last-sequence-number`. This is distinct from
+    /// merutable's per-row `seq_num` (which lives inside `ParquetFileMeta`).
+    #[serde(default)]
+    pub sequence_number: i64,
     /// Schema of the table at this snapshot.
     pub schema: TableSchema,
     /// All live file entries (status != "deleted").
@@ -95,6 +130,18 @@ pub struct Manifest {
 
 fn default_format_version() -> i32 {
     3
+}
+
+/// Current wall clock in epoch milliseconds. Kept private and used by
+/// [`Manifest::empty`] / [`Manifest::apply`] so every commit stamps a
+/// fresh `last_updated_ms` without the caller having to thread a clock
+/// through.
+pub(crate) fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl Manifest {
@@ -141,11 +188,35 @@ impl Manifest {
             .map_err(|e| MeruError::Iceberg(format!("manifest deserialize: {e}")))
     }
 
-    /// Create an empty initial manifest.
+    /// Create an empty initial manifest with a fresh `table_uuid`.
+    /// Snapshot IDs start at 0 (the initial empty snapshot has no parent
+    /// and sequence number 0).
     pub fn empty(schema: TableSchema) -> Self {
         Self {
             format_version: 3,
+            table_uuid: uuid::Uuid::new_v4().to_string(),
+            last_updated_ms: now_ms(),
             snapshot_id: 0,
+            parent_snapshot_id: None,
+            sequence_number: 0,
+            schema,
+            entries: Vec::new(),
+            properties: HashMap::new(),
+        }
+    }
+
+    /// Create an empty manifest with a caller-supplied `table_uuid`. Used
+    /// by the catalog when reopening a legacy on-disk manifest that has
+    /// no `table_uuid` field — we want the first post-upgrade commit to
+    /// mint one deterministically so all subsequent snapshots agree.
+    pub fn empty_with_uuid(schema: TableSchema, table_uuid: String) -> Self {
+        Self {
+            format_version: 3,
+            table_uuid,
+            last_updated_ms: now_ms(),
+            snapshot_id: 0,
+            parent_snapshot_id: None,
+            sequence_number: 0,
             schema,
             entries: Vec::new(),
             properties: HashMap::new(),
@@ -227,9 +298,32 @@ impl Manifest {
         let mut props = self.properties.clone();
         props.extend(txn.props.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+        // Preserve table_uuid across snapshots. If the predecessor manifest
+        // was a legacy one with no uuid (all zeros or empty string), mint a
+        // fresh v4 — this path runs at most once per table upgrade.
+        let table_uuid = if self.table_uuid.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            self.table_uuid.clone()
+        };
+        // parent_snapshot_id is the predecessor's snapshot_id, UNLESS the
+        // predecessor was the initial empty manifest (snapshot_id=0) in
+        // which case Iceberg expects None on the first real snapshot.
+        let parent_snapshot_id = if self.snapshot_id == 0 {
+            None
+        } else {
+            Some(self.snapshot_id)
+        };
+
         Ok(Manifest {
             format_version: self.format_version,
+            table_uuid,
+            last_updated_ms: now_ms(),
             snapshot_id: new_snapshot_id,
+            parent_snapshot_id,
+            // Iceberg sequence number is monotonic — bump by one on every
+            // commit, regardless of how many files the transaction touched.
+            sequence_number: self.sequence_number + 1,
             schema: self.schema.clone(),
             entries: new_entries,
             properties: props,

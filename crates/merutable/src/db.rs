@@ -145,6 +145,29 @@ impl MeruDB {
         self.engine.catalog_path()
     }
 
+    /// Export the current catalog snapshot as an Apache Iceberg v2
+    /// `metadata.json` under `target_dir`.
+    ///
+    /// merutable commits a native JSON manifest on every flush; that
+    /// manifest is a strict superset of Iceberg v2 `TableMetadata`. This
+    /// method projects the current snapshot onto the Iceberg shape and
+    /// writes it to `{target_dir}/metadata/v{N}.metadata.json` alongside a
+    /// `version-hint.text`. Downstream tools (pyiceberg, Spark, Trino,
+    /// DuckDB, Snowflake, Athena) can read the exported metadata to
+    /// register the table, inspect its schema, or audit lineage.
+    ///
+    /// See [`merutable_iceberg::IcebergCatalog::export_to_iceberg`] for
+    /// the full field mapping and the current limitations
+    /// (manifest-list / manifest Avro emission is follow-on work).
+    ///
+    /// Returns the absolute path of the emitted `v{N}.metadata.json`.
+    pub async fn export_iceberg(
+        &self,
+        target_dir: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf> {
+        self.engine.export_iceberg(target_dir).await
+    }
+
     /// Re-read the Iceberg manifest from disk. Only meaningful for
     /// read-only replicas; on a read-write instance this is a no-op.
     pub async fn refresh(&self) -> Result<()> {
@@ -374,6 +397,45 @@ mod tests {
         // Scan should work.
         let results = db.scan(None, None).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// End-to-end Iceberg translator test: open, write, flush, export,
+    /// then hand the exported metadata to the `iceberg-rs` crate's
+    /// deserializer. This is the strongest compatibility signal
+    /// available in-tree — if that crate accepts our payload, every
+    /// v2-aware Iceberg reader in the ecosystem will too.
+    #[tokio::test]
+    async fn export_iceberg_metadata_parses_with_iceberg_rs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+
+        // Write and flush some rows so the exported snapshot is non-empty.
+        for i in 0..5i64 {
+            db.put(make_row(i, &format!("row{i}"))).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let metadata_path = db.export_iceberg(target.path()).await.unwrap();
+        assert!(metadata_path.exists());
+
+        let bytes = tokio::fs::read(&metadata_path).await.unwrap();
+        let parsed: std::result::Result<iceberg::spec::TableMetadata, _> =
+            serde_json::from_slice(&bytes);
+        assert!(
+            parsed.is_ok(),
+            "iceberg-rs rejected exported metadata: {:?}\n\nfile: {}\n\ncontent:\n{}",
+            parsed.err(),
+            metadata_path.display(),
+            String::from_utf8_lossy(&bytes)
+        );
+        let tm = parsed.unwrap();
+        // Post-flush we expect exactly one snapshot with a live file.
+        assert!(tm.current_snapshot_id().is_some());
+        assert!(
+            tm.last_sequence_number() >= 1,
+            "sequence number must advance after the first commit"
+        );
     }
 
     #[tokio::test]

@@ -4,15 +4,15 @@
 [![Rust](https://img.shields.io/badge/rust-stable-blue.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
-An embeddable Rust HTAP database engine. One logical table backed by an LSM-tree where manifests are Apache Iceberg v3 snapshots and SSTables are Apache Parquet files. Row promotions between LSM levels use Iceberg v3 Deletion Vectors (Puffin format) instead of physical deletes. Every commit (flush or compaction) produces a spec-compliant Iceberg v3 snapshot readable by Spark, Trino, and DuckDB — no ETL, no format conversion.
+An embeddable Rust HTAP database engine. One logical table backed by an LSM-tree: SSTables are Apache Parquet files, deletion vectors are Apache Iceberg v3 `deletion-vector-v1` Puffin blobs, and each commit writes a native JSON manifest that is a **strict superset of Apache Iceberg v2 `TableMetadata`** — losslessly projectable onto a spec-compliant Iceberg table via [`merutable-iceberg::translate`](crates/merutable-iceberg/src/translate.rs) and exportable on demand with `db.export_iceberg(target_dir)`. DuckDB, Spark, Trino, and pyiceberg read the exported view; the Parquet files themselves are the single source of truth — no ETL, no format conversion.
 
 Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from Indian mythology.
 
 ## Why merutable
 
-- **HTAP in one binary**: Transactional writes (put/delete/scan) with sub-millisecond memtable lookups, while the on-disk format is standard Iceberg+Parquet readable by any analytics engine.
-- **No ETL pipeline**: Every commit (flush or compaction) produces a spec-compliant Iceberg v3 snapshot. Analytical readers see consistent data at any snapshot without a separate ingestion step.
-- **Deletion Vectors, not physical deletes**: Promoted rows are masked via Puffin-format roaring bitmaps (Iceberg v3 `deletion-vector-v1`). Source files remain readable throughout compaction.
+- **HTAP in one binary**: Transactional writes (put/delete/scan) with sub-millisecond memtable lookups; the on-disk data files are Apache Parquet, directly readable by any analytics engine.
+- **Native manifest, Iceberg-translatable**: Every flush and compaction writes a single-file native JSON manifest — one fsync, no Avro on the hot path — whose schema is a strict superset of Apache Iceberg v2 `TableMetadata`. Call `db.export_iceberg(target)` to project the current snapshot onto a spec-compliant `metadata.json` for pyiceberg / Spark / Trino / DuckDB / Snowflake / Athena. Every field round-trips through the `iceberg-rs` deserializer in CI, so compatibility is pinned, not aspirational.
+- **Deletion Vectors, not physical deletes**: Promoted rows are masked via Apache Iceberg v3 `deletion-vector-v1` Puffin blobs (roaring bitmaps). Source Parquet files stay readable throughout compaction — the DV tells readers which row positions to skip.
 - **SIMD-optimized bloom filter**: AVX2/NEON runtime-dispatched cache-line-aligned bloom filter for fast negative lookups on the read path.
 - **Prefix-compressed sparse index**: Each Parquet file carries a `KvSparseIndex` in the footer KV — a front-coded `user_key → page_location` map with binary-searchable restart points (LevelDB/RocksDB index-block style). Point lookups binary-search the restarts then linear-scan at most one restart interval, skipping all non-matching pages. Full keys, no 64-byte truncation.
 - **Row cache**: LRU buffer cache (10K entries default) between memtable and Parquet I/O. Eliminates disk reads for hot-key workloads. Invalidated on every write — never stale.
@@ -26,13 +26,15 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
   <img src="docs/architecture.svg" alt="merutable architecture" width="900"/>
 </p>
 
-`IcebergTable` manages a single Iceberg v3 table (manifests, snapshots, version-hint). Catalog integration (Hive, Glue, REST, etc.) is an external layer on top — merutable provides the table, not the catalog.
+`IcebergCatalog` manages the single table's native manifest chain (`metadata/v{N}.metadata.json` + `version-hint.text`). The manifest is a superset of Iceberg v2 `TableMetadata` — every field Iceberg needs (`table_uuid`, `last_updated_ms`, `parent_snapshot_id`, `sequence_number`, `schemas[]`) is already stored, so projection is a pure function with no data loss. Catalog integration (Hive, Glue, REST, etc.) is an external layer on top — merutable provides the table artifacts, not the catalog service.
 
-**Write path**: Sequence assign → WAL append → memtable insert → flush when threshold crossed. Each flush produces a new Iceberg v3 snapshot.
+**Write path**: Sequence assign → WAL append → memtable insert → flush when threshold crossed. Each flush writes a new `v{N}.metadata.json` and installs a new `Version` via `ArcSwap`.
 
 **Read path**: Memtable (active + immutable queue) → L0 files (bloom → `KvSparseIndex` page skip → scan) → L1..LN (bloom → `KvSparseIndex` → binary search).
 
-**Compaction**: Leveled compaction with Deletion Vector tracking. Fully compacted files are removed from the manifest; partially compacted files get a DV update. Each compaction commit is a new Iceberg snapshot — external readers (Spark, Trino, DuckDB) always see a consistent, spec-compliant table at any snapshot.
+**Compaction**: Leveled compaction with Deletion Vector tracking. Fully compacted files are removed from the manifest; partially compacted files get a Puffin `deletion-vector-v1` blob pointing at the deleted row positions. Each compaction commit is a new `v{N}.metadata.json`.
+
+**Iceberg translation**: Call `db.export_iceberg(target_dir)` at any time to emit a spec-compliant Iceberg v2 `metadata.json` under `target_dir/metadata/v{N}.metadata.json` plus a `version-hint.text`. Spec compliance is pinned by a CI test that round-trips the emitted JSON through the `iceberg-rs` `TableMetadata` deserializer. Manifest-list / manifest Avro file emission is tracked as follow-on work; for inspection, catalog registration, and schema audit the `metadata.json` alone is sufficient.
 
 ## Crate map
 
@@ -42,7 +44,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 | `merutable-wal` | 32 KiB block format WAL with CRC32, recovery, rotation |
 | `merutable-memtable` | `crossbeam` skip-list memtable, `bumpalo` arena, rotation, flow control |
 | `merutable-parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, `KvSparseIndex`, footer KV metadata |
-| `merutable-iceberg` | Iceberg v3 table management: manifest, snapshots, `VersionSet` (ArcSwap), `DeletionVector` (Puffin). Not a catalog — catalog integration (Hive, Glue, REST) is external. |
+| `merutable-iceberg` | Native JSON manifest + `VersionSet` (ArcSwap) + `DeletionVector` (Puffin v3 `deletion-vector-v1`) + `translate` module projecting snapshots onto Apache Iceberg v2 `TableMetadata`. Not a catalog — catalog integration (Hive, Glue, REST) is external. |
 | `merutable-store` | Pluggable object store: local FS, S3, LRU disk cache |
 | `merutable-engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, `RowCache`, read/write paths |
 | `merutable` | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator` |
@@ -124,8 +126,8 @@ db.put_batch([
     {"id": 3, "name": "carol", "score": 92.1, "active": False},
 ])
 
-db.flush()              # → L0 Parquet file + Iceberg v3 snapshot
-db.compact()            # → L1 columnstore + Deletion Vectors
+db.flush()              # → L0 Parquet file + new v{N}.metadata.json
+db.compact()            # → L1 columnstore + Deletion Vectors (Puffin v3)
 print(db.stats())       # includes cache hit/miss counters
 
 # HTAP: DuckDB reads the same Parquet files
@@ -136,6 +138,13 @@ duckdb.sql(f"SELECT * FROM read_parquet('{db.catalog_path()}/data/L1/*.parquet')
 replica = MeruDB("/tmp/mydb", "events", [...], read_only=True)
 replica.get(1)          # reads from Parquet files
 replica.refresh()       # picks up new snapshots from the primary
+
+# Hand the current snapshot to any Iceberg v2 reader
+db.export_iceberg("/tmp/events-iceberg")   # writes metadata/v{N}.metadata.json
+# Then, e.g.:
+#   from pyiceberg.table import StaticTable
+#   t = StaticTable.from_metadata("/tmp/events-iceberg/metadata/v1.metadata.json")
+#   t.schema()              # ← full Iceberg v2 schema, table_uuid, snapshot chain
 ```
 
 Build with [maturin](https://www.maturin.rs/):

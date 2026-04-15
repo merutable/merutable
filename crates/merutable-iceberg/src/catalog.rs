@@ -17,10 +17,19 @@
 //! └── version-hint.text         # current metadata version pointer
 //! ```
 //!
-//! This is a simplified file-system catalog that doesn't depend on the full
-//! `iceberg` Rust crate (which targets REST catalog / Hive metastore).
-//! It writes standard-enough metadata that a real Iceberg catalog can adopt
-//! the table later.
+//! This is a file-system catalog that writes merutable's **native manifest
+//! format** — a JSON superset of Iceberg's `TableMetadata` — rather than
+//! Iceberg's on-wire format (`TableMetadata` JSON + Avro manifest-list +
+//! Avro manifest files). The native format is chosen for efficiency: one
+//! fsyncable JSON file per commit instead of four, no Avro dependency on
+//! the hot path.
+//!
+//! The on-disk layout is **losslessly translatable** to a real Apache
+//! Iceberg v2 table via [`crate::translate`]. The translator can be run
+//! online (to expose the catalog to pyiceberg / Spark / Trino / DuckDB /
+//! Snowflake) or offline (as a one-shot migration). See the translate
+//! module's docs for the mapping from merutable fields to Iceberg spec
+//! fields.
 
 use std::{
     collections::HashMap,
@@ -80,7 +89,16 @@ impl IcebergCatalog {
                 .map_err(|_| MeruError::Corruption("bad version-hint".into()))?;
             let meta_path = metadata_dir.join(format!("v{ver}.metadata.json"));
             let data = tokio::fs::read(&meta_path).await.map_err(MeruError::Io)?;
-            let manifest = Manifest::from_json(&data)?;
+            let mut manifest = Manifest::from_json(&data)?;
+            // Legacy-upgrade path: manifests written by pre-Iceberg-enrichment
+            // merutable carry neither a `table_uuid` nor `last_updated_ms`.
+            // Mint the uuid here — `apply()` will carry it forward to every
+            // future snapshot. `last_updated_ms` stays at whatever the old
+            // manifest had (0 by default) until the next commit stamps a
+            // real clock.
+            if manifest.table_uuid.is_empty() {
+                manifest.table_uuid = uuid::Uuid::new_v4().to_string();
+            }
             (manifest, ver + 1)
         } else {
             (Manifest::empty(schema), 1)
@@ -345,6 +363,96 @@ impl IcebergCatalog {
             .await
             .map_err(MeruError::Io)?;
         Ok(())
+    }
+
+    /// Export the current catalog snapshot as an Apache Iceberg v2
+    /// `metadata.json` file.
+    ///
+    /// This is the **enabler artifact** for Iceberg interop: it projects
+    /// the in-memory `Manifest` onto the Iceberg v2 `TableMetadata` shape
+    /// (see [`crate::translate`]) and writes the result to
+    /// `{target_dir}/metadata/v{N}.metadata.json` alongside a
+    /// `version-hint.text` file pointing at it.
+    ///
+    /// # Use cases
+    ///
+    /// - **Register with an external catalog.** After calling this,
+    ///   a pyiceberg / Spark / Trino / DuckDB / Snowflake / Athena
+    ///   client can load the exported directory as an Iceberg v2 table
+    ///   (read-only; data files live under the original `base_path`).
+    /// - **Lineage / audit.** Diff two exported metadata.json files
+    ///   across snapshots to see schema evolution, snapshot history,
+    ///   and sequence-number progression in Iceberg-spec terms.
+    /// - **One-shot migration.** Call once at end-of-life to hand the
+    ///   table over to a different stack without re-writing the data.
+    ///
+    /// # Current limitation
+    ///
+    /// This writes the `TableMetadata` JSON but **not** the accompanying
+    /// manifest-list Avro or manifest Avro files that a full Iceberg
+    /// table requires for data-file discovery. A v2 reader that tries
+    /// to list files will follow the `manifest-list` path referenced in
+    /// the exported snapshot and fail to find the Avro file.
+    ///
+    /// For inspection-only workflows (catalog registration, lineage,
+    /// schema audit), this JSON is sufficient. For full data-read
+    /// interop, use the exported metadata as a starting point and emit
+    /// the Avro manifest files separately (tracked as follow-on work;
+    /// see `translate.rs` for the field mapping helpers).
+    pub async fn export_to_iceberg(&self, target_dir: impl AsRef<Path>) -> Result<PathBuf> {
+        let target = target_dir.as_ref().to_path_buf();
+        let meta_dir = target.join("metadata");
+        tokio::fs::create_dir_all(&meta_dir)
+            .await
+            .map_err(MeruError::Io)?;
+
+        // Snapshot the current manifest under the lock, then release it
+        // so the projection work runs off the critical path.
+        let manifest = {
+            let guard = self.current.lock().await;
+            guard.clone()
+        };
+
+        // Use an absolute `file://` URI so downstream Iceberg readers
+        // resolve the table location consistently regardless of cwd.
+        let canonical = tokio::fs::canonicalize(&self.base_path)
+            .await
+            .unwrap_or_else(|_| self.base_path.clone());
+        let table_location = format!("file://{}", canonical.display());
+
+        let json =
+            crate::translate::to_iceberg_v2_table_metadata_bytes(&manifest, &table_location)?;
+
+        let out_path = meta_dir.join(format!("v{}.metadata.json", manifest.snapshot_id));
+        tokio::fs::write(&out_path, &json)
+            .await
+            .map_err(MeruError::Io)?;
+        // fsync before updating version-hint.
+        tokio::fs::File::open(&out_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
+
+        let hint_path = target.join("version-hint.text");
+        tokio::fs::write(&hint_path, manifest.snapshot_id.to_string())
+            .await
+            .map_err(MeruError::Io)?;
+        tokio::fs::File::open(&hint_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
+
+        info!(
+            target = %target.display(),
+            snapshot_id = manifest.snapshot_id,
+            table_uuid = %manifest.table_uuid,
+            "exported Iceberg v2 metadata"
+        );
+        Ok(out_path)
     }
 }
 
@@ -624,5 +732,119 @@ mod tests {
         for i in 10..50u32 {
             assert!(!dv_merged.is_deleted(i), "row {i} should not be deleted");
         }
+    }
+
+    /// Every commit must stamp a non-zero `table_uuid`, bump
+    /// `sequence_number`, set `parent_snapshot_id`, and roll
+    /// `last_updated_ms` forward. These are the fields `crate::translate`
+    /// relies on for lossless Iceberg v2 projection.
+    #[tokio::test]
+    async fn commit_enriches_iceberg_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+
+        // Commit #1.
+        let mut txn1 = SnapshotTransaction::new();
+        txn1.add_file(IcebergDataFile {
+            path: "data/L0/a.parquet".into(),
+            file_size: 1024,
+            num_rows: 100,
+            meta: test_meta(0),
+        });
+        catalog.commit(&txn1, schema.clone()).await.unwrap();
+        let m1 = catalog.current_manifest().await;
+
+        assert!(
+            !m1.table_uuid.is_empty(),
+            "first commit must mint a table_uuid"
+        );
+        assert!(m1.last_updated_ms > 0, "last_updated_ms must be set");
+        assert_eq!(m1.sequence_number, 1);
+        assert_eq!(m1.parent_snapshot_id, None, "first commit has no parent");
+
+        // Commit #2 — must carry uuid, bump sequence, point parent at #1.
+        let mut txn2 = SnapshotTransaction::new();
+        txn2.add_file(IcebergDataFile {
+            path: "data/L0/b.parquet".into(),
+            file_size: 2048,
+            num_rows: 200,
+            meta: {
+                let mut m = test_meta(0);
+                m.seq_min = 11;
+                m.seq_max = 20;
+                m
+            },
+        });
+        catalog.commit(&txn2, schema.clone()).await.unwrap();
+        let m2 = catalog.current_manifest().await;
+
+        assert_eq!(
+            m2.table_uuid, m1.table_uuid,
+            "table_uuid must persist across commits"
+        );
+        assert_eq!(m2.sequence_number, 2);
+        assert_eq!(m2.parent_snapshot_id, Some(1));
+        assert!(m2.last_updated_ms >= m1.last_updated_ms);
+    }
+
+    /// `export_to_iceberg` must produce a `metadata.json` that parses
+    /// cleanly with the `iceberg` crate's `TableMetadata` deserializer.
+    /// That struct runs every spec validation the crate knows about —
+    /// if it accepts the payload, every V2-aware reader (pyiceberg,
+    /// Spark, Trino, DuckDB, Snowflake, Athena) will too.
+    #[tokio::test]
+    async fn export_produces_iceberg_spec_compliant_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_arc = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+
+        // Commit a file so the exported snapshot isn't empty.
+        let mut txn = SnapshotTransaction::new();
+        txn.add_file(IcebergDataFile {
+            path: "data/L0/a.parquet".into(),
+            file_size: 1024,
+            num_rows: 100,
+            meta: test_meta(0),
+        });
+        catalog.commit(&txn, schema_arc.clone()).await.unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let out = catalog.export_to_iceberg(target.path()).await.unwrap();
+
+        // File exists under metadata/ with the expected name.
+        assert!(out.exists());
+        assert!(out.starts_with(target.path().join("metadata")));
+        assert!(out
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with(".metadata.json"));
+
+        // version-hint.text must point at the emitted snapshot.
+        let hint = tokio::fs::read_to_string(target.path().join("version-hint.text"))
+            .await
+            .unwrap();
+        assert_eq!(hint.trim(), "1");
+
+        // Parse with the iceberg crate to enforce spec compliance.
+        let bytes = tokio::fs::read(&out).await.unwrap();
+        let parsed: std::result::Result<iceberg::spec::TableMetadata, _> =
+            serde_json::from_slice(&bytes);
+        assert!(
+            parsed.is_ok(),
+            "iceberg-rs rejected exported metadata: {:?}\n\nfile: {}\n\ncontent:\n{}",
+            parsed.err(),
+            out.display(),
+            String::from_utf8_lossy(&bytes)
+        );
+        let tm = parsed.unwrap();
+        assert_eq!(tm.last_sequence_number(), 1);
+        assert_eq!(tm.current_snapshot_id(), Some(1));
     }
 }

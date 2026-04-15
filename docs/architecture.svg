@@ -144,10 +144,10 @@
   <text x="560" y="515" text-anchor="middle" font-size="8" fill="#E53935">no ETL · no format conversion</text>
 
   <text x="700" y="490" font-size="9" fill="#37474F" font-style="italic">Read: memtable → L0 (bloom → KvSparseIndex) → L1+</text>
-  <text x="700" y="504" font-size="9" fill="#37474F" font-style="italic">Write: WAL → memtable → flush → Iceberg snapshot</text>
+  <text x="700" y="504" font-size="9" fill="#37474F" font-style="italic">Write: WAL → memtable → flush → native manifest (Iceberg v2 superset)</text>
 
-  <text x="550" y="550" text-anchor="middle" font-size="10" fill="#F57F17" font-weight="600">Every flush and compaction produces a spec-compliant Iceberg v3 snapshot.</text>
-  <text x="550" y="563" text-anchor="middle" font-size="9" fill="#795548">External readers see consistent data at any snapshot — no separate ingestion step.</text>
+  <text x="550" y="550" text-anchor="middle" font-size="10" fill="#F57F17" font-weight="600">Native JSON manifest — strict superset of Apache Iceberg v2 TableMetadata.</text>
+  <text x="550" y="563" text-anchor="middle" font-size="9" fill="#795548">db.export_iceberg(target) projects to a spec-compliant metadata.json on demand.</text>
 
   <!-- ═══════════════════════════════════════════════════════ -->
   <!-- ROW 3 (y=600..790): Per-Level Parquet Format — detail -->
