@@ -74,7 +74,7 @@ impl Default for MutationBatch {
 #[instrument(skip(engine, batch), fields(op = "apply_batch", batch_size = batch.ops.len()))]
 pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Result<SeqNum> {
     if batch.is_empty() {
-        return Ok(engine.global_seq.current());
+        return Ok(engine.visible_seq.current());
     }
 
     if engine.read_only {
@@ -82,26 +82,15 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
     }
 
     // Flow control.
-    while engine.memtable.should_stall() {
-        engine.memtable.flush_complete.notified().await;
+    loop {
+        let notify = engine.memtable.flush_complete.notified();
+        if !engine.memtable.should_stall() {
+            break;
+        }
+        notify.await;
     }
 
-    // Reserve one seq per record up front. The memtable's `apply_batch`
-    // consumes seqs incrementally (`seq, seq+1, …, seq+N-1`), so the global
-    // counter MUST be advanced by the full record count. If we only
-    // `allocate()` once, the next writer's allocation collides with the
-    // tail of this batch — crossbeam_skiplist's `insert` then silently
-    // overwrites one of the two entries at (same user_key, same seq) and
-    // drops a record. Bug A regression: `apply_batch_advances_seq_by_record_count`.
-    let base_seq = engine.global_seq.allocate_n(batch.ops.len() as u64);
-    debug!(
-        base_seq = base_seq.0,
-        count = batch.ops.len(),
-        "batch seq allocated"
-    );
-    let mut wal_batch = WriteBatch::new(base_seq);
-
-    // Only track user keys when the row cache needs invalidation.
+    // Encode all mutations (CPU work) outside the WAL lock.
     let has_cache = engine.row_cache.is_some();
     let mut user_keys: Vec<Vec<u8>> = if has_cache {
         Vec::with_capacity(batch.ops.len())
@@ -109,40 +98,74 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         Vec::new()
     };
 
+    struct EncodedOp {
+        user_key_bytes: Vec<u8>,
+        value_bytes: Bytes,
+        op_type: OpType,
+    }
+    let mut encoded_ops: Vec<EncodedOp> = Vec::with_capacity(batch.ops.len());
+
     for mutation in &batch.ops {
-        // Hot-path: encode only the PK user-key bytes — no full InternalKey
-        // struct, no pk_values.to_vec() clone, no tag encoding.
         let user_key_bytes = InternalKey::encode_user_key(&mutation.pk_values, &engine.schema)?;
         if has_cache {
             user_keys.push(user_key_bytes.clone());
         }
+        let value_bytes = match mutation.op_type {
+            OpType::Put => mutation
+                .row
+                .as_ref()
+                .map(|r| {
+                    let encoded = codec::encode_row(r).unwrap_or_default();
+                    Bytes::from(encoded)
+                })
+                .unwrap_or_default(),
+            OpType::Delete => Bytes::new(),
+        };
+        encoded_ops.push(EncodedOp {
+            user_key_bytes,
+            value_bytes,
+            op_type: mutation.op_type,
+        });
+    }
 
-        match mutation.op_type {
-            OpType::Put => {
-                let value_bytes = mutation
-                    .row
-                    .as_ref()
-                    .map(|r| {
-                        let encoded = codec::encode_row(r).unwrap_or_default();
-                        Bytes::from(encoded)
-                    })
-                    .unwrap_or_default();
-                wal_batch.put(Bytes::from(user_key_bytes), value_bytes);
-            }
-            OpType::Delete => {
-                wal_batch.delete(Bytes::from(user_key_bytes));
+    let batch_len = encoded_ops.len() as u64;
+
+    // IMP-02: allocate, WAL append, and memtable apply all inside the WAL
+    // lock. This ensures visible_seq is only advanced after data is in the
+    // memtable — no torn-read window for concurrent readers.
+    let (base_seq, should_flush) = {
+        let mut wal = engine.wal.lock().await;
+
+        let base_seq = engine.global_seq.allocate_n(batch_len);
+        debug!(
+            base_seq = base_seq.0,
+            count = batch_len,
+            "batch seq allocated"
+        );
+
+        let mut wal_batch = WriteBatch::new(base_seq);
+        for op in &encoded_ops {
+            match op.op_type {
+                OpType::Put => {
+                    wal_batch.put(
+                        Bytes::from(op.user_key_bytes.clone()),
+                        op.value_bytes.clone(),
+                    );
+                }
+                OpType::Delete => {
+                    wal_batch.delete(Bytes::from(op.user_key_bytes.clone()));
+                }
             }
         }
-    }
 
-    // WAL first.
-    {
-        let mut wal = engine.wal.lock().await;
         wal.append(&wal_batch)?;
-    }
+        let should_flush = engine.memtable.apply_batch(&wal_batch)?;
 
-    // Apply to memtable.
-    let should_flush = engine.memtable.apply_batch(&wal_batch)?;
+        // Advance visible_seq now that the data is in the memtable.
+        engine.visible_seq.set_at_least(base_seq.0 + batch_len);
+
+        (base_seq, should_flush)
+    };
 
     // Invalidate row cache for every key in the batch.
     if let Some(ref cache) = engine.row_cache {

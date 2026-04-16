@@ -151,6 +151,27 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         tokio::fs::write(&full_path, &parquet_bytes)
             .await
             .map_err(MeruError::Io)?;
+
+        // IMP-01: fsync the SST file so its bytes are durable before the
+        // manifest references it.  Without this a crash between write and
+        // catalog.commit() leaves a truncated/zero-length Parquet file
+        // that the manifest points at.
+        tokio::fs::File::open(&full_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
+
+        // IMP-19: fsync the data directory so the directory entry for the
+        // new file is durable.  POSIX: fsync on a file syncs data+metadata
+        // of the file itself but NOT the directory containing the link.
+        if let Some(parent) = full_path.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
+
         parquet_bytes.len() as u64
     };
 

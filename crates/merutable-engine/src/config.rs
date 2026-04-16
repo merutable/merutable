@@ -45,6 +45,12 @@ pub struct EngineConfig {
 
     /// Open in read-only mode. No WAL, no memtable writes. Default: false.
     pub read_only: bool,
+
+    /// IMP-12: minimum age (in seconds) before compaction-obsoleted files are
+    /// physically deleted. External readers (DuckDB, Spark) that resolved an
+    /// older snapshot may still be mid-read of the old files; deleting them
+    /// causes read failures. Default: 300 (5 minutes). Set to 0 for tests.
+    pub gc_grace_period_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -75,6 +81,7 @@ impl Default for EngineConfig {
             flush_parallelism: 1,
             compaction_parallelism: 2,
             read_only: false,
+            gc_grace_period_secs: 300,
         }
     }
 }

@@ -296,6 +296,22 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
             .await
             .map_err(MeruError::Io)?;
 
+        // IMP-01: fsync the output SST before the manifest references it.
+        tokio::fs::File::open(&full_path)
+            .await
+            .map_err(MeruError::Io)?
+            .sync_all()
+            .await
+            .map_err(MeruError::Io)?;
+
+        // IMP-19: fsync the data directory so the new file's directory
+        // entry is durable before the manifest commit.
+        if let Some(parent) = full_path.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
+
         let meta = ParquetFileMeta {
             level: pick.output_level,
             seq_min: if seq_min == u64::MAX { 0 } else { seq_min },
@@ -334,6 +350,30 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     // Commit.
     let new_version = engine.catalog.commit(&txn, engine.schema.clone()).await?;
     engine.version_set.install(new_version);
+
+    // IMP-03: clear the row cache after compaction. Compaction rewrites
+    // files and resolves MVCC versions — any entry cached from a now-obsolete
+    // file could be stale. A full clear is simple and correct; the cache
+    // refills on the next read wave.
+    if let Some(ref cache) = engine.row_cache {
+        cache.clear();
+    }
+
+    // IMP-12: enqueue obsoleted files for deferred deletion. External
+    // readers (DuckDB, Spark) may still be mid-read of old files; immediate
+    // deletion would cause read failures. Files are physically deleted
+    // after gc_grace_period_secs has elapsed.
+    let mut obsoleted_paths: Vec<std::path::PathBuf> = Vec::new();
+    for file_meta in input_file_metas.iter().chain(overlap_output_metas.iter()) {
+        obsoleted_paths.push(base.join(&file_meta.path));
+        if let Some(ref dv) = file_meta.dv_path {
+            obsoleted_paths.push(base.join(dv));
+        }
+    }
+    engine.enqueue_for_deletion(obsoleted_paths).await;
+
+    // Run GC to clean up any files whose grace period has expired.
+    engine.gc_pending_deletions().await;
 
     info!(
         input_level = pick.input_level.0,

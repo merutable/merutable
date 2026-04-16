@@ -252,6 +252,18 @@ impl Manifest {
             }
         }
 
+        // IMP-04: conflict detection — a transaction must not both add a DV
+        // for a file and remove that same file.  This is a logical error in
+        // the compaction/flush path (the DV would be silently discarded).
+        for dv_path in txn.dvs.keys() {
+            if txn.removes.contains(dv_path) {
+                return Err(MeruError::Iceberg(format!(
+                    "apply: transaction both adds DV and removes file '{dv_path}' — \
+                     this is a conflict; retry against the current manifest"
+                )));
+            }
+        }
+
         let remove_set: std::collections::HashSet<&str> =
             txn.removes.iter().map(|s| s.as_str()).collect();
 
@@ -620,5 +632,45 @@ mod tests {
         let l1 = v.files_at(Level(1));
         assert_eq!(l1[0].path, "l1_a.parquet");
         assert_eq!(l1[1].path, "l1_b.parquet");
+    }
+
+    /// IMP-04 regression: a transaction that both adds a DV for a file and
+    /// removes that same file must be rejected — the DV would be silently
+    /// discarded. This catches logic errors in the compaction path.
+    #[test]
+    fn apply_rejects_dv_add_and_file_remove_conflict() {
+        let mut m = Manifest::empty(test_schema());
+        m.entries.push(ManifestEntry {
+            path: "data/L0/a.parquet".into(),
+            meta: test_meta(0, 1, 10, b"\x01", b"\x05"),
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+            status: "existing".into(),
+        });
+
+        let mut txn = SnapshotTransaction::new();
+        // Both add DV and remove the same file — conflict.
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(0);
+        txn.add_dv("data/L0/a.parquet".into(), dv);
+        txn.remove_file("data/L0/a.parquet".into());
+
+        let mut dv_locs = HashMap::new();
+        dv_locs.insert(
+            "data/L0/a.parquet".to_string(),
+            DvLocation {
+                dv_path: "data/L0/a.dv-2.puffin".to_string(),
+                dv_offset: 4,
+                dv_length: 24,
+            },
+        );
+
+        let err = m.apply(&txn, 2, &dv_locs).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("conflict"),
+            "error must indicate a conflict: {msg}"
+        );
     }
 }

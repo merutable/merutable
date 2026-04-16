@@ -69,6 +69,14 @@ impl RowCache {
         guard.pop(user_key);
     }
 
+    /// Drop every cached entry. Called after compaction installs a new
+    /// version — compaction rewrites files and may resolve MVCC versions,
+    /// so any cached entry read from a now-obsolete file could be stale.
+    pub fn clear(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.clear();
+    }
+
     /// Current number of cached entries.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
@@ -141,6 +149,22 @@ mod tests {
         assert!(cache.get(b"a").is_none());
         assert!(cache.get(b"b").is_some());
         assert!(cache.get(b"c").is_some());
+    }
+
+    /// IMP-03 regression: `clear()` drops every cached entry so that
+    /// compaction-invalidated data cannot be served.
+    #[test]
+    fn clear_drops_all_entries() {
+        let cache = RowCache::new(10);
+        cache.insert(b"a".to_vec(), make_entry(1));
+        cache.insert(b"b".to_vec(), make_entry(2));
+        cache.insert(b"c".to_vec(), make_entry(3));
+        assert_eq!(cache.len(), 3);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(b"a").is_none());
+        assert!(cache.get(b"b").is_none());
+        assert!(cache.get(b"c").is_none());
     }
 
     #[test]

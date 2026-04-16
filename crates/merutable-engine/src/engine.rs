@@ -14,7 +14,7 @@ use merutable_types::{
 };
 use merutable_wal::{batch::WriteBatch, manager::WalManager};
 use tokio::sync::Mutex;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::config::EngineConfig;
 
@@ -49,6 +49,16 @@ pub struct MeruEngine {
     pub(crate) row_cache: Option<crate::cache::RowCache>,
     /// True if opened in read-only mode. Write ops will return `MeruError::ReadOnly`.
     pub(crate) read_only: bool,
+    /// IMP-02: reader-visible sequence number. Only advanced AFTER memtable
+    /// apply completes (inside the WAL lock), so `read_seq()` never returns a
+    /// sequence whose data isn't in the memtable yet. `global_seq` remains
+    /// the allocation counter; `visible_seq` is what readers snapshot.
+    pub(crate) visible_seq: GlobalSeq,
+    /// IMP-12: files pending deletion after compaction. Each entry is
+    /// (absolute_path, obsoleted_at_instant). Files are only physically
+    /// deleted after `gc_grace_period_secs` has elapsed, giving external
+    /// readers time to finish in-progress reads.
+    pub(crate) pending_deletions: Mutex<Vec<(std::path::PathBuf, std::time::Instant)>>,
 }
 
 impl MeruEngine {
@@ -138,6 +148,10 @@ impl MeruEngine {
             None
         };
 
+        // IMP-02: visible_seq starts at the same value as global_seq.
+        // Both are at init_seq after recovery.
+        let visible_seq = GlobalSeq::new(init_seq);
+
         let engine = Arc::new(Self {
             config,
             schema,
@@ -151,6 +165,8 @@ impl MeruEngine {
             compaction_mutex: Mutex::new(()),
             row_cache,
             read_only,
+            visible_seq,
+            pending_deletions: Mutex::new(Vec::new()),
         });
 
         Ok(engine)
@@ -184,14 +200,15 @@ impl MeruEngine {
         row: Option<Row>,
         op_type: OpType,
     ) -> Result<SeqNum> {
-        // Flow control: stall if immutable queue is full.
+        // Flow control: graduated backpressure + hard stall.
         //
-        // Bug Z fix: register the `notified()` future BEFORE checking the
-        // condition. The old `while should_stall() { notified().await }`
-        // pattern has a TOCTOU race: if a flush completes (calling
-        // `notify_waiters()`) between the `should_stall()` check and the
-        // `notified()` registration, the notification is lost and the writer
-        // hangs indefinitely until another unrelated flush happens.
+        // IMP-09: instead of a binary block at max_immutable, introduce a
+        // graduated delay once the immutable queue is >50% full. This
+        // prevents the sawtooth throughput pattern where all blocked
+        // writers resume simultaneously and re-trigger the stall.
+        //
+        // Bug Z fix preserved: register `notified()` BEFORE checking the
+        // condition to avoid lost-wakeup TOCTOU race.
         loop {
             let notify = self.memtable.flush_complete.notified();
             if !self.memtable.should_stall() {
@@ -200,15 +217,26 @@ impl MeruEngine {
             notify.await;
         }
 
-        // Allocate sequence number.
-        let seq = self.global_seq.allocate();
+        // Graduated delay: slow writes proportionally as the immutable
+        // queue fills, before the hard stall triggers.
+        {
+            let imm_count = self.memtable.immutable_count() as f64;
+            let max_imm = self.config.max_immutable_count as f64;
+            let ratio = imm_count / max_imm;
+            if ratio > 0.5 {
+                // Linear ramp: 0ms at 50%, 5ms at 100%.
+                let delay_ms = ((ratio - 0.5) * 2.0 * 5.0) as u64;
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
 
         // Encode only the user-key (PK) bytes — no full InternalKey struct,
         // no pk_values.to_vec() clone, no tag encoding. Hot-path optimization.
         let user_key_bytes = InternalKey::encode_user_key(&pk_values, &self.schema)?;
 
-        // Build WAL batch.
-        let mut batch = WriteBatch::new(seq);
+        // Encode value bytes (CPU work, outside the WAL lock).
         let value_bytes = match row {
             Some(r) => {
                 let encoded = crate::codec::encode_row(&r)?;
@@ -217,22 +245,32 @@ impl MeruEngine {
             None => None,
         };
 
-        match op_type {
-            OpType::Put => batch.put(
-                bytes::Bytes::from(user_key_bytes.clone()),
-                value_bytes.unwrap_or_default(),
-            ),
-            OpType::Delete => batch.delete(bytes::Bytes::from(user_key_bytes.clone())),
-        }
-
-        // WAL first (durability).
-        {
+        // IMP-02: allocate seq, WAL append, and memtable apply all happen
+        // inside the WAL lock. This guarantees that when visible_seq is
+        // advanced, all data for seqs <= visible_seq is in the memtable.
+        // A concurrent reader can never observe a sequence number whose
+        // data hasn't been applied yet.
+        let (seq, should_flush) = {
             let mut wal = self.wal.lock().await;
-            wal.append(&batch)?;
-        }
 
-        // Apply to memtable.
-        let should_flush = self.memtable.apply_batch(&batch)?;
+            let seq = self.global_seq.allocate();
+            let mut batch = WriteBatch::new(seq);
+            match op_type {
+                OpType::Put => batch.put(
+                    bytes::Bytes::from(user_key_bytes.clone()),
+                    value_bytes.unwrap_or_default(),
+                ),
+                OpType::Delete => batch.delete(bytes::Bytes::from(user_key_bytes.clone())),
+            }
+
+            wal.append(&batch)?;
+            let should_flush = self.memtable.apply_batch(&batch)?;
+
+            // Advance visible_seq now that the data is in the memtable.
+            self.visible_seq.set_at_least(seq.0 + 1);
+
+            (seq, should_flush)
+        };
 
         // Invalidate row cache so post-flush reads don't serve stale data.
         if let Some(ref cache) = self.row_cache {
@@ -338,8 +376,13 @@ impl MeruEngine {
     }
 
     /// Current read sequence (snapshot for reads).
+    ///
+    /// IMP-02: returns `visible_seq` — the highest sequence number whose
+    /// data is guaranteed to be in the memtable. This is strictly <=
+    /// `global_seq.current()` and is only advanced after memtable apply
+    /// completes inside the WAL lock.
     pub fn read_seq(&self) -> SeqNum {
-        self.global_seq.current()
+        self.visible_seq.current()
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -366,11 +409,72 @@ impl MeruEngine {
 
     /// Re-read the Iceberg manifest from disk and install a new version.
     /// Used by read-only replicas to pick up snapshots written by the primary.
+    ///
+    /// IMP-15: validates that all data files and Puffin files referenced by the
+    /// new manifest exist on disk before swapping the version. If any file is
+    /// missing (e.g. not yet replicated), the refresh is rejected and the
+    /// current version stays in place.
     pub async fn refresh(&self) -> Result<()> {
         let new_version = self.catalog.refresh(self.schema.clone()).await?;
+
+        // IMP-15: pre-flight check — every referenced file must exist.
+        let base = self.catalog.base_path();
+        for files in new_version.levels.values() {
+            for file in files {
+                let data_path = base.join(&file.path);
+                if !data_path.exists() {
+                    return Err(MeruError::ObjectStore(format!(
+                        "refresh: referenced data file missing: {}",
+                        file.path,
+                    )));
+                }
+                if let Some(ref dv_path) = file.dv_path {
+                    let puffin_path = base.join(dv_path);
+                    if !puffin_path.exists() {
+                        return Err(MeruError::ObjectStore(format!(
+                            "refresh: referenced puffin file missing: {dv_path}",
+                        )));
+                    }
+                }
+            }
+        }
+
         self.version_set.install(new_version);
         info!("version refreshed from disk");
         Ok(())
+    }
+
+    /// IMP-12: enqueue obsoleted files for deferred deletion.
+    /// Called by compaction after committing a new version.
+    pub(crate) async fn enqueue_for_deletion(&self, paths: Vec<std::path::PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut pending = self.pending_deletions.lock().await;
+        for p in paths {
+            pending.push((p, now));
+        }
+    }
+
+    /// IMP-12: delete files whose grace period has expired.
+    /// Called periodically by the background worker or after compaction.
+    pub async fn gc_pending_deletions(&self) {
+        let grace = std::time::Duration::from_secs(self.config.gc_grace_period_secs);
+        let mut pending = self.pending_deletions.lock().await;
+        let mut remaining = Vec::new();
+        for (path, obsoleted_at) in pending.drain(..) {
+            if obsoleted_at.elapsed() >= grace {
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %path.display(), error = %e, "failed to GC obsoleted file");
+                    }
+                }
+            } else {
+                remaining.push((path, obsoleted_at));
+            }
+        }
+        *pending = remaining;
     }
 
     /// Snapshot of engine statistics. Lock-free on the version side (ArcSwap),

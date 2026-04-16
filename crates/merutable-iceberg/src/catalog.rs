@@ -131,6 +131,10 @@ impl IcebergCatalog {
         let new_snapshot_id = *next_ver;
         debug!(snapshot_id = new_snapshot_id, "committing snapshot");
 
+        // IMP-06: track puffin files written during this commit so we can
+        // delete them if any later step fails (prevents orphaned blobs).
+        let mut pending_puffin_files: Vec<std::path::PathBuf> = Vec::new();
+
         // Upload puffin files for DV updates AND record their real
         // on-storage blob coordinates so the manifest can point at the
         // exact byte range of each roaring-bitmap blob. Skipping this
@@ -182,8 +186,24 @@ impl IcebergCatalog {
                     }
                     let existing_dv =
                         DeletionVector::from_puffin_blob(&puffin_data[offset..offset + length])?;
+                    let existing_card = existing_dv.cardinality();
+                    let new_card = new_dv.cardinality();
                     let mut merged = existing_dv;
                     merged.union_with(new_dv);
+
+                    // IMP-17: a union can never shrink — if it does, the
+                    // bitmap library dropped bits and deleted rows will
+                    // silently reappear.
+                    let merged_card = merged.cardinality();
+                    let min_expected = existing_card.max(new_card);
+                    if merged_card < min_expected {
+                        return Err(MeruError::Corruption(format!(
+                            "DV union for '{}' shrank: existing={existing_card} new={new_card} \
+                             merged={merged_card}",
+                            parquet_path,
+                        )));
+                    }
+
                     merged
                 }
                 _ => new_dv.clone(),
@@ -213,6 +233,7 @@ impl IcebergCatalog {
             tokio::fs::write(&abs_puffin_path, &encoded.bytes)
                 .await
                 .map_err(MeruError::Io)?;
+            pending_puffin_files.push(abs_puffin_path.clone());
             // fsync the puffin file so deleted-row bitmaps survive a crash.
             tokio::fs::File::open(&abs_puffin_path)
                 .await
@@ -244,67 +265,83 @@ impl IcebergCatalog {
         // that every DV in `txn.dvs` has a matching entry in
         // `dv_locations`; it errors out if the caller forgot any, so
         // the zero-placeholder bug cannot recur silently.
-        let new_manifest = current.apply(txn, new_snapshot_id, &dv_locations)?;
+        //
+        // IMP-06: everything below is wrapped so that on any error the
+        // puffin files written above are cleaned up (best-effort).
+        let result: Result<Version> = async {
+            let new_manifest = current.apply(txn, new_snapshot_id, &dv_locations)?;
 
-        // Write manifest JSON.
-        let meta_path = self
-            .base_path
-            .join("metadata")
-            .join(format!("v{new_snapshot_id}.metadata.json"));
-        let json = new_manifest.to_json()?;
-        tokio::fs::write(&meta_path, &json)
-            .await
-            .map_err(MeruError::Io)?;
-        // fsync the metadata JSON so it is complete before the version-hint
-        // points at it. Without this, a crash can leave a truncated file.
-        tokio::fs::File::open(&meta_path)
-            .await
-            .map_err(MeruError::Io)?
-            .sync_all()
-            .await
-            .map_err(MeruError::Io)?;
+            // Write manifest JSON.
+            let meta_path = self
+                .base_path
+                .join("metadata")
+                .join(format!("v{new_snapshot_id}.metadata.json"));
+            let json = new_manifest.to_json()?;
+            tokio::fs::write(&meta_path, &json)
+                .await
+                .map_err(MeruError::Io)?;
+            // fsync the metadata JSON so it is complete before the version-hint
+            // points at it. Without this, a crash can leave a truncated file.
+            tokio::fs::File::open(&meta_path)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
 
-        // Update version hint (atomic: write tmp + rename).
-        let hint_path = self.base_path.join("version-hint.text");
-        let tmp_hint = self.base_path.join("version-hint.text.tmp");
-        tokio::fs::write(&tmp_hint, new_snapshot_id.to_string())
-            .await
-            .map_err(MeruError::Io)?;
-        // fsync the tmp hint file before rename so the content is durable.
-        tokio::fs::File::open(&tmp_hint)
-            .await
-            .map_err(MeruError::Io)?
-            .sync_all()
-            .await
-            .map_err(MeruError::Io)?;
-        tokio::fs::rename(&tmp_hint, &hint_path)
-            .await
-            .map_err(MeruError::Io)?;
-        // fsync the metadata directory so both the new metadata JSON entry
-        // and the version-hint rename are durable (required on ext4/btrfs).
-        let metadata_dir = self.base_path.join("metadata");
-        tokio::fs::File::open(&metadata_dir)
-            .await
-            .map_err(MeruError::Io)?
-            .sync_all()
-            .await
-            .map_err(MeruError::Io)?;
-        // Also fsync the base directory (version-hint.text lives here).
-        tokio::fs::File::open(&self.base_path)
-            .await
-            .map_err(MeruError::Io)?
-            .sync_all()
-            .await
-            .map_err(MeruError::Io)?;
+            // Update version hint (atomic: write tmp + rename).
+            let hint_path = self.base_path.join("version-hint.text");
+            let tmp_hint = self.base_path.join("version-hint.text.tmp");
+            tokio::fs::write(&tmp_hint, new_snapshot_id.to_string())
+                .await
+                .map_err(MeruError::Io)?;
+            // fsync the tmp hint file before rename so the content is durable.
+            tokio::fs::File::open(&tmp_hint)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
+            tokio::fs::rename(&tmp_hint, &hint_path)
+                .await
+                .map_err(MeruError::Io)?;
+            // fsync the metadata directory so both the new metadata JSON entry
+            // and the version-hint rename are durable (required on ext4/btrfs).
+            let metadata_dir = self.base_path.join("metadata");
+            tokio::fs::File::open(&metadata_dir)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
+            // Also fsync the base directory (version-hint.text lives here).
+            tokio::fs::File::open(&self.base_path)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
 
-        // Build Version from the new manifest.
-        let version = new_manifest.to_version(schema);
+            // Build Version from the new manifest.
+            let version = new_manifest.to_version(schema);
 
-        // Update in-memory state.
-        *current = new_manifest;
-        *next_ver = new_snapshot_id + 1;
+            // Update in-memory state.
+            *current = new_manifest;
+            *next_ver = new_snapshot_id + 1;
 
-        Ok(version)
+            Ok(version)
+        }
+        .await;
+
+        // IMP-06: on commit failure, best-effort cleanup of orphaned puffin
+        // files that were written but never referenced by a manifest.
+        if result.is_err() {
+            for puffin_path in &pending_puffin_files {
+                let _ = tokio::fs::remove_file(puffin_path).await;
+            }
+        }
+
+        result
     }
 
     /// Re-read the current manifest from disk. Used by read-only replicas
