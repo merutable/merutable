@@ -10,11 +10,9 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 ## Why merutable
 
-- **HTAP in one binary**: Transactional KV writes land in Parquet. DuckDB, Spark, Trino read them directly — no ETL.
-- **Iceberg-native**: Every commit is a strict superset of Iceberg v2 `TableMetadata`. `db.export_iceberg()` projects onto spec-compliant metadata. Deletion Vectors use Iceberg v3 Puffin blobs.
-- **Fast**: SIMD bloom filters, prefix-compressed sparse index, LRU row cache. Point lookups skip files and pages, not just rows.
-- **Crash-safe**: Correct fsync ordering end-to-end. Linearizable reads. Graceful shutdown via `db.close()`.
-- **Embeddable**: One crate, async API, read-only replicas, pluggable storage (local FS or S3).
+- **One table, two workloads**: Write rows through a KV API, query them with SQL. Same Parquet files, zero ETL.
+- **Open format, no lock-in**: Data is Parquet. Metadata is Iceberg. DuckDB, Spark, Trino, Snowflake read it natively.
+- **Embed, don't deploy**: Link one crate. No server, no cluster, no JVM.
 
 ## Architecture
 
