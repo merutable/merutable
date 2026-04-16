@@ -213,6 +213,82 @@ async fn imp15_refresh_rejects_missing_files() {
     );
 }
 
+/// Graceful shutdown: close() must flush memtable data and reject
+/// subsequent writes while keeping reads available.
+#[tokio::test]
+async fn close_flushes_and_rejects_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.memtable_size_bytes = 64 * 1024 * 1024; // don't auto-flush
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Write data into the memtable (no flush).
+    for i in 0..20i64 {
+        engine
+            .put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{i}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Close: flushes memtable to Parquet.
+    engine.close().await.unwrap();
+
+    // Reads still work.
+    for i in 0..20i64 {
+        let row = engine.get(&[FieldValue::Int64(i)]).unwrap();
+        assert!(row.is_some(), "key {i} must be readable after close");
+    }
+
+    // Writes fail.
+    let err = engine
+        .put(
+            vec![FieldValue::Int64(99)],
+            Row::new(vec![Some(FieldValue::Int64(99)), None]),
+        )
+        .await;
+    assert!(err.is_err(), "put must fail after close");
+}
+
+/// Graceful shutdown: data written before close() survives reopen
+/// without relying on WAL recovery.
+#[tokio::test]
+async fn close_data_durable_across_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(&tmp);
+
+    {
+        let mut cfg = config.clone();
+        cfg.memtable_size_bytes = 64 * 1024 * 1024; // don't auto-flush
+        let engine = MeruEngine::open(cfg).await.unwrap();
+        for i in 0..30i64 {
+            engine
+                .put(
+                    vec![FieldValue::Int64(i)],
+                    Row::new(vec![
+                        Some(FieldValue::Int64(i)),
+                        Some(FieldValue::Bytes(bytes::Bytes::from(format!("data_{i}")))),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.close().await.unwrap();
+    }
+
+    // Reopen — data should come from Parquet, not WAL.
+    let engine = MeruEngine::open(config).await.unwrap();
+    for i in 0..30i64 {
+        let row = engine.get(&[FieldValue::Int64(i)]).unwrap();
+        assert!(row.is_some(), "key {i} must survive close + reopen");
+    }
+}
+
 /// IMP-12 regression: compaction-obsoleted files should be tracked for
 /// deferred deletion, not immediately removed.
 #[tokio::test]

@@ -34,6 +34,9 @@ pub enum MeruError {
 
     #[error("operation not permitted: database is read-only")]
     ReadOnly,
+
+    #[error("database is closed")]
+    Closed,
 }
 
 pub type Result<T> = std::result::Result<T, MeruError>;

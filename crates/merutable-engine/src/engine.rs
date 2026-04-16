@@ -1,6 +1,7 @@
 //! `MeruEngine`: central orchestrator. Owns WAL, memtable, version set, catalog,
 //! and background workers. All public operations go through this struct.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use merutable_iceberg::{IcebergCatalog, VersionSet};
@@ -59,6 +60,10 @@ pub struct MeruEngine {
     /// deleted after `gc_grace_period_secs` has elapsed, giving external
     /// readers time to finish in-progress reads.
     pub(crate) pending_deletions: Mutex<Vec<(std::path::PathBuf, std::time::Instant)>>,
+    /// Set to `true` by `close()`. All subsequent write/flush/compact ops
+    /// return `MeruError::Closed`. Reads remain available until the engine
+    /// is dropped.
+    closed: AtomicBool,
 }
 
 impl MeruEngine {
@@ -167,6 +172,7 @@ impl MeruEngine {
             read_only,
             visible_seq,
             pending_deletions: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
         });
 
         Ok(engine)
@@ -200,6 +206,10 @@ impl MeruEngine {
         row: Option<Row>,
         op_type: OpType,
     ) -> Result<SeqNum> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(MeruError::Closed);
+        }
+
         // Flow control: graduated backpressure + hard stall.
         //
         // IMP-09: instead of a binary block at max_immutable, introduce a
@@ -340,6 +350,9 @@ impl MeruEngine {
         if self.read_only {
             return Err(MeruError::ReadOnly);
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(MeruError::Closed);
+        }
         // Bug R fix: hold `rotation_lock` while rotating so a concurrent
         // auto-flush task from `write_internal` doesn't race on `rotate()`
         // and seal an empty (freshly-created) memtable.
@@ -371,6 +384,9 @@ impl MeruEngine {
     pub async fn compact(self: &Arc<Self>) -> Result<()> {
         if self.read_only {
             return Err(MeruError::ReadOnly);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(MeruError::Closed);
         }
         crate::compaction::job::run_compaction(self).await
     }
@@ -475,6 +491,66 @@ impl MeruEngine {
             }
         }
         *pending = remaining;
+    }
+
+    /// Graceful shutdown: flush all in-memory data to durable storage, fsync
+    /// the WAL, and set the closed flag. After `close()` returns, all data
+    /// written before this call is durable on disk. Subsequent write/flush/
+    /// compact calls return `MeruError::Closed`. Reads remain available
+    /// until the `MeruEngine` is dropped.
+    ///
+    /// Follows the RocksDB/sled pattern: the library provides the method,
+    /// the host process calls it in its shutdown path. No signal handlers
+    /// are installed.
+    #[instrument(skip(self), fields(op = "close"))]
+    pub async fn close(self: &Arc<Self>) -> Result<()> {
+        if self.read_only {
+            // Read-only instances have nothing to flush. Just set the flag.
+            self.closed.store(true, Ordering::Release);
+            info!("read-only engine closed");
+            return Ok(());
+        }
+
+        // Prevent double-close.
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        info!("engine closing — flushing memtable to durable storage");
+
+        // Rotate the active memtable so its contents become immutable and
+        // can be flushed. Same pattern as the manual flush() path.
+        {
+            let _rotation_guard = self.rotation_lock.lock().await;
+            if self.memtable.active_size_bytes() > 0 {
+                let next_seq = self.global_seq.current().next();
+                self.memtable.rotate(next_seq);
+                {
+                    let mut wal = self.wal.lock().await;
+                    wal.rotate()?;
+                }
+            }
+        }
+
+        // Flush all immutable memtables.
+        while self.memtable.oldest_immutable().is_some() {
+            crate::flush::run_flush(self).await?;
+        }
+
+        // Final WAL sync for any trailing writes that landed between
+        // the last flush and the close flag.
+        {
+            let mut wal = self.wal.lock().await;
+            wal.sync()?;
+        }
+
+        info!("engine closed — all data flushed and synced");
+        Ok(())
+    }
+
+    /// Returns `true` if `close()` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Snapshot of engine statistics. Lock-free on the version side (ArcSwap),
@@ -768,5 +844,88 @@ mod tests {
         let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
         let row = engine.get(&[FieldValue::Int64(42)]).unwrap();
         assert!(row.is_some(), "WAL recovery should restore the row");
+    }
+
+    #[tokio::test]
+    async fn close_flushes_and_blocks_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+
+        // Write data that sits in the memtable.
+        engine
+            .put(
+                vec![FieldValue::Int64(1)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(1)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from("before_close"))),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        assert!(!engine.is_closed());
+        engine.close().await.unwrap();
+        assert!(engine.is_closed());
+
+        // Writes must fail after close.
+        let err = engine
+            .put(
+                vec![FieldValue::Int64(2)],
+                Row::new(vec![Some(FieldValue::Int64(2)), None]),
+            )
+            .await;
+        assert!(
+            matches!(err, Err(MeruError::Closed)),
+            "put after close must return Closed"
+        );
+
+        // Delete must fail.
+        let err = engine.delete(vec![FieldValue::Int64(1)]).await;
+        assert!(matches!(err, Err(MeruError::Closed)));
+
+        // Reads still work.
+        let row = engine.get(&[FieldValue::Int64(1)]).unwrap();
+        assert!(row.is_some(), "reads must still work after close");
+    }
+
+    #[tokio::test]
+    async fn close_data_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write, close, drop.
+        {
+            let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+            for i in 1..=10i64 {
+                engine
+                    .put(
+                        vec![FieldValue::Int64(i)],
+                        Row::new(vec![
+                            Some(FieldValue::Int64(i)),
+                            Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{i}")))),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.close().await.unwrap();
+        }
+
+        // Reopen — data was flushed by close(), should be in Parquet.
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+        for i in 1..=10i64 {
+            let row = engine.get(&[FieldValue::Int64(i)]).unwrap();
+            assert!(row.is_some(), "key {i} must survive close + reopen");
+        }
+    }
+
+    #[tokio::test]
+    async fn double_close_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+
+        engine.close().await.unwrap();
+        // Second close should succeed silently.
+        engine.close().await.unwrap();
+        assert!(engine.is_closed());
     }
 }

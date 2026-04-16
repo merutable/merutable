@@ -20,8 +20,9 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 - **Linearizable reads**: Sequence allocation, WAL append, and memtable apply are serialized under the WAL lock. A separate `visible_seq` counter (advanced only after memtable apply) guarantees that `read_seq()` never returns a sequence whose data isn't in the memtable — no torn-read window under concurrent writes.
 - **Graduated write backpressure**: Instead of a binary stall at `max_immutable`, writes are progressively delayed as the immutable memtable queue fills (linear ramp from 50% to 100% queue depth). Hard stall remains as a safety net. Eliminates sawtooth throughput oscillation.
 - **HTAP-safe file lifecycle**: Compaction-obsoleted files are deferred for deletion with a configurable grace period (`gc_grace_period_secs`, default 5 minutes). External readers (DuckDB, Spark) mid-read of an older snapshot are not disrupted by immediate file removal.
+- **Graceful shutdown**: `MeruDB::close()` flushes all in-memory data to Parquet, fsyncs the WAL, and sets a closed flag — subsequent writes return `MeruError::Closed` while reads remain available until drop. A `Drop` impl logs a warning if `close()` wasn't called. Follows the RocksDB/sled pattern: no signal handlers, the host process owns shutdown orchestration.
 - **Read-only replica**: `MeruDB.open_read_only()` opens the same catalog directory for reads only. Call `refresh()` to pick up new Iceberg snapshots from the primary — validates all referenced data and Puffin files exist before swapping the version.
-- **Structured tracing**: `#[instrument]` spans on every engine operation (open, put, get, scan, flush, compact, batch). Filter by operation type, level, file path. Drop in `tracing-subscriber` to activate.
+- **Structured tracing**: `#[instrument]` spans on every engine operation (open, put, get, scan, flush, compact, close, batch). Filter by operation type, level, file path. Drop in `tracing-subscriber` to activate.
 - **Pluggable storage**: Local filesystem for development, S3 with LRU disk cache for production.
 
 ## Architecture
@@ -94,6 +95,10 @@ async fn main() {
     db.put(&[FieldValue::Int64(1)], &[FieldValue::Int64(1), FieldValue::Null]).await.unwrap();
     let row = db.get(&[FieldValue::Int64(1)]).unwrap();
     println!("{row:?}");
+
+    // Graceful shutdown — flushes memtable to Parquet, fsyncs, and
+    // rejects further writes. Reads remain available until drop.
+    db.close().await.unwrap();
 }
 ```
 
@@ -149,6 +154,9 @@ db.export_iceberg("/tmp/events-iceberg")   # writes metadata/v{N}.metadata.json
 #   from pyiceberg.table import StaticTable
 #   t = StaticTable.from_metadata("/tmp/events-iceberg/metadata/v1.metadata.json")
 #   t.schema()              # ← full Iceberg v2 schema, table_uuid, snapshot chain
+
+# Graceful shutdown — flush + fsync + seal
+db.close()              # writes are rejected after this; reads still work
 ```
 
 Build with [maturin](https://www.maturin.rs/):

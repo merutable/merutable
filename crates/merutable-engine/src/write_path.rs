@@ -81,6 +81,10 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         return Err(merutable_types::MeruError::ReadOnly);
     }
 
+    if engine.is_closed() {
+        return Err(merutable_types::MeruError::Closed);
+    }
+
     // Flow control.
     loop {
         let notify = engine.memtable.flush_complete.notified();

@@ -310,6 +310,16 @@ impl PyMeruDB {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
     }
 
+    /// Graceful shutdown: flush memtable, fsync, and seal the database.
+    /// Writes are rejected after close(); reads still work until the
+    /// object is garbage-collected.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        let rt = Arc::clone(&self.runtime);
+        py.allow_threads(move || rt.block_on(async { inner.close().await }))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    }
+
     /// Catalog base directory path. Point DuckDB at `{catalog_path}/data/L1/*.parquet`.
     fn catalog_path(&self) -> String {
         self.inner.catalog_path()

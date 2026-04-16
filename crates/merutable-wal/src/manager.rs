@@ -101,6 +101,11 @@ impl WalManager {
         Ok(())
     }
 
+    /// Fsync the current WAL file to ensure all appended records are durable.
+    pub fn sync(&mut self) -> Result<()> {
+        self.current.sync()
+    }
+
     /// Rotate: close the current WAL and open a new one.
     /// Returns the log number of the file that was closed (the caller
     /// associates it with the immutable memtable that needs flushing).

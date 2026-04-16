@@ -46,6 +46,19 @@ use merutable_types::{
 use crate::options::OpenOptions;
 
 /// Primary embedding interface. Thread-safe, cloneable (via `Arc`).
+///
+/// # Shutdown
+///
+/// Call [`close()`](Self::close) before dropping to flush all in-memory data to
+/// durable storage. If `close()` is not called, a warning is logged on drop.
+/// Reads remain available after `close()`; writes, flushes, and compactions
+/// return `MeruError::Closed`.
+///
+/// ```no_run
+/// # async fn example(db: merutable::MeruDB) {
+/// db.close().await.expect("clean shutdown");
+/// # }
+/// ```
 pub struct MeruDB {
     engine: Arc<MeruEngine>,
 }
@@ -172,6 +185,41 @@ impl MeruDB {
     /// read-only replicas; on a read-write instance this is a no-op.
     pub async fn refresh(&self) -> Result<()> {
         self.engine.refresh().await
+    }
+
+    /// Graceful shutdown: flush all in-memory data to durable storage and
+    /// fsync. After `close()` returns, every write that completed before
+    /// this call is durable on disk. Subsequent write/flush/compact calls
+    /// return `MeruError::Closed`. Reads remain available until the `MeruDB`
+    /// is dropped.
+    ///
+    /// Call this in your application's shutdown path (e.g. before returning
+    /// from `main`, or in a signal handler's async block). If you drop a
+    /// `MeruDB` without calling `close()`, a warning is logged — data in
+    /// the active memtable that hasn't been flushed will be recovered from
+    /// the WAL on the next `open()`, but deferring to WAL recovery is
+    /// slower and riskier than an explicit flush.
+    ///
+    /// Calling `close()` more than once is a no-op.
+    pub async fn close(&self) -> Result<()> {
+        self.engine.close().await
+    }
+
+    /// Returns `true` if `close()` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.engine.is_closed()
+    }
+}
+
+impl Drop for MeruDB {
+    fn drop(&mut self) {
+        if !self.engine.is_closed() {
+            tracing::warn!(
+                table = %self.engine.schema().table_name,
+                "MeruDB dropped without calling close() — \
+                 unflushed memtable data will rely on WAL recovery"
+            );
+        }
     }
 }
 
@@ -465,5 +513,89 @@ mod tests {
             row2.is_some(),
             "read-only replica should see key 2 after refresh"
         );
+    }
+
+    #[tokio::test]
+    async fn close_flushes_memtable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+
+        // Write data — sits in memtable, not yet flushed.
+        for i in 0..50i64 {
+            db.put(make_row(i, &format!("row{i}"))).await.unwrap();
+        }
+
+        assert!(!db.is_closed());
+        db.close().await.unwrap();
+        assert!(db.is_closed());
+
+        // Reads still work after close.
+        let row = db.get(&[FieldValue::Int64(0)]).unwrap();
+        assert!(row.is_some(), "reads must work after close");
+
+        // Writes are rejected.
+        let err = db.put(make_row(100, "nope")).await;
+        assert!(err.is_err(), "writes must fail after close");
+
+        // Batch writes are rejected.
+        let err = db.put_batch(vec![make_row(101, "nope")]).await;
+        assert!(err.is_err(), "batch writes must fail after close");
+
+        // Flush is rejected.
+        let err = db.flush().await;
+        assert!(err.is_err(), "flush must fail after close");
+
+        // Compact is rejected.
+        let err = db.compact().await;
+        assert!(err.is_err(), "compact must fail after close");
+    }
+
+    #[tokio::test]
+    async fn close_data_durable_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        {
+            let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+            for i in 0..20i64 {
+                db.put(make_row(i, &format!("val{i}"))).await.unwrap();
+            }
+            // close() flushes to Parquet — no WAL recovery needed.
+            db.close().await.unwrap();
+        }
+
+        // Reopen and verify all data is present from Parquet.
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+        for i in 0..20i64 {
+            let row = db.get(&[FieldValue::Int64(i)]).unwrap();
+            assert!(
+                row.is_some(),
+                "key {i} must be durable after close + reopen"
+            );
+        }
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn double_close_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+        db.close().await.unwrap();
+        db.close().await.unwrap(); // must not panic or error
+        assert!(db.is_closed());
+    }
+
+    #[tokio::test]
+    async fn scan_works_after_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = MeruDB::open(test_options(&tmp)).await.unwrap();
+
+        for i in 1..=5i64 {
+            db.put(make_row(i, &format!("user{i}"))).await.unwrap();
+        }
+        db.close().await.unwrap();
+
+        // Scan must still work.
+        let results = db.scan(None, None).unwrap();
+        assert_eq!(results.len(), 5);
     }
 }
