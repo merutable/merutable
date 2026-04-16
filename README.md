@@ -10,20 +10,16 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 ## Why merutable
 
-- **HTAP in one binary**: Transactional writes (put/delete/scan) with sub-millisecond memtable lookups; the on-disk data files are Apache Parquet, directly readable by any analytics engine.
-- **Native manifest, Iceberg-translatable**: Every flush and compaction writes a single-file native JSON manifest — one fsync, no Avro on the hot path — whose schema is a strict superset of Apache Iceberg v2 `TableMetadata`. Call `db.export_iceberg(target)` to project the current snapshot onto a spec-compliant `metadata.json` for pyiceberg / Spark / Trino / DuckDB / Snowflake / Athena. Every field round-trips through the `iceberg-rs` deserializer in CI, so compatibility is pinned, not aspirational.
-- **Deletion Vectors, not physical deletes**: Promoted rows are masked via Apache Iceberg v3 `deletion-vector-v1` Puffin blobs (roaring bitmaps). Source Parquet files stay readable throughout compaction — the DV tells readers which row positions to skip.
-- **SIMD-optimized bloom filter**: AVX2/NEON runtime-dispatched cache-line-aligned bloom filter for fast negative lookups on the read path.
-- **Prefix-compressed sparse index**: Each Parquet file carries a `KvSparseIndex` in the footer KV — a front-coded `user_key → page_location` map with binary-searchable restart points (LevelDB/RocksDB index-block style). Point lookups binary-search the restarts then linear-scan at most one restart interval, skipping all non-matching pages. Full keys, no 64-byte truncation.
-- **Row cache**: LRU buffer cache (10K entries default) between memtable and Parquet I/O. Eliminates disk reads for hot-key workloads. Invalidated on every write and cleared on compaction — never stale.
-- **Crash-safe write ordering**: SST files are fsynced (file + parent directory) before the manifest references them. Manifest JSON is fsynced before the version-hint is atomically swapped. The correct durability ordering — `write SST → fsync SST → fsync data dir → commit manifest → fsync metadata dir → update version-hint` — is enforced end-to-end.
-- **Linearizable reads**: Sequence allocation, WAL append, and memtable apply are serialized under the WAL lock. A separate `visible_seq` counter (advanced only after memtable apply) guarantees that `read_seq()` never returns a sequence whose data isn't in the memtable — no torn-read window under concurrent writes.
-- **Graduated write backpressure**: Instead of a binary stall at `max_immutable`, writes are progressively delayed as the immutable memtable queue fills (linear ramp from 50% to 100% queue depth). Hard stall remains as a safety net. Eliminates sawtooth throughput oscillation.
-- **HTAP-safe file lifecycle**: Compaction-obsoleted files are deferred for deletion with a configurable grace period (`gc_grace_period_secs`, default 5 minutes). External readers (DuckDB, Spark) mid-read of an older snapshot are not disrupted by immediate file removal.
-- **Graceful shutdown**: `MeruDB::close()` flushes all in-memory data to Parquet, fsyncs the WAL, and sets a closed flag — subsequent writes return `MeruError::Closed` while reads remain available until drop. A `Drop` impl logs a warning if `close()` wasn't called. Follows the RocksDB/sled pattern: no signal handlers, the host process owns shutdown orchestration.
-- **Read-only replica**: `MeruDB.open_read_only()` opens the same catalog directory for reads only. Call `refresh()` to pick up new Iceberg snapshots from the primary — validates all referenced data and Puffin files exist before swapping the version.
-- **Structured tracing**: `#[instrument]` spans on every engine operation (open, put, get, scan, flush, compact, close, batch). Filter by operation type, level, file path. Drop in `tracing-subscriber` to activate.
-- **Pluggable storage**: Local filesystem for development, S3 with LRU disk cache for production.
+- **HTAP in one binary**: Transactional writes (put/delete/scan) with sub-millisecond memtable lookups. On-disk data files are Apache Parquet — DuckDB, Spark, Trino read them directly. No ETL, no format conversion.
+- **Iceberg-native**: Every commit writes a JSON manifest that is a strict superset of Apache Iceberg v2 `TableMetadata`. Call `db.export_iceberg(target)` to project onto a spec-compliant `metadata.json` for pyiceberg / Spark / DuckDB / Snowflake. Compatibility is CI-pinned via `iceberg-rs` round-trip.
+- **Deletion Vectors**: Compaction masks rows via Iceberg v3 `deletion-vector-v1` Puffin blobs (roaring bitmaps). Source Parquet files stay readable throughout — no rewrite-in-place.
+- **Fast point lookups**: SIMD bloom filter (AVX2/NEON, cache-line-aligned) skips entire files. Prefix-compressed sparse index with restart-point binary search skips pages within files.
+- **Row cache**: LRU cache between memtable and Parquet I/O. Never stale — invalidated on write, cleared on compaction.
+- **Crash-safe**: SST fsync → directory fsync → manifest commit → version-hint swap. Correct durability ordering end-to-end.
+- **Linearizable reads**: No torn-read window under concurrent writes.
+- **Graceful shutdown**: `db.close()` flushes memtable to Parquet, fsyncs, seals. Reads stay available; writes are rejected.
+- **Read-only replica**: `open_read_only()` + `refresh()` picks up new snapshots from the primary.
+- **Pluggable storage**: Local FS or S3 with LRU disk cache.
 
 ## Architecture
 
