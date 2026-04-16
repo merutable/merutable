@@ -10,16 +10,11 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 ## Why merutable
 
-- **HTAP in one binary**: Transactional writes (put/delete/scan) with sub-millisecond memtable lookups. On-disk data files are Apache Parquet — DuckDB, Spark, Trino read them directly. No ETL, no format conversion.
-- **Iceberg-native**: Every commit writes a JSON manifest that is a strict superset of Apache Iceberg v2 `TableMetadata`. Call `db.export_iceberg(target)` to project onto a spec-compliant `metadata.json` for pyiceberg / Spark / DuckDB / Snowflake. Compatibility is CI-pinned via `iceberg-rs` round-trip.
-- **Deletion Vectors**: Compaction masks rows via Iceberg v3 `deletion-vector-v1` Puffin blobs (roaring bitmaps). Source Parquet files stay readable throughout — no rewrite-in-place.
-- **Fast point lookups**: SIMD bloom filter (AVX2/NEON, cache-line-aligned) skips entire files. Prefix-compressed sparse index with restart-point binary search skips pages within files.
-- **Row cache**: LRU cache between memtable and Parquet I/O. Never stale — invalidated on write, cleared on compaction.
-- **Crash-safe**: SST fsync → directory fsync → manifest commit → version-hint swap. Correct durability ordering end-to-end.
-- **Linearizable reads**: No torn-read window under concurrent writes.
-- **Graceful shutdown**: `db.close()` flushes memtable to Parquet, fsyncs, seals. Reads stay available; writes are rejected.
-- **Read-only replica**: `open_read_only()` + `refresh()` picks up new snapshots from the primary.
-- **Pluggable storage**: Local FS or S3 with LRU disk cache.
+- **HTAP in one binary**: Transactional KV writes land in Parquet. DuckDB, Spark, Trino read them directly — no ETL.
+- **Iceberg-native**: Every commit is a strict superset of Iceberg v2 `TableMetadata`. `db.export_iceberg()` projects onto spec-compliant metadata. Deletion Vectors use Iceberg v3 Puffin blobs.
+- **Fast**: SIMD bloom filters, prefix-compressed sparse index, LRU row cache. Point lookups skip files and pages, not just rows.
+- **Crash-safe**: Correct fsync ordering end-to-end. Linearizable reads. Graceful shutdown via `db.close()`.
+- **Embeddable**: One crate, async API, read-only replicas, pluggable storage (local FS or S3).
 
 ## Architecture
 
