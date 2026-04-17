@@ -213,6 +213,73 @@ async fn imp15_refresh_rejects_missing_files() {
     );
 }
 
+/// Compaction loop regression: a single `compact()` call must drain the
+/// tree until no level is above its trigger. Previously `compact()`
+/// executed exactly one job and returned, so a caller (or the background
+/// worker) had to keep calling it. With concurrent flushes, L0 could
+/// grow unboundedly while a single deep compaction was in flight.
+///
+/// This test forces multiple L0 files to accumulate, drives the tree
+/// past the L0 compaction trigger, and verifies that one `compact()`
+/// call reduces L0 below the trigger.
+#[tokio::test]
+async fn compact_loops_until_tree_healthy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    // Small memtable so each put flushes quickly — but we'll force flushes
+    // manually to control the L0 file count precisely.
+    config.memtable_size_bytes = 64 * 1024 * 1024; // don't auto-flush
+    config.gc_grace_period_secs = 0;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Create 6 L0 files (above the default l0_compaction_trigger=4).
+    // Each flush produces one L0 file.
+    for batch in 0..6i64 {
+        for i in 0..10i64 {
+            let key = batch * 100 + i;
+            engine
+                .put(
+                    vec![FieldValue::Int64(key)],
+                    Row::new(vec![
+                        Some(FieldValue::Int64(key)),
+                        Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{key}")))),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+
+    // Confirm we have at least the trigger count of L0 files.
+    let stats_before = engine.stats();
+    let l0_before = stats_before
+        .levels
+        .iter()
+        .find(|l| l.level == 0)
+        .map(|l| l.file_count)
+        .unwrap_or(0);
+    assert!(
+        l0_before >= 4,
+        "setup invariant: need ≥4 L0 files, got {l0_before}"
+    );
+
+    // One compact() call must drain L0 below the trigger.
+    engine.compact().await.unwrap();
+
+    let stats_after = engine.stats();
+    let l0_after = stats_after
+        .levels
+        .iter()
+        .find(|l| l.level == 0)
+        .map(|l| l.file_count)
+        .unwrap_or(0);
+    assert!(
+        l0_after < 4,
+        "compact() should have drained L0 below trigger, got {l0_after} files"
+    );
+}
+
 /// Graceful shutdown: close() must flush memtable data and reject
 /// subsequent writes while keeping reads available.
 #[tokio::test]

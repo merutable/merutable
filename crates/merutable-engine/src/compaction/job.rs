@@ -21,7 +21,7 @@ use merutable_iceberg::{
 use merutable_parquet::reader::ParquetReader;
 use merutable_types::{level::ParquetFileMeta, schema::TableSchema, MeruError, Result};
 use roaring::RoaringBitmap;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     compaction::{
@@ -107,13 +107,53 @@ fn compute_union_range(files: &[DataFileMeta]) -> (Option<Vec<u8>>, Option<Vec<u
     (union_min, union_max)
 }
 
+/// Run compaction until the LSM tree is healthy.
+///
+/// Loops: pick the highest-pressure level → execute one merge job →
+/// release the mutex → re-check. Returns when `pick_compaction()` returns
+/// `None` (no level above trigger). The mutex is released between
+/// iterations so a concurrent background worker can interleave — e.g. one
+/// worker finishes a deep L2→L3 merge, releases, and the other
+/// immediately grabs L0 drainage (L0 priority path in `pick_compaction`).
+///
+/// Without this loop, a single `compact()` call returned after one job,
+/// so a backlog of flushes could accumulate on L0 while a deep
+/// compaction was in flight — L0 would grow unboundedly.
+///
+/// Safety cap: `MAX_ITERATIONS` prevents a runaway loop if the picker
+/// keeps returning the same level (shouldn't happen, but defend against
+/// config pathologies).
+#[instrument(skip(engine), fields(op = "compaction"))]
+pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
+    const MAX_ITERATIONS: usize = 128;
+    for iter in 0..MAX_ITERATIONS {
+        let did_work = run_one_compaction_job(engine).await?;
+        if !did_work {
+            if iter > 0 {
+                debug!(iterations = iter, "compaction drained all pressure");
+            }
+            return Ok(());
+        }
+    }
+    warn!(
+        max = MAX_ITERATIONS,
+        "compaction loop hit iteration cap — will resume on next trigger"
+    );
+    Ok(())
+}
+
 /// Run one compaction job. Picks the best level and compacts.
+///
+/// Returns `true` if a compaction was executed, `false` if no level
+/// needed compaction.
 ///
 /// Bug T fix: serialized by `engine.compaction_mutex` so two background
 /// workers don't both pick the same level, read the same files, and write
-/// duplicate output to the output level.
-#[instrument(skip(engine), fields(op = "compaction"))]
-pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
+/// duplicate output to the output level. The mutex is acquired per job
+/// (not per `run_compaction` call) so interleaving between workers is
+/// possible — critical for L0 drainage to keep up with flushes while a
+/// deep compaction is running on another worker.
+async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     let _compaction_guard = engine.compaction_mutex.lock().await;
 
     let version = engine.version_set.current();
@@ -121,7 +161,7 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         Some(p) => p,
         None => {
             debug!("no compaction needed");
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -141,7 +181,7 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     let input_file_metas: Vec<DataFileMeta> = version.files_at(pick.input_level).to_vec();
     if input_file_metas.is_empty() {
         debug!("compaction picked an empty input level");
-        return Ok(());
+        return Ok(false);
     }
 
     // ── Overlap pull-in: include every output-level file whose key range
@@ -382,5 +422,5 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
         "compaction committed"
     );
 
-    Ok(())
+    Ok(true)
 }

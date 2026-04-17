@@ -25,32 +25,50 @@ pub struct CompactionPick {
 }
 
 /// Pick the best compaction, or `None` if no level needs compaction.
+///
+/// L0 priority: when `l0_file_count >= l0_slowdown_trigger`, L0 is picked
+/// unconditionally regardless of deeper-level scores. L0 buildup degrades
+/// both read latency (more files to probe) and write latency (slowdown
+/// sleep + eventual stall). A deep compaction that outpaces flushes will
+/// otherwise let L0 accumulate indefinitely — even if its score is 18×
+/// the trigger — because `best_score` was previously a single max across
+/// all levels. This fix lets the caller (run_compaction loop) keep
+/// draining L0 between deep compactions.
 pub fn pick_compaction(version: &Version, config: &EngineConfig) -> Option<CompactionPick> {
+    let l0_count = version.l0_file_count();
+    let l0_score = l0_count as f64 / config.l0_compaction_trigger as f64;
+
+    // L0 priority path.
+    let force_l0 = l0_count >= config.l0_slowdown_trigger;
+
     let mut best_score = 0.0f64;
     let mut best_level = Level(0);
 
-    // Score L0.
-    let l0_score = version.l0_file_count() as f64 / config.l0_compaction_trigger as f64;
-    if l0_score > best_score {
+    if force_l0 {
+        // L0 is above slowdown — compact it regardless of deeper pressure.
         best_score = l0_score;
         best_level = Level(0);
-    }
-
-    // Score L1+.
-    for (i, &target) in config.level_target_bytes.iter().enumerate() {
-        let level = Level((i + 1) as u8);
-        let bytes = version.level_bytes(level);
-        if target > 0 {
-            let score = bytes as f64 / target as f64;
-            if score > best_score {
-                best_score = score;
-                best_level = level;
+    } else {
+        // Normal scoring: pick the highest-pressure level.
+        if l0_score > best_score {
+            best_score = l0_score;
+            best_level = Level(0);
+        }
+        for (i, &target) in config.level_target_bytes.iter().enumerate() {
+            let level = Level((i + 1) as u8);
+            let bytes = version.level_bytes(level);
+            if target > 0 {
+                let score = bytes as f64 / target as f64;
+                if score > best_score {
+                    best_score = score;
+                    best_level = level;
+                }
             }
         }
-    }
 
-    if best_score < 1.0 {
-        return None; // no level needs compaction
+        if best_score < 1.0 {
+            return None; // no level needs compaction
+        }
     }
 
     let output_level = best_level.next();
@@ -168,6 +186,80 @@ mod tests {
         assert_eq!(pick.input_level, Level(0));
         assert_eq!(pick.output_level, Level(1));
         assert_eq!(pick.input_files.len(), 5);
+    }
+
+    /// L0 priority: when L0 is above `l0_slowdown_trigger`, it must be
+    /// picked even if a deeper level has a numerically higher score.
+    /// Regression: previously a single max-score pass would pick e.g. L2
+    /// with score=2.0 over L0 with score=5.0 (because of how score math
+    /// can compare), letting L0 grow unbounded while deep compactions
+    /// churned. Now L0 wins unconditionally above slowdown.
+    #[test]
+    fn l0_priority_above_slowdown() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig::default();
+
+        // L0: 25 files — above slowdown (20), far above trigger (4).
+        let mut l0_files = Vec::new();
+        for i in 0..25 {
+            l0_files.push(make_file(&format!("l0_{i}.parquet"), 0, 100, 1024));
+        }
+        v.levels.insert(Level(0), l0_files);
+
+        // L2: 10 GiB — score = 10 GiB / 2 GiB = 5.0 (high pressure).
+        let mut l2_files = Vec::new();
+        for i in 0..10 {
+            l2_files.push(make_file(
+                &format!("l2_{i}.parquet"),
+                2,
+                1_000_000,
+                1024 * 1024 * 1024, // 1 GiB each → 10 GiB total
+            ));
+        }
+        v.levels.insert(Level(2), l2_files);
+
+        // Even though L2's bytes/target score is high, L0 must win because
+        // it's above the slowdown trigger.
+        let pick = pick_compaction(&v, &config).unwrap();
+        assert_eq!(
+            pick.input_level,
+            Level(0),
+            "L0 above slowdown must be prioritized over deeper-level pressure"
+        );
+    }
+
+    /// Below the slowdown trigger, the normal max-score picker still
+    /// chooses deeper levels when they have higher pressure.
+    #[test]
+    fn deeper_level_wins_when_l0_below_slowdown() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig::default();
+
+        // L0: 5 files — above trigger (4) but below slowdown (20).
+        let mut l0_files = Vec::new();
+        for i in 0..5 {
+            l0_files.push(make_file(&format!("l0_{i}.parquet"), 0, 100, 1024));
+        }
+        v.levels.insert(Level(0), l0_files);
+
+        // L2: 10 GiB → score = 5.0 vs L0 score = 1.25.
+        let mut l2_files = Vec::new();
+        for i in 0..10 {
+            l2_files.push(make_file(
+                &format!("l2_{i}.parquet"),
+                2,
+                1_000_000,
+                1024 * 1024 * 1024,
+            ));
+        }
+        v.levels.insert(Level(2), l2_files);
+
+        let pick = pick_compaction(&v, &config).unwrap();
+        assert_eq!(
+            pick.input_level,
+            Level(2),
+            "below slowdown, deeper level with higher score should win"
+        );
     }
 
     /// Bug I regression: tombstones must NOT be dropped when writing to a
