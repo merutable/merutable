@@ -160,7 +160,7 @@ impl Manifest {
 
         // Sort L0 by seq_max descending (newest first).
         if let Some(l0_files) = levels.get_mut(&Level(0)) {
-            l0_files.sort_by(|a, b| b.meta.seq_max.cmp(&a.meta.seq_max));
+            l0_files.sort_by_key(|f| std::cmp::Reverse(f.meta.seq_max));
         }
         // Sort L1+ by key_min ascending (for binary search).
         for (level, files) in levels.iter_mut() {
