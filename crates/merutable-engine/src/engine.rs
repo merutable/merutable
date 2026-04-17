@@ -79,15 +79,72 @@ pub struct MeruEngine {
     /// sequence whose data isn't in the memtable yet. `global_seq` remains
     /// the allocation counter; `visible_seq` is what readers snapshot.
     pub(crate) visible_seq: GlobalSeq,
-    /// IMP-12: files pending deletion after compaction. Each entry is
-    /// (absolute_path, obsoleted_at_instant). Files are only physically
-    /// deleted after `gc_grace_period_secs` has elapsed, giving external
-    /// readers time to finish in-progress reads.
-    pub(crate) pending_deletions: Mutex<Vec<(std::path::PathBuf, std::time::Instant)>>,
+    /// Files pending physical deletion after a compaction committed the
+    /// manifest removal. Each entry records:
+    /// - `path`: the file on disk.
+    /// - `obsoleted_at`: wall-clock time of commit; used by the legacy
+    ///   time-based grace period.
+    /// - `obsoleted_after_snapshot`: the `snapshot_id` at which the file
+    ///   was still live. Readers pinning any snapshot `<=` this value
+    ///   may still try to read this file, so GC must wait for those
+    ///   pins to release.
+    ///
+    /// GC deletes a file iff BOTH conditions hold:
+    /// 1. No reader pin exists at a snapshot `<=` `obsoleted_after_snapshot`
+    ///    (version-pinned safety — fixes BUG-0007..0013 where long
+    ///    integrity scans hit `IO NotFound` because GC ran while the
+    ///    reader still held the old `Version`).
+    /// 2. `obsoleted_at.elapsed() >= gc_grace_period_secs` (time-based
+    ///    grace for external HTAP readers, e.g. DuckDB, which don't
+    ///    participate in the pin protocol).
+    ///
+    /// Both must hold: version-pin protects internal readers,
+    /// time-grace protects external ones.
+    pub(crate) pending_deletions: Mutex<Vec<PendingDelete>>,
+    /// Multiset of snapshot_ids pinned by active internal readers.
+    /// `get()` / `scan()` pin the snapshot they capture from
+    /// `version_set.current()` and unpin on return via `SnapshotPin`'s
+    /// `Drop`. GC's `min_pinned_snapshot()` queries the smallest key;
+    /// any file whose `obsoleted_after_snapshot >= min_pinned` is still
+    /// reachable by a live reader and must not be deleted.
+    pub(crate) live_snapshots: std::sync::Mutex<std::collections::BTreeMap<i64, usize>>,
     /// Set to `true` by `close()`. All subsequent write/flush/compact ops
     /// return `MeruError::Closed`. Reads remain available until the engine
     /// is dropped.
     closed: AtomicBool,
+}
+
+/// An entry in `pending_deletions` — see the field docs on `MeruEngine`.
+#[derive(Debug)]
+pub(crate) struct PendingDelete {
+    pub path: std::path::PathBuf,
+    pub obsoleted_at: std::time::Instant,
+    pub obsoleted_after_snapshot: i64,
+}
+
+/// RAII guard returned by `pin_current_snapshot`. On drop, decrements
+/// the snapshot's pin count; when the count hits zero, the snapshot_id
+/// is removed from the pin map so `min_pinned_snapshot()` can advance.
+///
+/// Holding this guard prevents GC from deleting any file whose
+/// `obsoleted_after_snapshot >= self.snapshot_id` — the reader is
+/// guaranteed every file its `Version` snapshot references will remain
+/// on disk until the guard drops.
+pub struct SnapshotPin<'a> {
+    engine: &'a MeruEngine,
+    snapshot_id: i64,
+}
+
+impl Drop for SnapshotPin<'_> {
+    fn drop(&mut self) {
+        let mut pins = self.engine.live_snapshots.lock().unwrap();
+        if let Some(count) = pins.get_mut(&self.snapshot_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pins.remove(&self.snapshot_id);
+            }
+        }
+    }
 }
 
 impl MeruEngine {
@@ -197,6 +254,7 @@ impl MeruEngine {
             read_only,
             visible_seq,
             pending_deletions: Mutex::new(Vec::new()),
+            live_snapshots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             closed: AtomicBool::new(false),
         });
 
@@ -485,37 +543,115 @@ impl MeruEngine {
         Ok(())
     }
 
-    /// IMP-12: enqueue obsoleted files for deferred deletion.
-    /// Called by compaction after committing a new version.
-    pub(crate) async fn enqueue_for_deletion(&self, paths: Vec<std::path::PathBuf>) {
+    /// Enqueue obsoleted files for deferred deletion.
+    ///
+    /// `obsoleted_after_snapshot` is the `snapshot_id` of the version in
+    /// which these files were still live — i.e., the version the
+    /// compaction was based on. Any reader pinning a snapshot <= this
+    /// value may still dereference these files, so GC will keep them
+    /// alive until the last such pin releases.
+    pub(crate) async fn enqueue_for_deletion(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        obsoleted_after_snapshot: i64,
+    ) {
         if paths.is_empty() {
             return;
         }
         let now = std::time::Instant::now();
         let mut pending = self.pending_deletions.lock().await;
-        for p in paths {
-            pending.push((p, now));
+        for path in paths {
+            pending.push(PendingDelete {
+                path,
+                obsoleted_at: now,
+                obsoleted_after_snapshot,
+            });
         }
     }
 
-    /// IMP-12: delete files whose grace period has expired.
-    /// Called periodically by the background worker or after compaction.
+    /// Delete files that are both (a) no longer pinned by any live
+    /// internal reader AND (b) past the `gc_grace_period_secs` time
+    /// grace for external (HTAP) readers. Called after compaction
+    /// commits and periodically by the optional background worker.
+    ///
+    /// Version-pinned safety (fixes BUG-0007..0013): even when the
+    /// time-based grace elapsed, GC refuses to delete files still
+    /// referenced by any `Version` held via `pin_current_snapshot`.
+    /// A 40 GB integrity scan can legitimately exceed the default
+    /// 5-minute grace period; without version pinning, GC would delete
+    /// files the scan still needs to open, producing spurious
+    /// `IO error: No such file or directory` failures.
     pub async fn gc_pending_deletions(&self) {
         let grace = std::time::Duration::from_secs(self.config.gc_grace_period_secs);
+        let min_pinned = self.min_pinned_snapshot();
         let mut pending = self.pending_deletions.lock().await;
         let mut remaining = Vec::new();
-        for (path, obsoleted_at) in pending.drain(..) {
-            if obsoleted_at.elapsed() >= grace {
-                if let Err(e) = tokio::fs::remove_file(&path).await {
+        for entry in pending.drain(..) {
+            // Keep if any live reader's snapshot could still see this
+            // file. A pin at snapshot S means S was live for that
+            // reader; the reader's `Version` references files visible
+            // up to S. Our file was live through `obsoleted_after_snapshot`
+            // inclusive, so pins at S <= obsoleted_after_snapshot still
+            // reference it.
+            let still_pinned = min_pinned.is_some_and(|m| m <= entry.obsoleted_after_snapshot);
+            if still_pinned {
+                remaining.push(entry);
+                continue;
+            }
+            // Time-based grace for external readers (DuckDB, Spark,
+            // etc.) which don't participate in the pin protocol.
+            if entry.obsoleted_at.elapsed() >= grace {
+                if let Err(e) = tokio::fs::remove_file(&entry.path).await {
                     if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %path.display(), error = %e, "failed to GC obsoleted file");
+                        warn!(path = %entry.path.display(), error = %e,
+                              "failed to GC obsoleted file");
                     }
                 }
             } else {
-                remaining.push((path, obsoleted_at));
+                remaining.push(entry);
             }
         }
         *pending = remaining;
+    }
+
+    /// Pin the current snapshot for the lifetime of the returned guard
+    /// and return the pinned `Version` Arc. While the pin is held, GC
+    /// will NOT delete any file whose `obsoleted_after_snapshot` is
+    /// `>=` the pinned snapshot_id — the reader is guaranteed every
+    /// file its `Version` references will remain on disk.
+    ///
+    /// Used by the read path (point_lookup, range_scan) to prevent
+    /// file-GC races during long reads. Release by dropping the guard.
+    ///
+    /// Public so integration tests can exercise the pin contract; not
+    /// meant to be called from user code.
+    pub fn pin_current_snapshot(
+        &self,
+    ) -> (
+        SnapshotPin<'_>,
+        std::sync::Arc<merutable_iceberg::version::Version>,
+    ) {
+        let version_guard = self.version_set.current();
+        let snapshot_id = version_guard.snapshot_id;
+        let version: std::sync::Arc<merutable_iceberg::version::Version> = (*version_guard).clone();
+        drop(version_guard);
+        let mut pins = self.live_snapshots.lock().unwrap();
+        *pins.entry(snapshot_id).or_insert(0) += 1;
+        drop(pins);
+        (
+            SnapshotPin {
+                engine: self,
+                snapshot_id,
+            },
+            version,
+        )
+    }
+
+    /// The smallest pinned snapshot_id across all live readers, or
+    /// `None` if nothing is pinned. GC uses this as the watermark
+    /// below which files can be safely deleted.
+    pub fn min_pinned_snapshot(&self) -> Option<i64> {
+        self.live_snapshots.lock().unwrap().keys().next().copied()
     }
 
     /// Graceful shutdown: flush all in-memory data to durable storage, fsync

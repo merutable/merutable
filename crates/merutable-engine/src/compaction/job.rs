@@ -507,7 +507,13 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
             obsoleted_paths.push(base.join(dv));
         }
     }
-    engine.enqueue_for_deletion(obsoleted_paths).await;
+    // `version.snapshot_id` is the snapshot the compaction was based on
+    // — the last snapshot in which the obsoleted files were still live.
+    // GC keeps files alive while any reader pins a snapshot <= this
+    // value (version-pinned safety for long reads).
+    engine
+        .enqueue_for_deletion(obsoleted_paths, version.snapshot_id)
+        .await;
 
     // Run GC to clean up any files whose grace period has expired.
     engine.gc_pending_deletions().await;

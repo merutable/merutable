@@ -477,6 +477,143 @@ async fn close_data_durable_across_reopen() {
     }
 }
 
+/// BUG-0007..0013 regression: version-pinned GC.
+///
+/// A long-running reader holds a `Version` snapshot that references
+/// files obsoleted by a concurrent compaction. With time-based grace
+/// alone, a scan of tens of GB on a laptop can outlast the default
+/// 5-minute window; GC then deletes files the scan still needs and
+/// the scan fails with `IO NotFound`.
+///
+/// This test simulates the race deterministically:
+/// 1. Write data and flush to create L0 files.
+/// 2. Pin a snapshot (simulating a long scan in progress).
+/// 3. Trigger a compaction that obsoletes those files AND a GC sweep
+///    with `gc_grace_period_secs = 0`.
+/// 4. Verify the obsoleted files are STILL on disk — the pin held.
+/// 5. Drop the pin, trigger another GC sweep.
+/// 6. Verify the files are now gone.
+#[tokio::test]
+async fn version_pin_prevents_gc_of_files_a_reader_might_need() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    // Zero grace so time-based check never keeps files alive — we
+    // want to prove the *pin* is what's keeping them, not the timer.
+    config.gc_grace_period_secs = 0;
+    config.memtable_size_bytes = 64 * 1024 * 1024;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Populate enough L0 files for a meaningful compaction.
+    for batch in 0..5i64 {
+        for i in 0..10i64 {
+            let key = batch * 100 + i;
+            engine
+                .put(
+                    vec![FieldValue::Int64(key)],
+                    Row::new(vec![
+                        Some(FieldValue::Int64(key)),
+                        Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{key}")))),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+
+    // Snapshot the L0 directory — these are the files the pinned
+    // reader would try to open.
+    let l0_dir = tmp.path().join("data").join("L0");
+    let files_before: Vec<_> = std::fs::read_dir(&l0_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        files_before.len() >= 4,
+        "need ≥4 L0 files to guarantee compaction; got {}",
+        files_before.len()
+    );
+
+    // Pin the current snapshot — simulates a reader mid-scan.
+    let (pin, pinned_version) = engine.pin_current_snapshot();
+    let pinned_snapshot_id = pinned_version.snapshot_id;
+
+    // Run a compaction — obsoletes the pinned version's L0 files.
+    engine.compact().await.unwrap();
+
+    // The pinned reader still holds a `Version` that references the
+    // obsoleted files. GC must keep them alive.
+    let files_after_compact: Vec<_> = std::fs::read_dir(&l0_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+        .map(|e| e.path())
+        .collect();
+    // Every file the reader might open must still exist.
+    for f in &files_before {
+        assert!(
+            files_after_compact.iter().any(|p| p == f) || !f.exists(),
+            "file {} disappeared while a pinned reader still holds its snapshot",
+            f.display()
+        );
+        assert!(
+            f.exists(),
+            "BUG-0007..0013 regression: file {} was GCed while snapshot {pinned_snapshot_id} \
+             is pinned",
+            f.display(),
+        );
+    }
+
+    // Drop the pin — GC should now be able to clean up.
+    drop(pin);
+    engine.gc_pending_deletions().await;
+
+    // Files are gone now (grace = 0 and no pins).
+    let files_after_unpin: Vec<_> = std::fs::read_dir(&l0_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+        .map(|e| e.path())
+        .collect();
+    // We can't assert exactly zero (compaction might produce intra-L0
+    // outputs in edge cases), just that the ORIGINAL files are gone.
+    for f in &files_before {
+        assert!(
+            !f.exists(),
+            "file {} should have been GCed after pin released; remaining files = {files_after_unpin:?}",
+            f.display()
+        );
+    }
+}
+
+/// Version-pin accounting: multiple concurrent pins at the same
+/// snapshot_id are refcounted, and `min_pinned_snapshot` returns the
+/// smallest live pin across all snapshots.
+#[tokio::test]
+async fn pin_refcount_and_min_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+
+    // No pins yet.
+    assert!(engine.min_pinned_snapshot().is_none());
+
+    // Two concurrent pins at the same snapshot.
+    let (p1, v1) = engine.pin_current_snapshot();
+    let (p2, v2) = engine.pin_current_snapshot();
+    assert_eq!(v1.snapshot_id, v2.snapshot_id);
+    assert_eq!(engine.min_pinned_snapshot(), Some(v1.snapshot_id));
+
+    // Drop one — still pinned (refcount 2 → 1).
+    drop(p1);
+    assert_eq!(engine.min_pinned_snapshot(), Some(v2.snapshot_id));
+
+    // Drop the other — gone.
+    drop(p2);
+    assert!(engine.min_pinned_snapshot().is_none());
+}
+
 /// IMP-12 regression: compaction-obsoleted files should be tracked for
 /// deferred deletion, not immediately removed.
 #[tokio::test]

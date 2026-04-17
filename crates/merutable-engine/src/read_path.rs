@@ -126,7 +126,13 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
     // a stale-cache-survives-memtable-flush scenario.
     let cache_gen = engine.row_cache.as_ref().map(|c| c.snapshot_generation());
 
-    let version = engine.version_set.current();
+    // Pin the current version snapshot: GC will not delete any file
+    // our `version` still references until `_pin` drops at function
+    // return. Fixes BUG-0007..0013 where long integrity reads hit
+    // `IO NotFound` because GC ran mid-read. The guard owns a clone
+    // of the Version `Arc` so the caller uses a stable snapshot for
+    // every file opened below.
+    let (_pin, version) = engine.pin_current_snapshot();
     let base = engine.catalog.base_path();
 
     // Stop 2: L0 files. `Manifest::to_version` pre-sorts L0 by `seq_max`
@@ -268,7 +274,14 @@ pub fn range_scan(
     }
 
     // 2. Every live Parquet file at every level.
-    let version = engine.version_set.current();
+    //
+    // Pin the current snapshot for the full scan — on large datasets
+    // a range scan can take longer than `gc_grace_period_secs` (default
+    // 5 minutes); without pinning, GC could delete a Parquet file mid-
+    // scan and produce `IO NotFound` (BUG-0007..0013). The `_pin` guard
+    // keeps every file the `version` references on disk until this
+    // function returns.
+    let (_pin, version) = engine.pin_current_snapshot();
     let base = engine.catalog.base_path();
     let max_level = version.max_level();
     for lvl in 0..=max_level.0 {
