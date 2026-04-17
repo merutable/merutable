@@ -77,6 +77,16 @@ impl IcebergCatalog {
             .await
             .map_err(MeruError::Io)?;
 
+        // Crash-recovery housekeeping: remove any leftover
+        // `version-hint.text.tmp` from a commit that crashed after the
+        // write but before the rename. Leaving it around is harmless
+        // (it's never read), but cleaning up keeps the base dir tidy
+        // and prevents ambiguity for human operators.
+        let tmp_hint = base.join("version-hint.text.tmp");
+        if tmp_hint.exists() {
+            let _ = tokio::fs::remove_file(&tmp_hint).await;
+        }
+
         // Try to load existing manifest from version-hint.
         let hint_path = base.join("version-hint.text");
         let (manifest, next_ver) = if hint_path.exists() {
@@ -101,6 +111,33 @@ impl IcebergCatalog {
             }
             (manifest, ver + 1)
         } else {
+            // No version-hint.text. Detect silent data loss: if the
+            // metadata/ directory already contains snapshot files, this
+            // means version-hint was lost (manual deletion, bad restore,
+            // filesystem corruption) and initializing to an empty
+            // manifest would orphan the existing snapshots. Error out
+            // so the operator can recover explicitly rather than
+            // silently clobbering data.
+            let mut has_existing_metadata = false;
+            if let Ok(mut entries) = tokio::fs::read_dir(&metadata_dir).await {
+                while let Ok(Some(e)) = entries.next_entry().await {
+                    let name = e.file_name();
+                    let n = name.to_string_lossy();
+                    if n.starts_with('v') && n.ends_with(".metadata.json") {
+                        has_existing_metadata = true;
+                        break;
+                    }
+                }
+            }
+            if has_existing_metadata {
+                return Err(MeruError::Corruption(format!(
+                    "version-hint.text is missing but {}/ contains snapshot \
+                     metadata files — refusing to initialize a fresh catalog \
+                     over existing data. Restore version-hint.text from backup \
+                     or move the existing metadata/ directory aside.",
+                    metadata_dir.display(),
+                )));
+            }
             (Manifest::empty(schema), 1)
         };
 
@@ -288,6 +325,20 @@ impl IcebergCatalog {
                 .sync_all()
                 .await
                 .map_err(MeruError::Io)?;
+            // fsync the metadata DIRECTORY so the new metadata.json's
+            // directory entry is durably linked BEFORE the version-hint
+            // points at it. Without this, a crash between the version-
+            // hint rename and the metadata dir fsync can leave
+            // version-hint pointing at a filename that isn't yet in the
+            // directory listing (ext4/btrfs journal it separately), and
+            // recovery fails with "metadata.json not found".
+            let metadata_dir = self.base_path.join("metadata");
+            tokio::fs::File::open(&metadata_dir)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
 
             // Update version hint (atomic: write tmp + rename).
             let hint_path = self.base_path.join("version-hint.text");
@@ -305,16 +356,9 @@ impl IcebergCatalog {
             tokio::fs::rename(&tmp_hint, &hint_path)
                 .await
                 .map_err(MeruError::Io)?;
-            // fsync the metadata directory so both the new metadata JSON entry
-            // and the version-hint rename are durable (required on ext4/btrfs).
-            let metadata_dir = self.base_path.join("metadata");
-            tokio::fs::File::open(&metadata_dir)
-                .await
-                .map_err(MeruError::Io)?
-                .sync_all()
-                .await
-                .map_err(MeruError::Io)?;
-            // Also fsync the base directory (version-hint.text lives here).
+            // fsync the base directory so the version-hint rename is
+            // durably linked — without this, the rename can "roll back"
+            // on a crash and readers see the old version.
             tokio::fs::File::open(&self.base_path)
                 .await
                 .map_err(MeruError::Io)?

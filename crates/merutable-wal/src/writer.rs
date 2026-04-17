@@ -17,8 +17,15 @@ use crate::format::{RecordType, BLOCK_SIZE, HEADER_SIZE, RECYCLABLE_HEADER_SIZE}
 pub trait WalSink: Send + Sync {
     /// Append bytes to the log. Must be durable after `sync()`.
     fn append(&mut self, data: &[u8]) -> Result<()>;
-    /// Fsync/flush so data is durable.
+    /// Fsync (fdatasync) — persist data only. Used on the hot append path.
     fn sync(&mut self) -> Result<()>;
+    /// Full fsync — persist data + metadata. Used on rotate so the
+    /// closed file's size/stat info is durable before the fd is dropped.
+    /// Default delegates to `sync()` for implementations that don't
+    /// distinguish (e.g., in-memory / network sinks).
+    fn sync_all(&mut self) -> Result<()> {
+        self.sync()
+    }
     /// Close the sink cleanly.
     fn close(self: Box<Self>) -> Result<()>;
 }
@@ -43,7 +50,19 @@ impl WalSink for FileSink {
         self.file.write_all(data).map_err(MeruError::Io)
     }
     fn sync(&mut self) -> Result<()> {
+        // Hot-path fsync — `sync_data` (fdatasync on Unix) skips metadata
+        // (mtime, etc.) but DOES persist file size, which is the only
+        // metadata we actually need for durability. Correct and faster
+        // than a full `sync_all` per append.
         self.file.sync_data().map_err(MeruError::Io)
+    }
+    fn sync_all(&mut self) -> Result<()> {
+        // Full fsync including metadata. Called on rotate so the file's
+        // size + timestamps are durably committed before its fd is
+        // dropped — `sync_data` alone can leave stat metadata stale in
+        // some filesystems (e.g., older ext4 journaled modes), which
+        // would make recovery misread the file length on the closed log.
+        self.file.sync_all().map_err(MeruError::Io)
     }
     fn close(self: Box<Self>) -> Result<()> {
         // `file` dropped on return — OS closes fd.
@@ -131,6 +150,10 @@ impl WalWriter {
 
     pub fn sync(&mut self) -> Result<()> {
         self.sink.sync()
+    }
+
+    pub fn sync_all(&mut self) -> Result<()> {
+        self.sink.sync_all()
     }
 
     pub fn close(self) -> Result<()> {

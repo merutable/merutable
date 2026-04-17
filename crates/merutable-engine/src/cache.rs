@@ -1,8 +1,25 @@
 //! Row-level LRU buffer cache for the read path.
 //!
 //! Sits between the memtable check and Parquet file I/O in `point_lookup()`.
-//! Cache entries are invalidated on every write (put/delete) so the cache
-//! never serves stale data after a key leaves the memtable.
+//! Cache entries are invalidated on every write (put/delete) and cleared on
+//! compaction so the cache never serves stale data after a key leaves the
+//! memtable.
+//!
+//! ## Insert-invalidate race (fix)
+//!
+//! The read path checks cache AFTER memtable. If a reader takes the path
+//! `memtable miss → L0 hit V1`, it inserts V1 into the cache to accelerate
+//! future reads. A concurrent writer of `V2` calls `invalidate(key)` on
+//! the cache, but the write interleaving allowed the reader's insert to
+//! land AFTER the writer's invalidate — leaving stale V1 in the cache.
+//! Once the memtable is later flushed and the memtable check misses for
+//! that key, the stale V1 wins indefinitely.
+//!
+//! Fix: a monotonic `generation` counter, bumped on every `invalidate`,
+//! `invalidate_key`, or `clear`. Readers capture the generation BEFORE
+//! reading from disk and pass it to `insert_if_fresh` — the insert is
+//! dropped if any invalidation happened in between. This mirrors an
+//! optimistic-concurrency-control pattern (version tag).
 //!
 //! Thread-safe: wraps `lru::LruCache` in a `std::sync::Mutex`. The lock is
 //! held only for the duration of a hash-map get/put — no I/O under the lock.
@@ -24,6 +41,12 @@ pub struct CacheEntry {
 /// Row-level LRU cache. Thread-safe.
 pub struct RowCache {
     inner: Mutex<LruCache<Vec<u8>, CacheEntry>>,
+    /// Monotonic counter; incremented on every mutating operation
+    /// (`invalidate`, `clear`). Readers capture the generation before
+    /// reading from disk; `insert_if_fresh` rejects the insert if the
+    /// generation has advanced — some write invalidated the cache between
+    /// the reader's disk read and its insert, so the insert might be stale.
+    generation: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -36,6 +59,7 @@ impl RowCache {
             inner: Mutex::new(LruCache::new(
                 NonZeroUsize::new(capacity).expect("row cache capacity must be > 0"),
             )),
+            generation: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -57,14 +81,46 @@ impl RowCache {
         }
     }
 
-    /// Insert or update a cache entry.
+    /// Snapshot of the current generation. Readers call this BEFORE
+    /// reading a key from disk; the returned value is passed to
+    /// `insert_if_fresh` at insertion time.
+    #[inline]
+    pub fn snapshot_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Insert or update a cache entry **only if** the generation is
+    /// still `captured_gen`. If any `invalidate` or `clear` fired since
+    /// the reader snapshotted the generation, the insert is dropped —
+    /// the reader's disk-sourced value might now be stale relative to
+    /// the write that triggered the invalidation.
+    ///
+    /// Slight cache-hit-rate cost (occasional dropped inserts under
+    /// concurrent writes) in exchange for strict read-after-write
+    /// correctness. The check is under the same lock as the insert, so
+    /// there is no TOCTOU between check and put.
+    pub fn insert_if_fresh(&self, user_key: Vec<u8>, entry: CacheEntry, captured_gen: u64) {
+        let mut guard = self.inner.lock().unwrap();
+        if self.generation.load(Ordering::Acquire) != captured_gen {
+            return;
+        }
+        guard.put(user_key, entry);
+    }
+
+    /// Unconditional insert — retained for tests and for paths where the
+    /// caller knows no concurrent writer can race. Prefer
+    /// `insert_if_fresh` from any code path that takes a disk read
+    /// across an await.
     pub fn insert(&self, user_key: Vec<u8>, entry: CacheEntry) {
         let mut guard = self.inner.lock().unwrap();
         guard.put(user_key, entry);
     }
 
     /// Invalidate a single key. Called on every write (put/delete).
+    /// Bumps the generation so any concurrent reader's pending
+    /// `insert_if_fresh` is rejected.
     pub fn invalidate(&self, user_key: &[u8]) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let mut guard = self.inner.lock().unwrap();
         guard.pop(user_key);
     }
@@ -72,7 +128,9 @@ impl RowCache {
     /// Drop every cached entry. Called after compaction installs a new
     /// version — compaction rewrites files and may resolve MVCC versions,
     /// so any cached entry read from a now-obsolete file could be stale.
+    /// Also bumps the generation.
     pub fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let mut guard = self.inner.lock().unwrap();
         guard.clear();
     }
@@ -149,6 +207,47 @@ mod tests {
         assert!(cache.get(b"a").is_none());
         assert!(cache.get(b"b").is_some());
         assert!(cache.get(b"c").is_some());
+    }
+
+    /// Insert-invalidate race: if the cache is invalidated between a
+    /// reader's generation snapshot and its insert, the insert must be
+    /// dropped. Without this, a reader could successfully install a
+    /// stale entry that a concurrent writer had just invalidated — and
+    /// after a subsequent memtable flush, the stale entry would be
+    /// served indefinitely.
+    #[test]
+    fn insert_if_fresh_rejects_after_invalidate() {
+        let cache = RowCache::new(10);
+        cache.insert(b"k".to_vec(), make_entry(1));
+
+        // Reader captures generation, then the cache is invalidated.
+        let gen = cache.snapshot_generation();
+        cache.invalidate(b"k");
+        assert!(cache.get(b"k").is_none());
+
+        // Reader tries to reinstall the (now-stale) value. Must be dropped.
+        cache.insert_if_fresh(b"k".to_vec(), make_entry(42), gen);
+        assert!(
+            cache.get(b"k").is_none(),
+            "insert_if_fresh must drop when generation advanced"
+        );
+    }
+
+    #[test]
+    fn insert_if_fresh_rejects_after_clear() {
+        let cache = RowCache::new(10);
+        let gen = cache.snapshot_generation();
+        cache.clear();
+        cache.insert_if_fresh(b"k".to_vec(), make_entry(42), gen);
+        assert!(cache.get(b"k").is_none());
+    }
+
+    #[test]
+    fn insert_if_fresh_succeeds_without_races() {
+        let cache = RowCache::new(10);
+        let gen = cache.snapshot_generation();
+        cache.insert_if_fresh(b"k".to_vec(), make_entry(42), gen);
+        assert!(cache.get(b"k").is_some());
     }
 
     /// IMP-03 regression: `clear()` drops every cached entry so that

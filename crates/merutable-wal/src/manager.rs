@@ -52,12 +52,25 @@ pub struct WalManager {
 
 impl WalManager {
     /// Open (or create) a WAL directory. Starts writing to a new log file.
+    ///
+    /// The parent directory is fsynced after creating the new log file so
+    /// the file's directory entry is durable. Without this fsync, a crash
+    /// between file creation and the first append can leave the WAL file
+    /// unlinked on recovery — on reopen, `recover_from_dir` computes
+    /// `max_log_number` from the surviving files, so the next log number
+    /// can collide with the unlinked one (or the unlinked file's writes
+    /// are silently lost).
     pub fn open(dir: &Path, initial_log_number: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let log_number = initial_log_number;
         let path = log_path(dir, log_number);
         info!(log_number, path = %path.display(), "opening WAL");
         let sink = FileSink::create(&path)?;
+        // fsync the parent directory so the new WAL file's directory
+        // entry survives a crash before any append completes.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
         let writer = WalWriter::new(Box::new(sink), log_number, false);
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -118,10 +131,21 @@ impl WalManager {
         let new_log = self.next_log.fetch_add(1, Ordering::Relaxed);
         debug!(old_log, new_log, "rotating WAL");
 
-        self.current.sync()?;
+        // Full fsync of the old file BEFORE closing it. `sync_data`
+        // persists the last appended bytes but can leave file-size
+        // metadata stale on some filesystem configurations; recovery
+        // reads `file.metadata()?.len()` to bound iteration, so a stale
+        // size could truncate recovery short of the last record.
+        self.current.sync_all()?;
         // Replace writer — old WalWriter dropped here (file closed by OS).
         let path = log_path(&self.dir, new_log);
         let sink = FileSink::create(&path)?;
+        // fsync the parent directory so both (a) the old file's final
+        // size is durable and (b) the new file's directory entry is
+        // durable before the first append to it.
+        if let Ok(d) = std::fs::File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
         self.current = WalWriter::new(Box::new(sink), new_log, false);
         self.log_number = new_log;
 

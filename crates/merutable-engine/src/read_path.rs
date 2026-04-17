@@ -119,6 +119,13 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         }
     }
 
+    // Cache race fix: snapshot the generation BEFORE reading from disk.
+    // Any concurrent write that invalidates the cache advances the
+    // generation; the `insert_if_fresh` call below refuses to install
+    // the disk-sourced value if the generation has moved on — preventing
+    // a stale-cache-survives-memtable-flush scenario.
+    let cache_gen = engine.row_cache.as_ref().map(|c| c.snapshot_generation());
+
     let version = engine.version_set.current();
     let base = engine.catalog.base_path();
 
@@ -131,14 +138,16 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         }
         let (reader, dv) = open_file(base, file, engine.schema.clone())?;
         if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
-            // Populate cache before returning.
-            if let Some(ref cache) = engine.row_cache {
-                cache.insert(
+            // Populate cache before returning — only if no concurrent
+            // invalidation raced with this read.
+            if let (Some(ref cache), Some(gen)) = (&engine.row_cache, cache_gen) {
+                cache.insert_if_fresh(
                     user_key_bytes.clone(),
                     crate::cache::CacheEntry {
                         op_type: hit_ikey.op_type,
                         row: row.clone(),
                     },
+                    gen,
                 );
             }
             if hit_ikey.op_type == OpType::Delete {
@@ -158,14 +167,14 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         };
         let (reader, dv) = open_file(base, file, engine.schema.clone())?;
         if let Some((hit_ikey, row)) = reader.get(&user_key_bytes, read_seq, dv.as_ref())? {
-            // Populate cache before returning.
-            if let Some(ref cache) = engine.row_cache {
-                cache.insert(
+            if let (Some(ref cache), Some(gen)) = (&engine.row_cache, cache_gen) {
+                cache.insert_if_fresh(
                     user_key_bytes.clone(),
                     crate::cache::CacheEntry {
                         op_type: hit_ikey.op_type,
                         row: row.clone(),
                     },
+                    gen,
                 );
             }
             if hit_ikey.op_type == OpType::Delete {

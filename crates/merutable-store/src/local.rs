@@ -32,10 +32,29 @@ impl MeruStore for LocalFileStore {
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        // Atomic: write to tmp, then rename.
+        // Atomic: write to tmp, fsync tmp, rename, fsync parent dir.
+        //
+        // Without the fsync-before-rename, rename might be applied to
+        // non-durable data and a crash loses the content. Without the
+        // fsync-after-rename, the directory entry itself (the link
+        // from `path` to the inode) is not durable on ext4/btrfs and
+        // a crash can "roll back" the rename — leaving the caller
+        // believing the write succeeded when the file is gone on reboot.
         let tmp = full.with_extension("tmp");
         tokio::fs::write(&tmp, &data).await?;
+        // fsync the file contents before the rename so the data is
+        // durable under whatever name we link it to.
+        if let Ok(f) = tokio::fs::File::open(&tmp).await {
+            let _ = f.sync_all().await;
+        }
         tokio::fs::rename(&tmp, &full).await?;
+        // fsync the parent directory so the rename's directory-entry
+        // change is durably committed.
+        if let Some(parent) = full.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
         Ok(())
     }
 
