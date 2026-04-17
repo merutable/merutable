@@ -200,8 +200,15 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     txn.set_prop("merutable.first_seq", first_seq.0.to_string());
     txn.set_prop("merutable.last_seq", last_seq.0.to_string());
 
-    // Commit snapshot.
-    let new_version = engine.catalog.commit(&txn, engine.schema.clone()).await?;
+    // Commit snapshot. Serialized with concurrent compaction commits
+    // via `commit_lock` — both paths compute `next_ver` from the
+    // current manifest and write `v{N+1}.metadata.json`, so two
+    // parallel committers would race on the version number without
+    // this lock. The commit itself is brief (single fsync chain).
+    let new_version = {
+        let _commit_guard = engine.commit_lock.lock().await;
+        engine.catalog.commit(&txn, engine.schema.clone()).await?
+    };
     engine.version_set.install(new_version);
 
     info!(

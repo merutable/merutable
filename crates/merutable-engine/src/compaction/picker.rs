@@ -5,6 +5,13 @@
 //! - L0 score = `l0_file_count / l0_compaction_trigger`
 //! - L1+ score = `level_bytes / level_target_bytes[level]`
 //! - Pick highest score > 1.0; output level = input + 1.
+//!
+//! Parallelism: the picker accepts a `busy_levels` set; any level whose
+//! input or output is already being compacted by another worker is
+//! skipped. This lets `run_compaction` run multiple jobs concurrently
+//! on disjoint level sets (e.g. L0→L1 in worker A, L2→L3 in worker B).
+
+use std::collections::HashSet;
 
 use merutable_iceberg::version::Version;
 use merutable_types::level::Level;
@@ -24,51 +31,74 @@ pub struct CompactionPick {
     pub input_files: Vec<String>,
 }
 
-/// Pick the best compaction, or `None` if no level needs compaction.
+/// Pick the best compaction, or `None` if no level needs compaction —
+/// or if every candidate level has its input or output level already
+/// reserved by another in-progress compaction.
 ///
 /// L0 priority: when `l0_file_count >= l0_slowdown_trigger`, L0 is picked
 /// unconditionally regardless of deeper-level scores. L0 buildup degrades
 /// both read latency (more files to probe) and write latency (slowdown
-/// sleep + eventual stall). A deep compaction that outpaces flushes will
-/// otherwise let L0 accumulate indefinitely — even if its score is 18×
-/// the trigger — because `best_score` was previously a single max across
-/// all levels. This fix lets the caller (run_compaction loop) keep
-/// draining L0 between deep compactions.
-pub fn pick_compaction(version: &Version, config: &EngineConfig) -> Option<CompactionPick> {
+/// sleep + eventual stall).
+///
+/// Parallelism: `busy_levels` is the set of levels currently being
+/// compacted. A candidate level `L` is eligible iff neither `L` nor
+/// `L.next()` is in `busy_levels`. This lets a long-running L2→L3
+/// compaction coexist with concurrent L0→L1 drainage — the key
+/// mechanism that prevents the stress-test L0 buildup when a deep
+/// compaction would otherwise hold the worker slot for minutes.
+pub fn pick_compaction(
+    version: &Version,
+    config: &EngineConfig,
+    busy_levels: &HashSet<Level>,
+) -> Option<CompactionPick> {
+    let level_is_free =
+        |lvl: Level| -> bool { !busy_levels.contains(&lvl) && !busy_levels.contains(&lvl.next()) };
+
     let l0_count = version.l0_file_count();
     let l0_score = l0_count as f64 / config.l0_compaction_trigger as f64;
 
     // L0 priority path.
-    let force_l0 = l0_count >= config.l0_slowdown_trigger;
+    let force_l0 = l0_count >= config.l0_slowdown_trigger && level_is_free(Level(0));
 
-    let mut best_score = 0.0f64;
-    let mut best_level = Level(0);
+    let best_level;
+    let best_score;
 
     if force_l0 {
         // L0 is above slowdown — compact it regardless of deeper pressure.
-        best_score = l0_score;
         best_level = Level(0);
+        best_score = l0_score;
     } else {
-        // Normal scoring: pick the highest-pressure level.
-        if l0_score > best_score {
-            best_score = l0_score;
-            best_level = Level(0);
+        // Normal scoring: pick the highest-pressure eligible level.
+        let mut cur_best_score = 0.0f64;
+        let mut cur_best_level = Level(0);
+        let mut found_candidate = false;
+
+        if l0_score > cur_best_score && level_is_free(Level(0)) {
+            cur_best_score = l0_score;
+            cur_best_level = Level(0);
+            found_candidate = true;
         }
         for (i, &target) in config.level_target_bytes.iter().enumerate() {
             let level = Level((i + 1) as u8);
+            if !level_is_free(level) {
+                continue;
+            }
             let bytes = version.level_bytes(level);
             if target > 0 {
                 let score = bytes as f64 / target as f64;
-                if score > best_score {
-                    best_score = score;
-                    best_level = level;
+                if score > cur_best_score {
+                    cur_best_score = score;
+                    cur_best_level = level;
+                    found_candidate = true;
                 }
             }
         }
 
-        if best_score < 1.0 {
-            return None; // no level needs compaction
+        if !found_candidate || cur_best_score < 1.0 {
+            return None; // no eligible level needs compaction
         }
+        best_level = cur_best_level;
+        best_score = cur_best_score;
     }
 
     let output_level = best_level.next();
@@ -164,11 +194,15 @@ mod tests {
         }
     }
 
+    fn empty_busy() -> HashSet<Level> {
+        HashSet::new()
+    }
+
     #[test]
     fn no_compaction_needed() {
         let v = Version::empty(test_schema());
         let config = EngineConfig::default();
-        assert!(pick_compaction(&v, &config).is_none());
+        assert!(pick_compaction(&v, &config, &empty_busy()).is_none());
     }
 
     #[test]
@@ -182,7 +216,7 @@ mod tests {
         v.levels.insert(Level(0), l0_files);
 
         let config = EngineConfig::default();
-        let pick = pick_compaction(&v, &config).unwrap();
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
         assert_eq!(pick.input_level, Level(0));
         assert_eq!(pick.output_level, Level(1));
         assert_eq!(pick.input_files.len(), 5);
@@ -220,7 +254,7 @@ mod tests {
 
         // Even though L2's bytes/target score is high, L0 must win because
         // it's above the slowdown trigger.
-        let pick = pick_compaction(&v, &config).unwrap();
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
         assert_eq!(
             pick.input_level,
             Level(0),
@@ -254,11 +288,126 @@ mod tests {
         }
         v.levels.insert(Level(2), l2_files);
 
-        let pick = pick_compaction(&v, &config).unwrap();
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
         assert_eq!(
             pick.input_level,
             Level(2),
             "below slowdown, deeper level with higher score should win"
+        );
+    }
+
+    /// Parallelism: when L0→L1 is already in progress (busy={L0,L1}),
+    /// another worker should be able to pick a disjoint deeper compaction
+    /// (L2→L3) instead of returning None. This is the mechanism that
+    /// unblocks stress tests where a long L0 drainage would otherwise
+    /// starve L2/L3 compactions (and vice versa).
+    #[test]
+    fn picks_disjoint_level_when_l0_busy() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig::default();
+
+        // L0: above trigger but below slowdown (so not force-picked).
+        for i in 0..5 {
+            v.levels.entry(Level(0)).or_default().push(make_file(
+                &format!("l0_{i}.parquet"),
+                0,
+                100,
+                1024,
+            ));
+        }
+        // L2: above target so score >= 1.
+        for i in 0..10 {
+            v.levels.entry(Level(2)).or_default().push(make_file(
+                &format!("l2_{i}.parquet"),
+                2,
+                1_000_000,
+                1024 * 1024 * 1024,
+            ));
+        }
+
+        // Simulate worker A doing L0→L1: both levels are reserved.
+        let mut busy = HashSet::new();
+        busy.insert(Level(0));
+        busy.insert(Level(1));
+
+        let pick = pick_compaction(&v, &config, &busy).unwrap();
+        assert_eq!(
+            pick.input_level,
+            Level(2),
+            "L0 busy → worker B must be able to pick L2 (disjoint from {{L0,L1}})"
+        );
+        assert_eq!(pick.output_level, Level(3));
+    }
+
+    /// When every eligible level's input or output is reserved, the
+    /// picker must return None (don't steal files from an in-progress
+    /// compaction). The caller's loop then exits and yields to other
+    /// workers.
+    #[test]
+    fn returns_none_when_all_candidates_busy() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig::default();
+
+        // L0 over trigger.
+        for i in 0..5 {
+            v.levels.entry(Level(0)).or_default().push(make_file(
+                &format!("l0_{i}.parquet"),
+                0,
+                100,
+                1024,
+            ));
+        }
+
+        // Busy: L0→L1 in progress.
+        let mut busy = HashSet::new();
+        busy.insert(Level(0));
+        busy.insert(Level(1));
+
+        assert!(
+            pick_compaction(&v, &config, &busy).is_none(),
+            "no other level needs compaction → must return None when L0 is busy"
+        );
+    }
+
+    /// L0 force-pick must yield to an in-progress L0 compaction. A
+    /// second worker entering while L0 is already being drained should
+    /// not try to steal L0 files — even if L0 is above slowdown.
+    /// Otherwise the reservation fails and we waste a picker cycle.
+    #[test]
+    fn l0_force_pick_respects_busy_l0() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig::default();
+
+        // L0: 30 files — well above slowdown.
+        for i in 0..30 {
+            v.levels.entry(Level(0)).or_default().push(make_file(
+                &format!("l0_{i}.parquet"),
+                0,
+                100,
+                1024,
+            ));
+        }
+        // L2 also needs work.
+        for i in 0..10 {
+            v.levels.entry(Level(2)).or_default().push(make_file(
+                &format!("l2_{i}.parquet"),
+                2,
+                1_000_000,
+                1024 * 1024 * 1024,
+            ));
+        }
+
+        // L0 already busy.
+        let mut busy = HashSet::new();
+        busy.insert(Level(0));
+        busy.insert(Level(1));
+
+        // Must fall back to normal scoring and pick L2, not re-pick L0.
+        let pick = pick_compaction(&v, &config, &busy).unwrap();
+        assert_eq!(
+            pick.input_level,
+            Level(2),
+            "L0 busy → force-pick must defer to normal scoring and pick L2"
         );
     }
 

@@ -40,12 +40,36 @@ pub struct MeruEngine {
     /// and write two L0 Parquet files containing identical rows (followed
     /// by two competing catalog commits). Bug G regression.
     pub(crate) flush_mutex: Mutex<()>,
-    /// Bug T fix: serializes `run_compaction` so two background compaction
-    /// workers (default `compaction_parallelism=2`) don't both pick the
-    /// same level, read the same files, write duplicate output Parquet
-    /// files at the output level, and commit competing snapshots —
-    /// producing duplicate rows visible to readers.
-    pub(crate) compaction_mutex: Mutex<()>,
+    /// Per-level reservation set. Replaces the pre-existing single
+    /// `compaction_mutex` so two background compaction workers can run
+    /// concurrently on **disjoint level sets** — e.g. worker A does
+    /// L0→L1 while worker B does L2→L3 in parallel. Before this was
+    /// introduced, a single 45-minute L2→L3 compaction blocked all L0
+    /// drainage (observed in stress test: L0 grew to 75 files with 2
+    /// idle workers stalled on the mutex).
+    ///
+    /// Invariants (Bug T fix preserved):
+    /// - A compaction reserves both its input_level and output_level
+    ///   before executing. Two compactions never share any level.
+    /// - Full-level picking (current picker model) means two compactions
+    ///   on the same level would either share input files OR produce
+    ///   overlapping output ranges at the output level. Either would
+    ///   corrupt the L1+ non-overlap invariant or the manifest. Per-level
+    ///   reservation prevents both at once with a single lock acquire.
+    ///
+    /// Follows Pebble's `compactionEnv.inProgressCompactions` and
+    /// RocksDB's `level0_compactions_in_progress_` / `FileMetaData::
+    /// being_compacted` pattern, scaled down to level granularity since
+    /// the current picker is full-level. Can be refined to file-granular
+    /// tracking if/when partial-level picking is introduced.
+    pub(crate) compacting_levels: Mutex<std::collections::HashSet<merutable_types::level::Level>>,
+    /// Serializes just the catalog commit phase — brief (ms), distinct
+    /// from the long merge phase. Two parallel compactions that finish
+    /// their merges concurrently must linearize through `catalog.commit()`
+    /// because each commit computes `next_ver` from the current manifest
+    /// and writes `v{N+1}.metadata.json`; without serialization they'd
+    /// race on the version number and overwrite each other's manifest.
+    pub(crate) commit_lock: Mutex<()>,
     /// Row-level LRU cache for point lookups. `None` if disabled (capacity=0).
     pub(crate) row_cache: Option<crate::cache::RowCache>,
     /// True if opened in read-only mode. Write ops will return `MeruError::ReadOnly`.
@@ -167,7 +191,8 @@ impl MeruEngine {
             catalog,
             rotation_lock: Mutex::new(()),
             flush_mutex: Mutex::new(()),
-            compaction_mutex: Mutex::new(()),
+            compacting_levels: Mutex::new(std::collections::HashSet::new()),
+            commit_lock: Mutex::new(()),
             row_cache,
             read_only,
             visible_seq,
@@ -551,6 +576,16 @@ impl MeruEngine {
     /// Returns `true` if `close()` has been called.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Snapshot of the per-level compaction reservations. Used only by
+    /// regression tests to assert that `LevelReservation`'s Drop impl
+    /// freed the levels after a compaction completes.
+    #[doc(hidden)]
+    pub async fn __compacting_levels_snapshot(
+        &self,
+    ) -> std::collections::HashSet<merutable_types::level::Level> {
+        self.compacting_levels.lock().await.clone()
     }
 
     /// Snapshot of engine statistics. Lock-free on the version side (ArcSwap),

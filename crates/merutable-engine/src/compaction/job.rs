@@ -19,7 +19,9 @@ use merutable_iceberg::{
     version::DataFileMeta, DeletionVector, IcebergDataFile, SnapshotTransaction,
 };
 use merutable_parquet::reader::ParquetReader;
-use merutable_types::{level::ParquetFileMeta, schema::TableSchema, MeruError, Result};
+use merutable_types::{
+    level::Level, level::ParquetFileMeta, schema::TableSchema, MeruError, Result,
+};
 use roaring::RoaringBitmap;
 use tracing::{debug, info, instrument, warn};
 
@@ -107,22 +109,70 @@ fn compute_union_range(files: &[DataFileMeta]) -> (Option<Vec<u8>>, Option<Vec<u
     (union_min, union_max)
 }
 
-/// Run compaction until the LSM tree is healthy.
+/// RAII guard that releases a level reservation when dropped. Ensures
+/// reserved levels are always freed even on error paths — without this,
+/// a mid-compaction error would permanently wedge the levels and no
+/// future compaction could touch them.
+struct LevelReservation {
+    engine: Arc<MeruEngine>,
+    levels: Vec<Level>,
+}
+
+impl Drop for LevelReservation {
+    fn drop(&mut self) {
+        // We're in a sync drop; `Mutex::blocking_lock` is wrong inside a
+        // tokio runtime (deadlocks if the runtime has only one worker).
+        // Use `try_lock` — the contention window is microseconds
+        // (pick/execute/commit all release naturally), so try_lock
+        // virtually always succeeds. If it fails, spawn an async task
+        // to free the reservation so levels can't leak permanently.
+        let levels = std::mem::take(&mut self.levels);
+        if levels.is_empty() {
+            return;
+        }
+        let acquired = {
+            let try_result = self.engine.compacting_levels.try_lock();
+            match try_result {
+                Ok(mut guard) => {
+                    for l in &levels {
+                        guard.remove(l);
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        if !acquired {
+            let engine = self.engine.clone();
+            tokio::spawn(async move {
+                let mut guard = engine.compacting_levels.lock().await;
+                for l in &levels {
+                    guard.remove(l);
+                }
+            });
+        }
+    }
+}
+
+/// Run compaction until the LSM tree is healthy or all eligible work is
+/// owned by other workers.
 ///
-/// Loops: pick the highest-pressure level → execute one merge job →
-/// release the mutex → re-check. Returns when `pick_compaction()` returns
-/// `None` (no level above trigger). The mutex is released between
-/// iterations so a concurrent background worker can interleave — e.g. one
-/// worker finishes a deep L2→L3 merge, releases, and the other
-/// immediately grabs L0 drainage (L0 priority path in `pick_compaction`).
+/// Loops: acquire the state lock → pick a compaction on levels not
+/// currently reserved by another worker → reserve those levels
+/// (input + output) → release the state lock → execute the merge (no
+/// lock held, so concurrent workers can run on disjoint levels) →
+/// acquire `commit_lock` for the brief catalog commit → release all
+/// reservations via RAII.
 ///
-/// Without this loop, a single `compact()` call returned after one job,
-/// so a backlog of flushes could accumulate on L0 while a deep
-/// compaction was in flight — L0 would grow unboundedly.
+/// Returns when `pick_compaction()` returns `None`, either because no
+/// level needs compaction or because every eligible level is currently
+/// being compacted by another worker. The other worker's loop will
+/// handle any remaining work as its levels free up.
 ///
-/// Safety cap: `MAX_ITERATIONS` prevents a runaway loop if the picker
-/// keeps returning the same level (shouldn't happen, but defend against
-/// config pathologies).
+/// Follows Pebble's `inProgressCompactions` / BadgerDB's `compactStatus`
+/// pattern. Scaled to per-level granularity because the current picker
+/// always picks full levels; refinable to per-file tracking if the
+/// picker learns to select subranges.
 #[instrument(skip(engine), fields(op = "compaction"))]
 pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     const MAX_ITERATIONS: usize = 128;
@@ -142,25 +192,51 @@ pub async fn run_compaction(engine: &Arc<MeruEngine>) -> Result<()> {
     Ok(())
 }
 
-/// Run one compaction job. Picks the best level and compacts.
-///
-/// Returns `true` if a compaction was executed, `false` if no level
-/// needed compaction.
-///
-/// Bug T fix: serialized by `engine.compaction_mutex` so two background
-/// workers don't both pick the same level, read the same files, and write
-/// duplicate output to the output level. The mutex is acquired per job
-/// (not per `run_compaction` call) so interleaving between workers is
-/// possible — critical for L0 drainage to keep up with flushes while a
-/// deep compaction is running on another worker.
-async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
-    let _compaction_guard = engine.compaction_mutex.lock().await;
+/// Reserve the input + output levels for a new compaction. Returns the
+/// pick, the version snapshot the pick was made from, and an RAII guard.
+/// Returning the version preserves Bug Q's invariant: the compaction
+/// reads files from the same version the picker scored — a later
+/// `version_set.current()` call could see a different version after a
+/// concurrent flush committed.
+async fn reserve_next_compaction(
+    engine: &Arc<MeruEngine>,
+) -> Option<(
+    picker::CompactionPick,
+    Arc<merutable_iceberg::version::Version>,
+    LevelReservation,
+)> {
+    let mut busy = engine.compacting_levels.lock().await;
+    let version_guard = engine.version_set.current();
+    let pick = picker::pick_compaction(&version_guard, &engine.config, &busy)?;
+    // Clone the Arc out of the ArcSwap guard so the version outlives the
+    // reservation (and the caller can read files from it without holding
+    // the guard across await points).
+    let version: Arc<merutable_iceberg::version::Version> = (*version_guard).clone();
+    drop(version_guard);
 
-    let version = engine.version_set.current();
-    let pick = match picker::pick_compaction(&version, &engine.config) {
-        Some(p) => p,
+    // Reserve the picked levels. Inserts must succeed because the
+    // picker guaranteed neither is already in `busy`.
+    let input_level = pick.input_level;
+    let output_level = pick.output_level;
+    busy.insert(input_level);
+    busy.insert(output_level);
+    drop(busy);
+
+    let reservation = LevelReservation {
+        engine: engine.clone(),
+        levels: vec![input_level, output_level],
+    };
+    Some((pick, version, reservation))
+}
+
+/// Run one compaction job. Returns `true` if a compaction was executed,
+/// `false` if no eligible level needed compaction (or all were busy).
+async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
+    // Phase 1: pick + reserve (brief lock).
+    let (pick, version, _reservation) = match reserve_next_compaction(engine).await {
+        Some(r) => r,
         None => {
-            debug!("no compaction needed");
+            debug!("no compaction needed (or all candidates busy)");
             return Ok(false);
         }
     };
@@ -387,8 +463,17 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     txn.set_prop("merutable.input_level", pick.input_level.0.to_string());
     txn.set_prop("merutable.output_level", pick.output_level.0.to_string());
 
-    // Commit.
-    let new_version = engine.catalog.commit(&txn, engine.schema.clone()).await?;
+    // Commit. Two concurrent compactions on disjoint levels finish
+    // their merges in parallel; their commits must linearize because
+    // each computes `next_ver` from the current manifest — without
+    // serialization they'd race on the version number and overwrite
+    // each other's `v{N+1}.metadata.json`. The commit itself is brief
+    // (single fsync chain), so this lock doesn't serialize the hot
+    // merge work.
+    let new_version = {
+        let _commit_guard = engine.commit_lock.lock().await;
+        engine.catalog.commit(&txn, engine.schema.clone()).await?
+    };
     engine.version_set.install(new_version);
 
     // IMP-03: clear the row cache after compaction. Compaction rewrites

@@ -213,6 +213,127 @@ async fn imp15_refresh_rejects_missing_files() {
     );
 }
 
+/// Compaction parallelism regression: with the old single `compaction_mutex`,
+/// two workers on disjoint levels serialized. With per-level reservation,
+/// a long L2→L3 compaction must not block a concurrent L0→L1 compaction.
+///
+/// This test uses two `tokio::spawn`'d tasks. If they deadlock or if the
+/// second blocks waiting for the first, the test times out. With the
+/// fix, the second compaction picks disjoint levels and runs in parallel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compactions_on_disjoint_levels_run_concurrently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.memtable_size_bytes = 64 * 1024 * 1024;
+    config.gc_grace_period_secs = 0;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Seed enough L0 files for an L0→L1 pick.
+    for batch in 0..6i64 {
+        for i in 0..20i64 {
+            let key = batch * 100 + i;
+            engine
+                .put(
+                    vec![FieldValue::Int64(key)],
+                    Row::new(vec![
+                        Some(FieldValue::Int64(key)),
+                        Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{key}")))),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+
+    // Spawn two concurrent compactions. Neither should deadlock.
+    let e1 = engine.clone();
+    let e2 = engine.clone();
+    let h1 = tokio::spawn(async move { e1.compact().await });
+    let h2 = tokio::spawn(async move { e2.compact().await });
+
+    // A timeout guards against serialization deadlock. On a multi-thread
+    // runtime with the fix, both return quickly.
+    let timeout = std::time::Duration::from_secs(60);
+    let (r1, r2) = tokio::join!(
+        tokio::time::timeout(timeout, h1),
+        tokio::time::timeout(timeout, h2),
+    );
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "concurrent compactions must not deadlock"
+    );
+    r1.unwrap().unwrap().unwrap();
+    r2.unwrap().unwrap().unwrap();
+
+    // L0 must be drained below trigger.
+    let stats = engine.stats();
+    let l0 = stats
+        .levels
+        .iter()
+        .find(|l| l.level == 0)
+        .map(|l| l.file_count)
+        .unwrap_or(0);
+    assert!(
+        l0 < 4,
+        "after concurrent compactions L0 must be below trigger (got {l0})"
+    );
+}
+
+/// Level reservations must not leak on error paths. If a compaction
+/// fails mid-flight, the `LevelReservation` Drop impl must release the
+/// levels so subsequent compactions can proceed.
+///
+/// We can't easily inject a failure without deeper surgery, so this
+/// test exercises the happy path and verifies the busy set is empty
+/// after `compact()` returns — the Drop impl handled the release.
+#[tokio::test]
+async fn level_reservations_released_after_compact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.memtable_size_bytes = 64 * 1024 * 1024;
+    config.gc_grace_period_secs = 0;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    for batch in 0..5i64 {
+        for i in 0..10i64 {
+            let key = batch * 100 + i;
+            engine
+                .put(
+                    vec![FieldValue::Int64(key)],
+                    Row::new(vec![Some(FieldValue::Int64(key)), None]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+
+    engine.compact().await.unwrap();
+
+    // After compact() returns, no level should still be reserved —
+    // otherwise a subsequent compact() would see an empty pick.
+    // Drop impl may enqueue release on the runtime via tokio::spawn
+    // when try_lock fails; yield a few times to let it complete.
+    for _ in 0..16 {
+        let busy = engine.__compacting_levels_snapshot().await;
+        if busy.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let busy = engine.__compacting_levels_snapshot().await;
+    assert!(
+        busy.is_empty(),
+        "level reservations leaked after compact(): {busy:?}"
+    );
+
+    // And a subsequent compact() must still be able to pick work if
+    // any is outstanding (no-op here since we just drained).
+    engine.compact().await.unwrap();
+}
+
 /// Compaction loop regression: a single `compact()` call must drain the
 /// tree until no level is above its trigger. Previously `compact()`
 /// executed exactly one job and returned, so a caller (or the background
