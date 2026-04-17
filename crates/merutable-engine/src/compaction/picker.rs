@@ -104,13 +104,46 @@ pub fn pick_compaction(
     let output_level = best_level.next();
 
     // Select input files.
+    //
+    // Memory cap: `config.max_compaction_bytes` bounds how much input
+    // a single compaction loads into memory. The current compaction
+    // job reads whole Parquet files into `Bytes` buffers before the
+    // merge, so unbounded input selection = unbounded RSS. A stress
+    // test with 75 L0 files × 64 MiB each would otherwise pull ~5 GiB
+    // per compaction; with parallel workers this multiplies.
+    //
+    // For L0: take oldest-first (seq_min ASC) until the cumulative
+    // file size would exceed the cap. At least one file is always
+    // picked so progress is guaranteed. Remaining L0 files stay at
+    // L0 and are drained by the next iteration of the
+    // `run_compaction` loop (which re-picks with the same cap).
+    //
+    // For L1+: the picker always does full-level compaction (current
+    // design), so capping would require partial-range picking — out
+    // of scope here. If total input exceeds the cap by >4×, the cap
+    // is relaxed with a debug log; tune `max_compaction_bytes` or
+    // `level_target_bytes` if deep-level compactions OOM.
     let input_files: Vec<String> = if best_level == Level(0) {
-        // For L0, compact ALL L0 files (they can overlap).
-        version
-            .files_at(Level(0))
-            .iter()
-            .map(|f| f.path.clone())
-            .collect()
+        let max_bytes = config.max_compaction_bytes;
+        let mut l0: Vec<&merutable_iceberg::version::DataFileMeta> =
+            version.files_at(Level(0)).iter().collect();
+        // Sort oldest-first by seq_min so the picked subset is the
+        // oldest contiguous batch — the newest L0 files (with the
+        // highest seq numbers) remain live and readable while the
+        // older ones are rewritten to L1.
+        l0.sort_by_key(|f| f.meta.seq_min);
+        let mut total = 0u64;
+        let mut picked = Vec::new();
+        for f in l0 {
+            // Always take at least one file so we make progress even
+            // if a single file exceeds the cap.
+            if !picked.is_empty() && total.saturating_add(f.meta.file_size) > max_bytes {
+                break;
+            }
+            total = total.saturating_add(f.meta.file_size);
+            picked.push(f.path.clone());
+        }
+        picked
     } else {
         // For L1+, pick files that overlap with the output level's boundary.
         // Simplified: pick all files at this level (full-level compaction).
@@ -367,6 +400,64 @@ mod tests {
             pick_compaction(&v, &config, &busy).is_none(),
             "no other level needs compaction → must return None when L0 is busy"
         );
+    }
+
+    /// BUG-0002 regression: L0 picker must cap total input bytes at
+    /// `config.max_compaction_bytes`. Without this, a large L0
+    /// (e.g. 75 files × 64 MiB = 4.8 GiB) would load entirely into
+    /// memory and cause OOM when multiple workers compact in parallel.
+    #[test]
+    fn l0_pick_caps_at_max_compaction_bytes() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            max_compaction_bytes: 256 * 1024 * 1024, // 256 MiB cap.
+            ..EngineConfig::default()
+        };
+
+        // 20 L0 files × 64 MiB = 1.28 GiB total — well above cap.
+        for i in 0..20 {
+            let mut f = make_file(&format!("l0_{i}.parquet"), 0, 100, 64 * 1024 * 1024);
+            // Make seq_min increase with i so sort is deterministic.
+            f.meta.seq_min = (i + 1) as u64;
+            f.meta.seq_max = (i + 1) as u64 * 10;
+            v.levels.entry(Level(0)).or_default().push(f);
+        }
+
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        assert_eq!(pick.input_level, Level(0));
+        // 256 MiB / 64 MiB = 4 files max before hitting the cap; the
+        // loop rule "always take at least one" means we'd take 4 here
+        // (at cap, not over).
+        assert!(
+            pick.input_files.len() <= 5,
+            "L0 pick must respect max_compaction_bytes; got {} files \
+             (cap=256MiB, 64MiB each)",
+            pick.input_files.len()
+        );
+        assert!(
+            !pick.input_files.is_empty(),
+            "L0 pick must always take at least one file to make progress"
+        );
+    }
+
+    /// Progress guarantee: even if a single L0 file exceeds the cap,
+    /// one file is always picked — otherwise the tree would wedge.
+    #[test]
+    fn l0_pick_always_picks_at_least_one() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            max_compaction_bytes: 1024, // Absurdly small cap (1 KiB).
+            ..EngineConfig::default()
+        };
+
+        for i in 0..5 {
+            let mut f = make_file(&format!("l0_{i}.parquet"), 0, 100, 64 * 1024 * 1024);
+            f.meta.seq_min = (i + 1) as u64;
+            v.levels.entry(Level(0)).or_default().push(f);
+        }
+
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        assert_eq!(pick.input_files.len(), 1, "must take at least one file");
     }
 
     /// L0 force-pick must yield to an in-progress L0 compaction. A

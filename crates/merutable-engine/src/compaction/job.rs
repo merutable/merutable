@@ -254,7 +254,19 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     // a different version if a concurrent flush committed between pick and
     // this point — causing the compaction to read a file set inconsistent
     // with what the picker evaluated.
-    let input_file_metas: Vec<DataFileMeta> = version.files_at(pick.input_level).to_vec();
+    //
+    // Honor the picker's `input_files` selection (not `version.files_at`):
+    // the picker may have chosen a subset of the level to bound per-job
+    // memory via `max_compaction_bytes`. Taking all level files here
+    // would defeat the cap and re-introduce OOM under stress (BUG-0002).
+    let input_selection: std::collections::HashSet<&str> =
+        pick.input_files.iter().map(|s| s.as_str()).collect();
+    let input_file_metas: Vec<DataFileMeta> = version
+        .files_at(pick.input_level)
+        .iter()
+        .filter(|f| input_selection.contains(f.path.as_str()))
+        .cloned()
+        .collect();
     if input_file_metas.is_empty() {
         debug!("compaction picked an empty input level");
         return Ok(false);
