@@ -82,14 +82,56 @@ impl BackgroundWorkers {
     /// notify will return from its select on the notify branch; any
     /// worker that races ahead of the notify will see the flag at
     /// the top of its next iteration. Either path is deterministic.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.shutdown_flag.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
-        for h in self.flush_handles {
+        // Drain into locals so that Drop (below) sees empty Vecs and
+        // doesn't double-abort. We still want the graceful await path
+        // to join cleanly.
+        let flush = std::mem::take(&mut self.flush_handles);
+        let compaction = std::mem::take(&mut self.compaction_handles);
+        for h in flush {
             let _ = h.await;
         }
-        for h in self.compaction_handles {
+        for h in compaction {
             let _ = h.await;
+        }
+    }
+}
+
+/// Issue #21: if `BackgroundWorkers` is dropped without first going
+/// through `shutdown().await` (the common case: a `MeruDB` is dropped
+/// without `close()`), the derived drop just releases the `JoinHandle`s,
+/// which **detaches** the underlying Tokio tasks rather than cancelling
+/// them. Detached workers keep running with their own `Arc<MeruEngine>`
+/// clone, racing against a freshly reopened DB on the same directory
+/// and spamming `IO NotFound` warnings as they try to compact files
+/// the new instance has already removed.
+///
+/// Drop is synchronous, so we can't `.await` the joins. What we CAN do,
+/// cheaply, is:
+///
+///   1. Flip the shutdown `AtomicBool` so any worker that next
+///      examines it exits its loop instead of picking work.
+///   2. Notify any tasks currently parked on `notified().await`.
+///   3. Abort each `JoinHandle` — this cancels the task at its next
+///      `.await` point, short-circuiting the 1-second sleep-and-retry
+///      loop that otherwise logs hundreds of spurious failures.
+///
+/// A worker in the middle of a compaction will still complete the
+/// in-flight Parquet write before it reaches the next await (writes
+/// are mostly sync `tokio::fs` calls that do yield, but the abort
+/// point is wherever the next yield happens). That's intentional —
+/// we don't rip the rug out of an active fsync.
+impl Drop for BackgroundWorkers {
+    fn drop(&mut self) {
+        self.shutdown_flag.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+        for h in self.flush_handles.drain(..) {
+            h.abort();
+        }
+        for h in self.compaction_handles.drain(..) {
+            h.abort();
         }
     }
 }

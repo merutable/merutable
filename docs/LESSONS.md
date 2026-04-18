@@ -371,6 +371,31 @@ change at all. When mass edits are unavoidable, use an AST tool
 (rust-analyzer "add field" refactor) or handwrite each call site —
 regex on Rust struct literals is a foot-cannon.
 
+## 19. Async shutdown needs a sync escape hatch
+
+**Seen in**: Issue #21 — `BackgroundWorkers::shutdown(self).await` is
+the graceful path, but `Drop` is sync and can't `.await`. The derived
+`Drop` released the `JoinHandle`s without aborting them, detaching the
+tasks. Orphaned workers then spun forever against a deleted directory,
+logging 1,558 `IO NotFound` warnings per chaos-monkey run and holding
+`Arc<MeruEngine>` alive long after the DB was dropped.
+
+**Symptom**: Tasks spawned for the lifetime of an object outlive it.
+Visible as log spam, CPU burn, and racing writers when a new instance
+opens the same directory.
+
+**Anti-pattern**: "The graceful path exists; users should just call it."
+Users will drop objects on panics, on error paths, on reload flows —
+any lifecycle method that's sync-only will be invoked without `close()`.
+If a crash-simulation test exists (it did), it demonstrates this.
+
+**Discipline**: Any object that owns tokio tasks needs a `Drop` that
+(a) flips the shutdown `AtomicBool`, (b) calls `notify_waiters()` for
+parked tasks, (c) `JoinHandle::abort()`s every spawned handle. Sync
+drop can't *wait* for termination, but it can *signal* and *cancel*
+within microseconds, which is all we need to release held state at
+the next scheduler yield.
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible
