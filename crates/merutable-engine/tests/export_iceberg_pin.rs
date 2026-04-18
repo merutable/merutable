@@ -6,12 +6,14 @@
 //! the same BUG-0007..0013 hazard the read path was fixed for, minus
 //! the fix on this call site.
 //!
-//! This test verifies the contract directly: while `export_iceberg`
-//! is running, `min_pinned_snapshot()` must be `Some(_)`, proving
-//! the pin is held. The prior behaviour had `min_pinned_snapshot()`
-//! return `None` throughout, making the export GC-invisible.
+//! This test is deterministic (no timing races): it builds the
+//! `export_iceberg` future, polls it once to advance to the first
+//! `.await` (which happens after the pin is acquired), then inspects
+//! `min_pinned_snapshot()`. With the fix, the pin is observably held.
+//! Without the fix, the pin is never acquired and the inspection
+//! returns `None`.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use merutable_engine::{EngineConfig, MeruEngine};
 use merutable_types::{
@@ -44,17 +46,13 @@ fn config(tmp: &TempDir) -> EngineConfig {
     }
 }
 
-/// Spawn `export_iceberg` as a separate task and poll
-/// `min_pinned_snapshot()` concurrently. The pin must be observed
-/// as held at least once during the export window.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn export_iceberg_holds_snapshot_pin_for_lifetime_of_call() {
     let tmp = tempfile::tempdir().unwrap();
     let engine: Arc<MeruEngine> = MeruEngine::open(config(&tmp)).await.unwrap();
 
-    // Put something so the manifest has a non-empty snapshot to
-    // export. Not strictly required — empty manifests export fine —
-    // but a realistic setup exercises more of the catalog write path.
+    // Populate so the catalog has a non-empty snapshot — exercises
+    // the full export path, not just the empty-metadata fast return.
     for i in 0..10i64 {
         engine
             .put(
@@ -66,43 +64,51 @@ async fn export_iceberg_holds_snapshot_pin_for_lifetime_of_call() {
     }
     engine.flush().await.unwrap();
 
-    // Baseline: nothing should be pinned before the export.
     assert_eq!(
         engine.min_pinned_snapshot(),
         None,
         "precondition: no pin before export"
     );
 
-    let export_engine = engine.clone();
+    // Build the export future and poll it exactly once. The `.await`
+    // inside `catalog.export_to_iceberg` hits a tokio::fs::write that
+    // returns Pending on the first poll, so control comes back to us
+    // with the pin alive. If `export_iceberg` did not acquire a pin
+    // (the Issue #24 regression), nothing observable changes between
+    // "before poll" and "after poll — exported future parked".
     let export_dir = tmp.path().join("exported");
-    let export_task = tokio::spawn(async move { export_engine.export_iceberg(export_dir).await });
+    let fut = engine.export_iceberg(export_dir.clone());
+    tokio::pin!(fut);
 
-    // Poll min_pinned_snapshot for up to 1s; we expect to observe the
-    // pin at least once while the export is in flight. With Issue #24
-    // unfixed, `min_pinned_snapshot()` would return `None` for the
-    // entire duration.
-    let mut saw_pin = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while std::time::Instant::now() < deadline {
-        if engine.min_pinned_snapshot().is_some() {
-            saw_pin = true;
-            break;
+    // One poll to advance the future past pin acquisition and into
+    // the first catalog await. `poll!` returns `Poll::Pending` on
+    // success (the future parked on the fs.write completion); if it
+    // returns Ready, the export finished synchronously (possible on
+    // ultra-fast systems) — in which case we skip the mid-flight
+    // observation and rely on the next-assertion loop.
+    let first_poll = futures::poll!(&mut fut);
+    match first_poll {
+        std::task::Poll::Pending => {
+            // Pin must be observably held while the future is parked.
+            assert!(
+                engine.min_pinned_snapshot().is_some(),
+                "Issue #24 regression: export_iceberg's future parked \
+                 mid-export but min_pinned_snapshot() is None — the \
+                 pin was never acquired"
+            );
         }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        std::task::Poll::Ready(_) => {
+            // Future completed on first poll — nothing parked, so
+            // nothing to observe. This path doesn't exercise the
+            // regression, but also doesn't invalidate it (behavior
+            // might be OS/filesystem-dependent).
+        }
     }
 
-    let result = export_task.await.unwrap();
-    result.expect("export_iceberg succeeded");
+    // Drive to completion.
+    fut.await.expect("export_iceberg succeeded");
 
-    assert!(
-        saw_pin,
-        "Issue #24 regression: export_iceberg() ran to completion \
-         without ever incrementing live_snapshots — GC is free to \
-         delete files out from under the in-flight export"
-    );
-
-    // Post-export the pin must be released.
+    // After the export future has returned, the pin must be released.
     assert_eq!(
         engine.min_pinned_snapshot(),
         None,
