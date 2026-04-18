@@ -34,7 +34,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use merutable_parquet::{
     bloom::FastLocalBloom,
-    codec::{IKEY_COLUMN_NAME, VALUE_BLOB_COLUMN_NAME},
+    codec::{IKEY_COLUMN_NAME, OP_COLUMN_NAME, SEQ_COLUMN_NAME, VALUE_BLOB_COLUMN_NAME},
     kv_index::{KvSparseIndex, KV_INDEX_FOOTER_KEY},
     writer::write_sorted_rows,
 };
@@ -282,8 +282,14 @@ fn physical_column_layout_matches_level_contract() {
         .map(|i| l1_descr.column(i).name().to_string())
         .collect();
 
+    // Issue #16: every merutable-written file carries _merutable_seq
+    // (Int64) and _merutable_op (Int32) after _merutable_ikey, so
+    // external analytics readers can apply the MVCC dedup projection
+    // without decoding the ikey trailer.
     let expected_l0: Vec<String> = vec![
         IKEY_COLUMN_NAME.to_string(),
+        SEQ_COLUMN_NAME.to_string(),
+        OP_COLUMN_NAME.to_string(),
         VALUE_BLOB_COLUMN_NAME.to_string(),
         "id".into(),
         "name".into(),
@@ -292,6 +298,8 @@ fn physical_column_layout_matches_level_contract() {
     ];
     let expected_l1: Vec<String> = vec![
         IKEY_COLUMN_NAME.to_string(),
+        SEQ_COLUMN_NAME.to_string(),
+        OP_COLUMN_NAME.to_string(),
         "id".into(),
         "name".into(),
         "active".into(),

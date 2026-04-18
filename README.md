@@ -139,14 +139,16 @@ import duckdb
 db.export_iceberg("/tmp/events-iceberg")  # metadata.json + version-hint
 duckdb.sql("INSTALL iceberg; LOAD iceberg;")
 duckdb.sql(f"""
-    SELECT * EXCLUDE (_merutable_ikey)
+    SELECT * EXCLUDE (_merutable_ikey, _merutable_seq, _merutable_op)
     FROM iceberg_scan('/tmp/events-iceberg/metadata/v1.metadata.json')
     -- MVCC dedup: pick newest seq per PK, drop tombstones.
+    -- _merutable_seq (BIGINT) and _merutable_op (INT, 1=Put/0=Delete)
+    -- are typed hidden columns every merutable-written file carries.
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY id
-        ORDER BY merutable_seq(_merutable_ikey) DESC
+        ORDER BY _merutable_seq DESC
     ) = 1
-       AND merutable_op(_merutable_ikey) = 'Put';
+       AND _merutable_op = 1;
 """).show()
 
 # Read-only replica — opens same catalog, no WAL, no writes

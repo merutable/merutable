@@ -107,6 +107,23 @@ fn build_column_encoding_props(
         .set_column_encoding(ikey_col.clone(), Encoding::PLAIN)
         .set_column_dictionary_enabled(ikey_col, false);
 
+    // Issue #16: _merutable_seq is monotonic-ish (flush writes a
+    // contiguous range; compaction writes a shuffled but still
+    // delta-friendly range). DELTA_BINARY_PACKED is near-optimal.
+    let seq_col = ColumnPath::new(vec![crate::codec::SEQ_COLUMN_NAME.to_string()]);
+    builder = builder
+        .set_column_encoding(seq_col.clone(), Encoding::DELTA_BINARY_PACKED)
+        .set_column_dictionary_enabled(seq_col, false);
+
+    // Issue #16: _merutable_op is effectively a two-value enum
+    // (Put=1, Delete=0) dominated by long runs of Put. Parquet's RLE
+    // physical encoding only supports Boolean data, so for this Int32
+    // column we enable dictionary encoding — parquet-rs will emit
+    // RLE_DICTIONARY on the dictionary-index stream, which achieves
+    // the same collapse (2-entry dict + RLE-encoded indices).
+    let op_col = ColumnPath::new(vec![crate::codec::OP_COLUMN_NAME.to_string()]);
+    builder = builder.set_column_dictionary_enabled(op_col, true);
+
     if format.has_value_blob() {
         // Dual format: postcard value blob — PLAIN, no dictionary
         let value_col = ColumnPath::new(vec!["_merutable_value".to_string()]);

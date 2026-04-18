@@ -39,6 +39,23 @@ pub const IKEY_COLUMN_NAME: &str = "_merutable_ikey";
 /// are sufficient and reading a redundant blob would waste bytes).
 pub const VALUE_BLOB_COLUMN_NAME: &str = "_merutable_value";
 
+/// Issue #16: typed Int64 column carrying the sequence number of each
+/// row. Always present. External analytics readers use this directly
+/// in the mandatory MVCC dedup projection
+/// (`ROW_NUMBER() OVER (PARTITION BY pk ORDER BY _merutable_seq DESC)`)
+/// without decoding the `_merutable_ikey` trailer by hand. Encoded as
+/// DELTA_BINARY_PACKED at the Parquet layer (near-zero on-disk cost
+/// because writes are sequential-ish).
+pub const SEQ_COLUMN_NAME: &str = "_merutable_seq";
+
+/// Issue #16: typed Int32 column carrying the op-type of each row
+/// (`0 = Delete`, `1 = Put` — matches the on-disk tag byte in
+/// InternalKey). Always present. External analytics readers filter
+/// on `_merutable_op = 1` to drop tombstones. RLE-encoded at the
+/// Parquet layer (effectively free; one byte per run of consecutive
+/// same-op rows).
+pub const OP_COLUMN_NAME: &str = "_merutable_op";
+
 /// Whether files at the given level carry a `_merutable_value` blob column.
 /// Legacy helper — retained for callers that haven't plumbed the
 /// explicit `FileFormat` through yet. Delegates to
@@ -59,7 +76,15 @@ pub fn level_has_value_blob(level: Level) -> bool {
 /// - Remaining: one typed column per `TableSchema::columns` entry, in
 ///   schema order. These are the columns external HTAP readers see.
 pub fn arrow_schema(schema: &TableSchema, format: FileFormat) -> Arc<Schema> {
-    let mut fields = vec![Field::new(IKEY_COLUMN_NAME, DataType::Binary, false)];
+    let mut fields = vec![
+        Field::new(IKEY_COLUMN_NAME, DataType::Binary, false),
+        // Issue #16: typed _seq + _op columns so external analytics
+        // readers can apply the MVCC dedup projection without decoding
+        // the ikey trailer. Always present in every merutable-written
+        // file; internal reads skip them via the projection mask.
+        Field::new(SEQ_COLUMN_NAME, DataType::Int64, false),
+        Field::new(OP_COLUMN_NAME, DataType::Int32, false),
+    ];
     if format.has_value_blob() {
         fields.push(Field::new(VALUE_BLOB_COLUMN_NAME, DataType::Binary, false));
     }
@@ -102,7 +127,17 @@ pub fn rows_to_record_batch(
     let ikey_col: ArrayRef = Arc::new(BinaryArray::from_iter_values(
         rows.iter().map(|(ik, _)| ik.as_bytes()),
     ));
-    let mut col_arrays: Vec<ArrayRef> = vec![ikey_col];
+    // Issue #16: typed _seq / _op columns. We populate these from the
+    // InternalKey fields so the external-reader contract matches the
+    // engine's own seq+op semantics exactly. No additional per-row
+    // decoding cost — these are already in the InternalKey struct.
+    let seq_col: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        rows.iter().map(|(ik, _)| ik.seq.0 as i64),
+    ));
+    let op_col: ArrayRef = Arc::new(Int32Array::from_iter_values(
+        rows.iter().map(|(ik, _)| ik.op_type as u8 as i32),
+    ));
+    let mut col_arrays: Vec<ArrayRef> = vec![ikey_col, seq_col, op_col];
 
     // Optional _merutable_value blob column for Dual format.
     if format.has_value_blob() {

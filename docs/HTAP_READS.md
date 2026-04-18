@@ -33,15 +33,26 @@ deleted` markers and snapshot boundaries. Raw globs do not.
 
 ## Apply the MVCC dedup projection
 
+Every merutable-written file carries two typed hidden columns
+(Issue #16):
+
+- `_merutable_seq` — `BIGINT`, the sequence number of the row.
+- `_merutable_op` — `INT`, the op-type: `1 = Put`, `0 = Delete`.
+
+External analytics readers reference them directly:
+
 ```sql
-SELECT * EXCLUDE (_merutable_ikey)
+SELECT * EXCLUDE (_merutable_ikey, _merutable_seq, _merutable_op)
 FROM iceberg_table
 QUALIFY ROW_NUMBER() OVER (
     PARTITION BY <primary_key_columns>
-    ORDER BY merutable_seq(_merutable_ikey) DESC
+    ORDER BY _merutable_seq DESC
 ) = 1
-   AND merutable_op(_merutable_ikey) = 'Put';
+   AND _merutable_op = 1;
 ```
+
+No UDF, no ikey-trailer arithmetic. The DuckDB `QUALIFY` above works
+verbatim on Spark / Trino / Snowflake after the usual dialect swap.
 
 Why this is mandatory:
 
@@ -63,16 +74,18 @@ apply this as a streaming "first row per partition" filter at O(N)
 cost; engines that don't pay an O(N log N) sort. Either way the
 projection is required — the cost difference is only in the plan.
 
-## The `merutable_seq` / `merutable_op` UDFs
+## Legacy UDFs (pre-#16 files only)
 
-`_merutable_ikey` is a `BINARY` column whose last 8 bytes encode
-`(seq << 8) | op_type`. `merutable_seq` / `merutable_op` unpack that
-trailer:
+Files written before Issue #16 landed carry only `_merutable_ikey`
+and do not have the typed `_merutable_seq` / `_merutable_op`
+columns. Those files are rare in practice (Issue #16 lands on
+initial release), but if you encounter them the UDF-based
+decoding is:
 
 ```python
 import duckdb
 duckdb.sql("""
-CREATE OR REPLACE MACRO merutable_seq(ikey) AS
+CREATE OR REPLACE MACRO merutable_seq_from_ikey(ikey) AS
     (get_byte(ikey, length(ikey) - 8)::BIGINT << 48)
   | (get_byte(ikey, length(ikey) - 7)::BIGINT << 40)
   | (get_byte(ikey, length(ikey) - 6)::BIGINT << 32)
@@ -80,19 +93,10 @@ CREATE OR REPLACE MACRO merutable_seq(ikey) AS
   | (get_byte(ikey, length(ikey) - 4)::BIGINT << 16)
   | (get_byte(ikey, length(ikey) - 3)::BIGINT << 8)
   |  get_byte(ikey, length(ikey) - 2)::BIGINT;
-
-CREATE OR REPLACE MACRO merutable_op(ikey) AS
-    CASE get_byte(ikey, length(ikey) - 1)
-        WHEN 1 THEN 'Put'
-        WHEN 2 THEN 'Delete'
-    END;
 """)
 ```
 
-(Spark / Trino equivalents are mechanical translations of the same
-byte arithmetic. Issue #16 proposes emitting `_seq` and `_op` as
-typed columns directly in the Parquet schema so no UDF is needed —
-tracking follow-up.)
+New files do not need this — use the typed columns directly.
 
 ## `primary_key_columns`
 

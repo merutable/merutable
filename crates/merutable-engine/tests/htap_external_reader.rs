@@ -162,6 +162,21 @@ async fn l0_file_is_readable_by_upstream_parquet_with_typed_columns() {
         field_names.contains(&"_merutable_value"),
         "L0 must expose hidden postcard value blob column"
     );
+    // Issue #16: typed _seq (Int64) and _op (Int32) columns so
+    // external analytics engines apply the mandatory MVCC dedup
+    // projection without decoding the ikey trailer by hand.
+    assert!(
+        field_names.contains(&"_merutable_seq"),
+        "every file must expose typed _merutable_seq column"
+    );
+    assert!(
+        field_names.contains(&"_merutable_op"),
+        "every file must expose typed _merutable_op column"
+    );
+    let seq_field = arrow_schema.field_with_name("_merutable_seq").unwrap();
+    assert_eq!(seq_field.data_type(), &DataType::Int64);
+    let op_field = arrow_schema.field_with_name("_merutable_op").unwrap();
+    assert_eq!(op_field.data_type(), &DataType::Int32);
 
     // Datatype assertions: native types, not opaque blobs.
     let id_field = arrow_schema.field_with_name("id").unwrap();
