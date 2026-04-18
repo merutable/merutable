@@ -6,6 +6,7 @@ description = "Flush pipeline, read path, compaction, and engine orchestration f
 publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
+metrics              = { workspace = true }
 merutable-types    = { workspace = true }
 merutable-wal      = { workspace = true }
 merutable-memtable = { workspace = true }

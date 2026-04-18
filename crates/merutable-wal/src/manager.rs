@@ -93,8 +93,17 @@ impl WalManager {
             "WAL append"
         );
         let encoded = batch.encode();
+        let bytes = encoded.len() as u64;
         self.current.add_record(&encoded)?;
         self.current.sync()?;
+        // Issue #14 Phase-1 metrics. Off the single-record hot path
+        // (engine.put goes through write_internal, not directly
+        // through WAL.append), but WAL append/sync are themselves
+        // the durability contract; operators need visibility on
+        // sync rate and byte volume to reason about fsync overhead.
+        metrics::counter!("merutable.wal.appends_total").increment(1);
+        metrics::counter!("merutable.wal.syncs_total").increment(1);
+        metrics::counter!("merutable.wal.bytes_total").increment(bytes);
         let last = batch.last_seq().0;
         // fetch_max via CAS loop since AtomicU64 doesn't have fetch_max
         // until Rust 1.45+ is confirmed; use compare_exchange_weak for
@@ -148,6 +157,8 @@ impl WalManager {
         }
         self.current = WalWriter::new(Box::new(sink), new_log, false);
         self.log_number = new_log;
+
+        metrics::counter!("merutable.wal.rotations_total").increment(1);
 
         // Snapshot and reset the per-log max_seq counter. A log that never
         // received any writes is still a real file on disk and should be
@@ -205,18 +216,26 @@ impl WalManager {
                 path = %path.display(),
                 "GC WAL file"
             );
-            if let Err(e) = std::fs::remove_file(&path) {
-                // Treat "not found" as success — the file was already
-                // removed (possibly by a prior flush). Log the real errors
-                // at warn level; we don't fail the flush over a GC miss.
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        log = entry.log_number,
-                        error = %e,
-                        "failed to GC WAL file; will retry on next flush"
-                    );
-                    // Re-queue so a later flush can retry.
-                    self.closed_logs.lock().unwrap().push(entry);
+            match std::fs::remove_file(&path) {
+                Ok(_) => {
+                    metrics::counter!("merutable.wal.files_gcd_total").increment(1);
+                }
+                Err(e) => {
+                    // Treat "not found" as success — the file was already
+                    // removed (possibly by a prior flush). Log the real errors
+                    // at warn level; we don't fail the flush over a GC miss.
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        metrics::counter!("merutable.wal.files_gcd_total").increment(1);
+                    } else {
+                        tracing::warn!(
+                            log = entry.log_number,
+                            error = %e,
+                            "failed to GC WAL file; will retry on next flush"
+                        );
+                        metrics::counter!("merutable.errors.io_total").increment(1);
+                        // Re-queue so a later flush can retry.
+                        self.closed_logs.lock().unwrap().push(entry);
+                    }
                 }
             }
         }

@@ -6,6 +6,7 @@ description = "Iceberg v3 manifest layer, deletion vectors (Puffin), and version
 publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
+metrics             = { workspace = true }
 merutable-types   = { workspace = true }
 merutable-parquet = { workspace = true }
 iceberg           = { workspace = true }

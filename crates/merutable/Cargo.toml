@@ -7,6 +7,7 @@ keywords    = ["database", "lsm", "iceberg", "parquet", "htap"]
 license     = "Apache-2.0"
 
 [dependencies]
+metrics  = { workspace = true }
 merutable-types  = { workspace = true }
 merutable-engine = { workspace = true }
 tokio            = { workspace = true }

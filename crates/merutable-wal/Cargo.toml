@@ -6,6 +6,7 @@ description = "Write-ahead log: writer, reader, recovery, and manager for meruta
 publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
+metrics         = { workspace = true }
 merutable-types = { workspace = true }
 bytes           = { workspace = true }
 crc32fast       = { workspace = true }

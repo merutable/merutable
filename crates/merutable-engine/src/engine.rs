@@ -292,7 +292,10 @@ impl MeruEngine {
         // row was previously accepted and written, then on read
         // silently produced a phantom empty Row indistinguishable
         // from NULL.
-        row.validate(&self.schema)?;
+        if let Err(e) = row.validate(&self.schema) {
+            crate::metrics::inc(crate::metrics::SCHEMA_MISMATCH_TOTAL);
+            return Err(e);
+        }
         self.write_internal(pk_values, Some(row), OpType::Put).await
     }
 
@@ -329,13 +332,24 @@ impl MeruEngine {
         // Hard stop: `L0 >= l0_stop_trigger` → park on `l0_drained`
         // until compaction reduces L0 below the trigger. Bug Z fix:
         // register `notified()` BEFORE the check to avoid lost-wakeup.
-        loop {
-            let notify = self.l0_drained.notified();
-            let l0 = self.version_set.current().l0_file_count();
-            if l0 < self.config.l0_stop_trigger {
-                break;
+        {
+            let mut first_iter = true;
+            loop {
+                let notify = self.l0_drained.notified();
+                let l0 = self.version_set.current().l0_file_count();
+                if l0 < self.config.l0_stop_trigger {
+                    break;
+                }
+                if first_iter {
+                    // Issue #14: emit exactly once per parked writer,
+                    // not once per wake-up. Avoids inflating the
+                    // counter when a writer goes to sleep multiple
+                    // times during a single stall episode.
+                    crate::metrics::inc(crate::metrics::STALL_EVENTS_TOTAL);
+                    first_iter = false;
+                }
+                notify.await;
             }
-            notify.await;
         }
         // Graduated slowdown: `L0 >= l0_slowdown_trigger` → sleep
         // proportional to excess. Linear ramp from 0 µs at the
@@ -354,6 +368,7 @@ impl MeruEngine {
                 // already keep L0 < stop, but guard anyway.
                 let delay = (L0_MAX_DELAY_MICROS * excess.min(range)) / range;
                 if delay > 0 {
+                    crate::metrics::inc(crate::metrics::SLOWDOWN_EVENTS_TOTAL);
                     tokio::time::sleep(std::time::Duration::from_micros(delay)).await;
                 }
             }
@@ -702,23 +717,36 @@ impl MeruEngine {
             // reference it.
             let still_pinned = min_pinned.is_some_and(|m| m <= entry.obsoleted_after_snapshot);
             if still_pinned {
+                crate::metrics::inc(crate::metrics::GC_FILES_DEFERRED_BY_PIN_TOTAL);
                 remaining.push(entry);
                 continue;
             }
             // Time-based grace for external readers (DuckDB, Spark,
             // etc.) which don't participate in the pin protocol.
             if entry.obsoleted_at.elapsed() >= grace {
-                if let Err(e) = tokio::fs::remove_file(&entry.path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %entry.path.display(), error = %e,
-                              "failed to GC obsoleted file");
+                match tokio::fs::remove_file(&entry.path).await {
+                    Ok(_) => {
+                        crate::metrics::inc(crate::metrics::GC_FILES_DELETED_TOTAL);
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            crate::metrics::inc(crate::metrics::IO_ERRORS_TOTAL);
+                            warn!(path = %entry.path.display(), error = %e,
+                                  "failed to GC obsoleted file");
+                        } else {
+                            // Already gone — count as deleted so metrics
+                            // don't undercount the set of removed files.
+                            crate::metrics::inc(crate::metrics::GC_FILES_DELETED_TOTAL);
+                        }
                     }
                 }
             } else {
+                crate::metrics::inc(crate::metrics::GC_FILES_DEFERRED_BY_GRACE_TOTAL);
                 remaining.push(entry);
             }
         }
         *pending = remaining;
+        crate::metrics::inc(crate::metrics::GC_SWEEPS_TOTAL);
     }
 
     /// Pin the current snapshot for the lifetime of the returned guard

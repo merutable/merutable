@@ -78,6 +78,9 @@ impl MemtableManager {
         set.active = Arc::new(Memtable::new(new_first_seq, self.flush_threshold));
         set.immutable.push_back(sealed.clone());
         drop(set);
+        // Issue #14 Phase-1 metrics. Low-churn (rotation rate ~= flush
+        // rate), off the per-write hot path.
+        metrics::counter!("merutable.memtable.rotations_total").increment(1);
         // Bug S fix: wake any background flush workers waiting for an
         // immutable memtable to become available.
         self.immutable_available.notify_waiters();

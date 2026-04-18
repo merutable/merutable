@@ -597,6 +597,22 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     // background worker's 1-second heartbeat.
     engine.l0_drained.notify_waiters();
 
+    // Issue #14: Phase-1 metrics. Per-level counter with a static
+    // label (`level={0..5}`) — no dynamic per-key labels, matching
+    // the issue's label policy.
+    crate::metrics::inc_labeled(
+        crate::metrics::COMPACTIONS_TOTAL,
+        "input_level",
+        pick.input_level.0.to_string(),
+    );
+    crate::metrics::inc(crate::metrics::SNAPSHOTS_COMMITTED_TOTAL);
+    if !overlap_output_metas.is_empty() {
+        crate::metrics::inc_by(
+            crate::metrics::OVERLAP_PULLINS_TOTAL,
+            overlap_output_metas.len() as u64,
+        );
+    }
+
     // IMP-03: clear the row cache after compaction. Compaction rewrites
     // files and resolves MVCC versions — any entry cached from a now-obsolete
     // file could be stale. A full clear is simple and correct; the cache

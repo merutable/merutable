@@ -214,6 +214,9 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     };
     engine.version_set.install(new_version);
 
+    crate::metrics::inc(crate::metrics::FLUSHES_TOTAL);
+    crate::metrics::inc(crate::metrics::SNAPSHOTS_COMMITTED_TOTAL);
+
     info!(
         path = %parquet_path,
         num_rows,

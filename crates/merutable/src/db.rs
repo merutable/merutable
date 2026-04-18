@@ -76,6 +76,31 @@ pub struct MeruDB {
 
 impl MeruDB {
     /// Open (or create) a database instance.
+    /// Install a global `metrics` recorder. Call BEFORE `open` if
+    /// you want to receive any of the Phase-1 counters; registration
+    /// is global (per-process) and can only happen once. `metrics`
+    /// silently discards subsequent calls — the crate does not panic.
+    ///
+    /// Typical usage:
+    /// ```no_run
+    /// # use std::error::Error;
+    /// # fn example() -> Result<(), Box<dyn Error>> {
+    /// // e.g. with metrics-exporter-prometheus:
+    /// //   let handle = PrometheusBuilder::new().install_recorder()?;
+    /// //   merutable::MeruDB::install_metrics_recorder_global(Box::new(handle.recorder()));
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Passing `None` is a no-op (returns `Ok(())`). Returns an
+    /// error if the metrics crate rejects the recorder (e.g., already
+    /// set by another component).
+    pub fn install_metrics_recorder(
+        recorder: Box<dyn metrics::Recorder + Send + Sync>,
+    ) -> std::result::Result<(), metrics::SetRecorderError<Box<dyn metrics::Recorder + Send + Sync>>>
+    {
+        metrics::set_global_recorder(recorder)
+    }
+
     pub async fn open(options: OpenOptions) -> Result<Self> {
         // Issue #9: surface the full tuning matrix through
         // `OpenOptions`. Previously only 7/14 EngineConfig fields

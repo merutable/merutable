@@ -79,6 +79,12 @@ postcard   = { version = "1", features = ["use-std"] }
 once_cell = { version = "1" }
 hex       = { version = "0.4" }
 
+# Metrics facade (Issue #14). No-op when no recorder is registered,
+# so zero cost by default. Embedders opt in via
+# `OpenOptions::metrics_recorder` with a concrete exporter
+# (prometheus, opentelemetry, etc.).
+metrics = { version = "0.24" }
+
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
