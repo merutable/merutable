@@ -103,7 +103,8 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
         if entry.op_type == OpType::Delete {
             return Ok(None); // tombstone
         }
-        let row = crate::codec::decode_row(&entry.value);
+        // Issue #12: decode errors are Corruption, not silent defaults.
+        let row = crate::codec::decode_row(&entry.value)?;
         trace!(source = "memtable", "cache hit");
         return Ok(Some(row));
     }
@@ -265,8 +266,10 @@ pub fn range_scan(
         wire.extend_from_slice(&tag.to_be_bytes());
         let ikey = InternalKey::decode(&wire, &engine.schema)?;
 
+        // Issue #12: decode errors surface — the scan aborts rather
+        // than silently including an empty phantom row.
         let row: Row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
-            crate::codec::decode_row(&entry.entry.value)
+            crate::codec::decode_row(&entry.entry.value)?
         } else {
             Row::default()
         };

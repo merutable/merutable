@@ -30,20 +30,38 @@ pub fn encode_row(row: &Row) -> Result<Vec<u8>> {
 
 /// Deserialize a `Row` from bytes.
 ///
-/// - If the first byte is `POSTCARD_MARKER` (0x01): strip it and postcard-decode.
-/// - Otherwise: fall back to `serde_json` (legacy WAL data).
-/// - Empty input → `Row::default()`.
+/// - **Empty input** → `Ok(Row::default())`. This is the legitimate
+///   tombstone signal: `OpType::Delete` writes encode empty value
+///   bytes, and we need to preserve that path.
+/// - First byte `POSTCARD_MARKER` (0x01) → strip + postcard-decode.
+/// - Otherwise → `serde_json` (legacy WAL data).
+///
+/// Issue #12: any decode failure now returns `MeruError::Corruption`
+/// with a diagnostic message. The old signature returned `Row` and
+/// used `unwrap_or_default()`, silently swallowing WAL corruption
+/// and format-mismatch errors into phantom empty rows that callers
+/// treated identically to NULL — data loss without a trail. Callers
+/// now know exactly when bytes were unreadable and can surface the
+/// failure (abort recovery, alert, quarantine the file).
 #[inline]
-pub fn decode_row(bytes: &[u8]) -> Row {
+pub fn decode_row(bytes: &[u8]) -> Result<Row> {
     if bytes.is_empty() {
-        return Row::default();
+        return Ok(Row::default());
     }
     if bytes[0] == POSTCARD_MARKER {
-        // New format: postcard after the marker byte.
-        postcard::from_bytes(&bytes[1..]).unwrap_or_default()
+        postcard::from_bytes(&bytes[1..]).map_err(|e| {
+            MeruError::Corruption(format!(
+                "row postcard decode failed ({} bytes after marker): {e}",
+                bytes.len() - 1
+            ))
+        })
     } else {
-        // Legacy format: JSON.
-        serde_json::from_slice(bytes).unwrap_or_default()
+        serde_json::from_slice(bytes).map_err(|e| {
+            MeruError::Corruption(format!(
+                "row legacy-JSON decode failed ({} bytes): {e}",
+                bytes.len()
+            ))
+        })
     }
 }
 
@@ -62,7 +80,7 @@ mod tests {
         ]);
         let encoded = encode_row(&row).unwrap();
         assert_eq!(encoded[0], POSTCARD_MARKER);
-        let decoded = decode_row(&encoded);
+        let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded, row);
     }
 
@@ -75,14 +93,52 @@ mod tests {
         let json = serde_json::to_vec(&row).unwrap();
         // First byte of JSON is '{' (0x7B), not 0x01.
         assert_ne!(json[0], POSTCARD_MARKER);
-        let decoded = decode_row(&json);
+        let decoded = decode_row(&json).unwrap();
         assert_eq!(decoded, row);
     }
 
     #[test]
     fn decode_empty() {
-        let decoded = decode_row(&[]);
+        // Empty bytes = tombstone marker. Must decode to default row,
+        // NOT an error — `OpType::Delete` writes empty value bytes.
+        let decoded = decode_row(&[]).unwrap();
         assert_eq!(decoded, Row::default());
+    }
+
+    /// Issue #12 regression: decode failures must surface as
+    /// `MeruError::Corruption`, not silently collapse to empty rows.
+    #[test]
+    fn decode_corrupt_postcard_returns_corruption_error() {
+        // Marker byte + garbage postcard payload.
+        let bad = [POSTCARD_MARKER, 0xFF, 0xFF, 0xFF, 0xFF];
+        let err = decode_row(&bad).unwrap_err();
+        match err {
+            MeruError::Corruption(msg) => {
+                assert!(
+                    msg.contains("postcard decode failed"),
+                    "error message should identify postcard decode failure; got: {msg}"
+                );
+            }
+            other => panic!("expected Corruption, got {other:?}"),
+        }
+    }
+
+    /// Issue #12 regression: legacy-JSON path also returns
+    /// Corruption on malformed input (no silent default).
+    #[test]
+    fn decode_corrupt_legacy_json_returns_corruption_error() {
+        // Starts with '{' (JSON fallback) but is not valid JSON.
+        let bad = b"{not valid json}";
+        let err = decode_row(bad).unwrap_err();
+        match err {
+            MeruError::Corruption(msg) => {
+                assert!(
+                    msg.contains("legacy-JSON decode failed"),
+                    "error should identify JSON decode failure; got: {msg}"
+                );
+            }
+            other => panic!("expected Corruption, got {other:?}"),
+        }
     }
 
     #[test]

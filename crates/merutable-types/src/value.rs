@@ -47,6 +47,95 @@ impl Row {
             })
             .collect()
     }
+
+    /// Issue #12: validate a row against a schema before it enters the
+    /// write path. Three checks in order, each with a column-pointed
+    /// error message:
+    ///
+    /// 1. **Arity**: `fields.len()` must equal `schema.columns.len()`.
+    ///    A too-short or too-long row corrupts the output Parquet
+    ///    schema and makes "is this NULL or missing?" ambiguous on
+    ///    read.
+    /// 2. **Type compatibility**: each present field's `FieldValue`
+    ///    discriminant must match the column's `ColumnType`. E.g.,
+    ///    you cannot put a `Bytes` value into an `Int64` column.
+    /// 3. **NOT NULL**: a `None` in a non-nullable column is rejected.
+    ///
+    /// Called at every write entry point (put, put_batch, apply_batch,
+    /// internal engine.put) so malformed rows never reach the WAL or
+    /// memtable. Cheap — just field iteration; no allocations.
+    pub fn validate(&self, schema: &crate::schema::TableSchema) -> crate::Result<()> {
+        use crate::schema::ColumnType;
+        if self.fields.len() != schema.columns.len() {
+            return Err(crate::MeruError::SchemaMismatch(format!(
+                "row arity mismatch: got {} fields, schema has {} columns ({})",
+                self.fields.len(),
+                schema.columns.len(),
+                schema.table_name,
+            )));
+        }
+        for (idx, (field_opt, col)) in self.fields.iter().zip(schema.columns.iter()).enumerate() {
+            match field_opt {
+                None => {
+                    if !col.nullable {
+                        return Err(crate::MeruError::SchemaMismatch(format!(
+                            "column {idx} '{}' is NOT NULL but row field is None",
+                            col.name,
+                        )));
+                    }
+                }
+                Some(fv) => {
+                    let ok = matches!(
+                        (fv, &col.col_type),
+                        (FieldValue::Boolean(_), ColumnType::Boolean)
+                            | (FieldValue::Int32(_), ColumnType::Int32)
+                            | (FieldValue::Int64(_), ColumnType::Int64)
+                            | (FieldValue::Float(_), ColumnType::Float)
+                            | (FieldValue::Double(_), ColumnType::Double)
+                            | (
+                                FieldValue::Bytes(_),
+                                ColumnType::ByteArray | ColumnType::FixedLenByteArray(_)
+                            )
+                    );
+                    if !ok {
+                        return Err(crate::MeruError::SchemaMismatch(format!(
+                            "column {idx} '{}': field value type {} incompatible with column type {:?}",
+                            col.name,
+                            field_value_kind(fv),
+                            col.col_type,
+                        )));
+                    }
+                    // FixedLenByteArray length check: the PK-encoding
+                    // path also checks this, but validate here so
+                    // non-PK fixed-length columns get the same
+                    // guarantee.
+                    if let (FieldValue::Bytes(b), ColumnType::FixedLenByteArray(n)) =
+                        (fv, &col.col_type)
+                    {
+                        if b.len() != *n as usize {
+                            return Err(crate::MeruError::SchemaMismatch(format!(
+                                "column {idx} '{}': FixedLenByteArray({n}) got {} bytes",
+                                col.name,
+                                b.len(),
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn field_value_kind(fv: &FieldValue) -> &'static str {
+    match fv {
+        FieldValue::Boolean(_) => "Boolean",
+        FieldValue::Int32(_) => "Int32",
+        FieldValue::Int64(_) => "Int64",
+        FieldValue::Float(_) => "Float",
+        FieldValue::Double(_) => "Double",
+        FieldValue::Bytes(_) => "Bytes",
+    }
 }
 
 #[cfg(test)]

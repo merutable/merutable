@@ -85,6 +85,17 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         return Err(merutable_types::MeruError::Closed);
     }
 
+    // Issue #12: validate every Put row in the batch BEFORE any I/O.
+    // One invalid row aborts the whole batch with a column-pointed
+    // error — atomic-batch semantics preserved.
+    for (i, mutation) in batch.ops.iter().enumerate() {
+        if let (OpType::Put, Some(row)) = (mutation.op_type, mutation.row.as_ref()) {
+            row.validate(&engine.schema).map_err(|e| {
+                merutable_types::MeruError::SchemaMismatch(format!("batch entry {i}: {e}",))
+            })?;
+        }
+    }
+
     // Flow control #1: L0 file-count stop (Issue #5). Same contract as
     // `write_internal` — batch writes go through the same triggers so
     // a bulk load can't evade the stall by using the batch API.

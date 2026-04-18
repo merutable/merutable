@@ -287,6 +287,12 @@ impl MeruEngine {
         if self.read_only {
             return Err(MeruError::ReadOnly);
         }
+        // Issue #12: validate row shape (arity, per-column type,
+        // nullability) BEFORE anything reaches the WAL. A malformed
+        // row was previously accepted and written, then on read
+        // silently produced a phantom empty Row indistinguishable
+        // from NULL.
+        row.validate(&self.schema)?;
         self.write_internal(pk_values, Some(row), OpType::Put).await
     }
 
