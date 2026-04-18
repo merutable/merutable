@@ -618,6 +618,24 @@ impl MeruEngine {
         &self,
         target_dir: impl AsRef<std::path::Path>,
     ) -> Result<std::path::PathBuf> {
+        // Issue #24: pin the current snapshot for the lifetime of the
+        // export. Without the pin, `gc_pending_deletions()` can run
+        // concurrently (the background compaction worker's heartbeat
+        // calls it) while the export is mid-write. If compaction has
+        // obsoleted a file referenced by the exported manifest and the
+        // wall-clock grace window has elapsed, GC deletes it — the
+        // Iceberg JSON we just emitted points at a missing Parquet
+        // file. Worse, a scan immediately after the export picks up
+        // the new `Version` that still lists the deleted file and
+        // fails with ENOENT.
+        //
+        // The read path (`get`/`scan`) has had this pin since
+        // BUG-0007..0013; export_iceberg was a missed call-site in
+        // that sweep. Hold the pin until the catalog write fully
+        // returns — the Iceberg catalog also rereads the manifest
+        // internally, and every file it might touch must remain
+        // GC-ineligible under our snapshot refcount.
+        let (_pin, _version) = self.pin_current_snapshot();
         self.catalog.export_to_iceberg(target_dir).await
     }
 
