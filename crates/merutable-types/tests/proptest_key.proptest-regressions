@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5132509bc99d28e8b4114ceb8b28e6de2b7dd8fd18ecc1d25cb11746ae030c2f # shrinks to (schema, pk) = (TableSchema { table_name: "t", columns: [ColumnDef { name: "id", col_type: Int64, nullable: false }], primary_key: [0] }, [Int64(0)]), seq = SeqNum(72057594037927935), op = Delete
