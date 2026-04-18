@@ -591,6 +591,12 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     };
     engine.version_set.install(new_version);
 
+    // Issue #5: wake any writer parked on the L0 stop trigger.
+    // Over-firing is harmless (waiters re-check L0 count before
+    // proceeding); under-firing would hang the writer for up to the
+    // background worker's 1-second heartbeat.
+    engine.l0_drained.notify_waiters();
+
     // IMP-03: clear the row cache after compaction. Compaction rewrites
     // files and resolves MVCC versions — any entry cached from a now-obsolete
     // file could be stale. A full clear is simple and correct; the cache

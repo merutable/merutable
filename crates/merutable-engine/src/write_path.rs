@@ -85,7 +85,19 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         return Err(merutable_types::MeruError::Closed);
     }
 
-    // Flow control.
+    // Flow control #1: L0 file-count stop (Issue #5). Same contract as
+    // `write_internal` — batch writes go through the same triggers so
+    // a bulk load can't evade the stall by using the batch API.
+    loop {
+        let notify = engine.l0_drained.notified();
+        let l0 = engine.version_set.current().l0_file_count();
+        if l0 < engine.config.l0_stop_trigger {
+            break;
+        }
+        notify.await;
+    }
+
+    // Flow control #2: immutable-memtable queue stop.
     loop {
         let notify = engine.memtable.flush_complete.notified();
         if !engine.memtable.should_stall() {

@@ -38,6 +38,12 @@ fn test_config(tmp: &tempfile::TempDir) -> EngineConfig {
         memtable_size_bytes: 512,
         // No GC grace period in tests — delete immediately.
         gc_grace_period_secs: 0,
+        // Disable L0 stall in the shared fixture — tests that want to
+        // exercise the stall override these; tests that don't would
+        // otherwise deadlock when the small memtable produces many L0
+        // files.
+        l0_slowdown_trigger: u32::MAX as usize,
+        l0_stop_trigger: u32::MAX as usize,
         ..Default::default()
     }
 }
@@ -475,6 +481,110 @@ async fn close_data_durable_across_reopen() {
         let row = engine.get(&[FieldValue::Int64(i)]).unwrap();
         assert!(row.is_some(), "key {i} must survive close + reopen");
     }
+}
+
+/// Issue #5 regression: L0 stop trigger must block writes.
+///
+/// Before this fix, `l0_stop_trigger` was defined in config but
+/// never checked — writes proceeded regardless of L0 count. Stress
+/// test observed L0 reaching 44 files (8 past a 36-file stop trigger)
+/// with no stall or rejection.
+///
+/// The test drives this deterministically by:
+/// 1. Disabling background workers (`*_parallelism = 0`) so the only
+///    compactor is the test's explicit `compact()` call.
+/// 2. Flushing enough times to exceed the stop trigger.
+/// 3. Attempting a `put()` with a short timeout — it MUST time out
+///    (the stop trigger should block it).
+/// 4. Calling `compact()` to drain L0 — this fires `l0_drained`.
+/// 5. Confirming a subsequent `put()` completes immediately.
+#[tokio::test]
+async fn l0_stop_trigger_blocks_writes_until_drained() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.memtable_size_bytes = 64 * 1024 * 1024; // don't auto-flush
+                                                   // Tight triggers so the test produces few files.
+    config.l0_compaction_trigger = 100; // picker's score-based path off
+    config.l0_slowdown_trigger = 4;
+    config.l0_stop_trigger = 6;
+    // No background workers — deterministic timing.
+    config.flush_parallelism = 0;
+    config.compaction_parallelism = 0;
+    config.gc_grace_period_secs = 0;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Produce exactly 6 L0 files (at l0_stop_trigger = 6). Writing
+    // 7 flushes here would itself hit the stop trigger during the 7th
+    // put — the setup loop would deadlock on the very condition we're
+    // trying to test. Setup must stay strictly below the trigger.
+    for batch in 0..6i64 {
+        engine
+            .put(
+                vec![FieldValue::Int64(batch)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(batch)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{batch}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+        engine.flush().await.unwrap();
+    }
+    let l0 = engine
+        .stats()
+        .levels
+        .iter()
+        .find(|l| l.level == 0)
+        .map(|l| l.file_count)
+        .unwrap_or(0);
+    assert_eq!(
+        l0, 6,
+        "setup invariant: L0 must equal stop trigger; got {l0}"
+    );
+
+    // A put under these conditions must block indefinitely. Prove it
+    // by giving it 300ms and asserting the timeout fired.
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        engine.put(
+            vec![FieldValue::Int64(9999)],
+            Row::new(vec![Some(FieldValue::Int64(9999)), None]),
+        ),
+    )
+    .await;
+    assert!(
+        stalled.is_err(),
+        "Issue #5: put must be stalled when L0 is above stop trigger"
+    );
+
+    // Drain L0 via explicit compaction — fires l0_drained.
+    engine.compact().await.unwrap();
+
+    // L0 should now be below the stop trigger.
+    let l0_after = engine
+        .stats()
+        .levels
+        .iter()
+        .find(|l| l.level == 0)
+        .map(|l| l.file_count)
+        .unwrap_or(0);
+    assert!(
+        l0_after < 6,
+        "compact() should have drained L0 below stop trigger; got {l0_after}"
+    );
+
+    // New put completes promptly — no stall.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        engine.put(
+            vec![FieldValue::Int64(10000)],
+            Row::new(vec![Some(FieldValue::Int64(10000)), None]),
+        ),
+    )
+    .await
+    .expect("put must complete after compaction drained L0")
+    .expect("put must succeed");
+    assert!(result.0 > 0);
 }
 
 /// Issue #3 regression: compaction output is split into multiple

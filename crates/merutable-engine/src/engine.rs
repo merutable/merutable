@@ -101,6 +101,15 @@ pub struct MeruEngine {
     /// Both must hold: version-pin protects internal readers,
     /// time-grace protects external ones.
     pub(crate) pending_deletions: Mutex<Vec<PendingDelete>>,
+    /// Notified by compaction after a successful commit that reduced
+    /// the L0 file count. Writers stalled on the L0 stop trigger park
+    /// on this notify; waking them on L0 drainage (rather than on the
+    /// 1-second worker heartbeat) avoids unnecessary sleep latency on
+    /// the hot write path. Fires on compaction commit regardless of
+    /// input level — over-firing is harmless (waiters just re-check
+    /// the condition and go back to sleep) and keeps the notifier
+    /// logic simple.
+    pub(crate) l0_drained: std::sync::Arc<tokio::sync::Notify>,
     /// Multiset of snapshot_ids pinned by active internal readers.
     /// `get()` / `scan()` pin the snapshot they capture from
     /// `version_set.current()` and unpin on return via `SnapshotPin`'s
@@ -254,6 +263,7 @@ impl MeruEngine {
             read_only,
             visible_seq,
             pending_deletions: Mutex::new(Vec::new()),
+            l0_drained: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_snapshots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             closed: AtomicBool::new(false),
         });
@@ -293,7 +303,50 @@ impl MeruEngine {
             return Err(MeruError::Closed);
         }
 
-        // Flow control: graduated backpressure + hard stall.
+        // Flow control #1: L0 file-count backpressure (Issue #5).
+        //
+        // `l0_stop_trigger` and `l0_slowdown_trigger` are configured
+        // but were previously dead code — the write path only checked
+        // the immutable memtable queue, so L0 could grow unbounded
+        // during a compaction stall. Stress test observed L0 reaching
+        // 44 files (8 past the stop trigger) with writes still
+        // proceeding at full speed, directly enabling the Arrow i32
+        // overflow crash (Issue #3).
+        //
+        // Hard stop: `L0 >= l0_stop_trigger` → park on `l0_drained`
+        // until compaction reduces L0 below the trigger. Bug Z fix:
+        // register `notified()` BEFORE the check to avoid lost-wakeup.
+        loop {
+            let notify = self.l0_drained.notified();
+            let l0 = self.version_set.current().l0_file_count();
+            if l0 < self.config.l0_stop_trigger {
+                break;
+            }
+            notify.await;
+        }
+        // Graduated slowdown: `L0 >= l0_slowdown_trigger` → sleep
+        // proportional to excess. Linear ramp from 0 µs at the
+        // slowdown trigger to `L0_MAX_DELAY_MICROS` at the stop
+        // trigger. Matches RocksDB `SetupDelay()` behaviour
+        // (`db/column_family.cc` in upstream).
+        {
+            let l0 = self.version_set.current().l0_file_count();
+            let slow = self.config.l0_slowdown_trigger;
+            let stop = self.config.l0_stop_trigger;
+            if l0 >= slow && stop > slow {
+                const L0_MAX_DELAY_MICROS: u64 = 1000; // 1ms at the stop trigger.
+                let excess = (l0 - slow) as u64;
+                let range = (stop - slow) as u64;
+                // Clamp ratio to [0, 1] — the stop loop above should
+                // already keep L0 < stop, but guard anyway.
+                let delay = (L0_MAX_DELAY_MICROS * excess.min(range)) / range;
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_micros(delay)).await;
+                }
+            }
+        }
+
+        // Flow control #2: immutable-memtable queue backpressure.
         //
         // IMP-09: instead of a binary block at max_immutable, introduce a
         // graduated delay once the immutable queue is >50% full. This

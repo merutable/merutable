@@ -63,6 +63,15 @@ fn tiny_memtable_config(tmp: &TempDir) -> EngineConfig {
         wal_dir: tmp.path().join("wal"),
         // 4 KiB threshold — a handful of 512B rows crosses it.
         memtable_size_bytes: 4 * 1024,
+        // Disable the L0 stall for auto-flush regression tests: the
+        // tests deliberately produce hundreds of L0 files to stress
+        // the auto-flush path, which would (correctly) trip the stall
+        // in production config. The tests don't exercise compaction
+        // or the stall itself, so setting a very high stop trigger
+        // takes them out of the equation without disabling the
+        // mechanism globally.
+        l0_slowdown_trigger: u32::MAX as usize,
+        l0_stop_trigger: u32::MAX as usize,
         ..Default::default()
     }
 }
