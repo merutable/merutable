@@ -3,6 +3,7 @@ name    = "merutable-iceberg"
 version = "0.1.0"
 edition = "2021"
 description = "Iceberg v3 manifest layer, deletion vectors (Puffin), and version management for merutable"
+publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
 merutable-types   = { workspace = true }

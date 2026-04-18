@@ -3,6 +3,7 @@ name    = "merutable-engine"
 version = "0.1.0"
 edition = "2021"
 description = "Flush pipeline, read path, compaction, and engine orchestration for merutable"
+publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
 merutable-types    = { workspace = true }

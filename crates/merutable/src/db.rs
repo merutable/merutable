@@ -77,15 +77,32 @@ pub struct MeruDB {
 impl MeruDB {
     /// Open (or create) a database instance.
     pub async fn open(options: OpenOptions) -> Result<Self> {
+        // Issue #9: surface the full tuning matrix through
+        // `OpenOptions`. Previously only 7/14 EngineConfig fields
+        // were reachable from the public API — users who wanted to
+        // tune `level_target_bytes` / L0 triggers / parallelism /
+        // `max_compaction_bytes` / `gc_grace_period_secs` had to
+        // reach into `merutable-engine` directly, which is now
+        // `publish = false`. Every field maps 1:1 so the defaults
+        // and semantics come straight from EngineConfig.
         let config = EngineConfig {
             schema: options.schema.clone(),
             catalog_uri: options.catalog_uri.clone(),
             object_store_prefix: options.catalog_uri.clone(),
             wal_dir: options.wal_dir.clone(),
             memtable_size_bytes: options.memtable_size_mb * 1024 * 1024,
+            max_immutable_count: options.max_immutable_count,
             row_cache_capacity: options.row_cache_capacity,
+            level_target_bytes: options.level_target_bytes.clone(),
+            l0_compaction_trigger: options.l0_compaction_trigger,
+            l0_slowdown_trigger: options.l0_slowdown_trigger,
+            l0_stop_trigger: options.l0_stop_trigger,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            max_compaction_bytes: options.max_compaction_bytes,
+            flush_parallelism: options.flush_parallelism,
+            compaction_parallelism: options.compaction_parallelism,
+            gc_grace_period_secs: options.gc_grace_period_secs,
             read_only: options.read_only,
-            ..EngineConfig::default()
         };
 
         let engine = MeruEngine::open(config).await?;

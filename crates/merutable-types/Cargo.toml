@@ -3,6 +3,7 @@ name    = "merutable-types"
 version = "0.1.0"
 edition = "2021"
 description = "Core types, error handling, schema, and internal key encoding for merutable"
+publish = false  # internal crate — not a stable API surface; only `merutable` is published
 
 [dependencies]
 bytes      = { workspace = true }

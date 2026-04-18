@@ -66,8 +66,8 @@ L0 files carry both `_merutable_ikey` + `_merutable_value` (postcard blob for KV
 
 ```rust
 use merutable::{MeruDB, OpenOptions};
-use merutable::merutable_types::schema::{TableSchema, ColumnDef, ColumnType};
-use merutable::merutable_types::value::FieldValue;
+use merutable::schema::{TableSchema, ColumnDef, ColumnType};
+use merutable::value::FieldValue;
 
 #[tokio::main]
 async fn main() {
