@@ -171,6 +171,14 @@ async fn compaction_worker(
             break;
         }
 
+        // Issue #11: run the pending-deletion GC on every heartbeat,
+        // not just at the end of a successful compaction. Idle and
+        // read-heavy workloads can pile up obsoleted files from a
+        // prior compaction that never age out (time-grace elapsed but
+        // nothing triggers the sweep). This keeps the disk footprint
+        // bounded even when the LSM tree is at steady state.
+        engine.gc_pending_deletions().await;
+
         // Bug Y fix: always call `run_compaction` — it calls
         // `pick_compaction` internally which scores ALL levels (L0 and
         // L1+) and returns `None` if no compaction is needed. The old

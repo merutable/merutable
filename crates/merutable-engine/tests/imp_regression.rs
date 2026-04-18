@@ -483,6 +483,65 @@ async fn close_data_durable_across_reopen() {
     }
 }
 
+/// Issue #11 regression: `close()` must run a final GC sweep so
+/// pending deletions don't leak across process lifetimes. Without
+/// this, a compact→close sequence leaves obsoleted files on disk
+/// forever: close() tears down workers before they get a chance to
+/// run their heartbeat GC, and no later code path calls it.
+#[tokio::test]
+async fn issue11_close_sweeps_pending_deletions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(&tmp);
+    config.memtable_size_bytes = 64 * 1024 * 1024;
+    config.gc_grace_period_secs = 0;
+    let engine = MeruEngine::open(config).await.unwrap();
+
+    // Create enough L0 files to trigger an L0→L1 compaction that
+    // obsoletes the L0 files.
+    for batch in 0..5i64 {
+        for i in 0..5i64 {
+            let key = batch * 10 + i;
+            engine
+                .put(
+                    vec![FieldValue::Int64(key)],
+                    Row::new(vec![
+                        Some(FieldValue::Int64(key)),
+                        Some(FieldValue::Bytes(bytes::Bytes::from(format!("v{key}")))),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+    }
+    engine.compact().await.unwrap();
+
+    let l0_dir = tmp.path().join("data").join("L0");
+    // Count files at this moment; compact has queued the originals
+    // for deletion. With gc_grace_period_secs=0 they should be
+    // deletable now, but whether the compaction's post-commit GC
+    // actually ran depends on timing.
+    let _pre_close_files = std::fs::read_dir(&l0_dir)
+        .map(|it| it.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+
+    engine.close().await.unwrap();
+
+    // After close(), the L0 directory should contain no leaked
+    // obsoleted files — the close-path GC sweep drained them.
+    let post_close_files = std::fs::read_dir(&l0_dir)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        post_close_files, 0,
+        "Issue #11: close() must sweep pending deletions; {post_close_files} L0 files leaked",
+    );
+}
+
 /// Issue #10 regression: read-only replica's row cache must be
 /// cleared on refresh() so stale values aren't served after the
 /// primary overwrites or deletes keys.

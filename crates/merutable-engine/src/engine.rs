@@ -806,6 +806,12 @@ impl MeruEngine {
             wal.sync()?;
         }
 
+        // Issue #11: drain any queued deletions whose grace period
+        // has elapsed. Background workers are already being shut down
+        // at the MeruDB layer, so this may be the last chance to
+        // clean up obsoleted files before the engine goes away.
+        self.gc_pending_deletions().await;
+
         info!("engine closed — all data flushed and synced");
         Ok(())
     }
