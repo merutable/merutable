@@ -106,25 +106,32 @@ pub fn pick_compaction(
     // Select input files.
     //
     // Memory cap: `config.max_compaction_bytes` bounds how much input
-    // a single compaction loads into memory. The current compaction
-    // job reads whole Parquet files into `Bytes` buffers before the
-    // merge, so unbounded input selection = unbounded RSS. A stress
-    // test with 75 L0 files × 64 MiB each would otherwise pull ~5 GiB
+    // a single compaction loads into memory. The compaction job reads
+    // whole Parquet files into `Bytes` buffers before the merge, so
+    // unbounded input selection = unbounded RSS. A stress test with
+    // a 16 GiB L3 would otherwise pull the entire level into memory
     // per compaction; with parallel workers this multiplies.
     //
-    // For L0: take oldest-first (seq_min ASC) until the cumulative
-    // file size would exceed the cap. At least one file is always
-    // picked so progress is guaranteed. Remaining L0 files stay at
-    // L0 and are drained by the next iteration of the
-    // `run_compaction` loop (which re-picks with the same cap).
+    // The strategy differs by level type because the file layout does:
     //
-    // For L1+: the picker always does full-level compaction (current
-    // design), so capping would require partial-range picking — out
-    // of scope here. If total input exceeds the cap by >4×, the cap
-    // is relaxed with a debug log; tune `max_compaction_bytes` or
-    // `level_target_bytes` if deep-level compactions OOM.
+    // - **L0 files can overlap**: any subset is a valid compaction.
+    //   Take oldest-first (seq_min ASC) so newer data stays visible
+    //   in L0 while older data flows to L1.
+    //
+    // - **L1+ files are non-overlapping, sorted by key_min**: picking
+    //   a non-contiguous subset would force the overlap pull-in at
+    //   the output level to span the entire level (breaking the cap).
+    //   Instead, take a contiguous prefix from the sorted file list;
+    //   the overlap pull-in is then bounded by the selected range's
+    //   key span (at most `~10× max_compaction_bytes` given standard
+    //   level-size multipliers).
+    //
+    // Progress guarantee: always take at least one file, even if it
+    // exceeds the cap on its own. Remaining files stay at the current
+    // level and are drained by the next iteration of the
+    // `run_compaction` loop.
+    let max_bytes = config.max_compaction_bytes;
     let input_files: Vec<String> = if best_level == Level(0) {
-        let max_bytes = config.max_compaction_bytes;
         let mut l0: Vec<&merutable_iceberg::version::DataFileMeta> =
             version.files_at(Level(0)).iter().collect();
         // Sort oldest-first by seq_min so the picked subset is the
@@ -135,8 +142,6 @@ pub fn pick_compaction(
         let mut total = 0u64;
         let mut picked = Vec::new();
         for f in l0 {
-            // Always take at least one file so we make progress even
-            // if a single file exceeds the cap.
             if !picked.is_empty() && total.saturating_add(f.meta.file_size) > max_bytes {
                 break;
             }
@@ -145,14 +150,30 @@ pub fn pick_compaction(
         }
         picked
     } else {
-        // For L1+, pick files that overlap with the output level's boundary.
-        // Simplified: pick all files at this level (full-level compaction).
-        // A real implementation would be more selective.
-        version
-            .files_at(best_level)
-            .iter()
-            .map(|f| f.path.clone())
-            .collect()
+        // L1+: contiguous prefix by key_min (the level's intrinsic
+        // order — see Manifest::to_version), capped by total bytes.
+        // Issue #2: this prevents a single L2→L3 or L3→L4 compaction
+        // from pulling a multi-GiB level entirely into memory. The
+        // same range is compacted in the next iteration of the loop
+        // with the next prefix, so the level drains predictably.
+        //
+        // Note: contiguous-from-start always picks the lowest-key
+        // range first. For hot-key workloads concentrated at one end
+        // of the key space, this produces uneven compaction
+        // frequency. A rotating compaction cursor (Pebble's
+        // `compact_cursor_`) is the textbook mitigation but is out of
+        // scope here — the memory-safety invariant is the priority.
+        let files = version.files_at(best_level);
+        let mut total = 0u64;
+        let mut picked = Vec::new();
+        for f in files.iter() {
+            if !picked.is_empty() && total.saturating_add(f.meta.file_size) > max_bytes {
+                break;
+            }
+            total = total.saturating_add(f.meta.file_size);
+            picked.push(f.path.clone());
+        }
+        picked
     };
 
     if input_files.is_empty() {
@@ -438,6 +459,80 @@ mod tests {
             !pick.input_files.is_empty(),
             "L0 pick must always take at least one file to make progress"
         );
+    }
+
+    /// Issue #2 regression: L1+ picker must also cap total input bytes
+    /// at `config.max_compaction_bytes`. A 16 GiB L3 compaction would
+    /// otherwise load the whole level into memory (BUG-0002 at 32 GB
+    /// RSS / 10 GB data). Fix: contiguous prefix by key_min, bounded
+    /// by the cap.
+    #[test]
+    fn l1plus_pick_caps_at_max_compaction_bytes() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            max_compaction_bytes: 256 * 1024 * 1024, // 256 MiB cap.
+            ..EngineConfig::default()
+        };
+
+        // 20 L2 files × 512 MiB = 10 GiB — far over cap, above target.
+        for i in 0..20 {
+            let mut f = make_file(&format!("l2_{i}.parquet"), 2, 100_000, 512 * 1024 * 1024);
+            // Distinct key ranges so they're non-overlapping.
+            f.meta.key_min = vec![i as u8];
+            f.meta.key_max = vec![i as u8, 0xFF];
+            v.levels.entry(Level(2)).or_default().push(f);
+        }
+        // Manifest::to_version sorts L1+ by key_min ASC; mimic that.
+        v.levels
+            .get_mut(&Level(2))
+            .unwrap()
+            .sort_by(|a, b| a.meta.key_min.cmp(&b.meta.key_min));
+
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        assert_eq!(pick.input_level, Level(2));
+        // 256 MiB cap / 512 MiB per file → at most one file per pick
+        // (the first crosses the cap on its own; always picks at least one).
+        assert_eq!(
+            pick.input_files.len(),
+            1,
+            "L2 pick must respect max_compaction_bytes; got {} files \
+             (cap=256MiB, 512MiB each, should pick exactly 1)",
+            pick.input_files.len()
+        );
+    }
+
+    /// L1+ pick is a CONTIGUOUS prefix by key_min, not a random subset.
+    /// Non-contiguous selection would force the overlap pull-in at the
+    /// output level to span the whole level, defeating the cap.
+    #[test]
+    fn l1plus_pick_is_contiguous_prefix() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            max_compaction_bytes: 300 * 1024 * 1024, // fits 3× 100 MiB files.
+            ..EngineConfig::default()
+        };
+
+        // 30 files × 100 MiB = 3 GiB — above L2 target (2 GiB) so the
+        // picker scores L2 > 1.0 and selects it.
+        for i in 0..30 {
+            let mut f = make_file(&format!("l2_{i:02}.parquet"), 2, 100_000, 100 * 1024 * 1024);
+            f.meta.key_min = vec![i as u8];
+            f.meta.key_max = vec![i as u8, 0xFF];
+            v.levels.entry(Level(2)).or_default().push(f);
+        }
+        v.levels
+            .get_mut(&Level(2))
+            .unwrap()
+            .sort_by(|a, b| a.meta.key_min.cmp(&b.meta.key_min));
+
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        assert_eq!(pick.input_level, Level(2));
+        // 300 MiB cap / 100 MiB per file = 3 files exactly.
+        assert_eq!(pick.input_files.len(), 3, "expected 3 files under cap");
+        // Must be the FIRST three (lowest key_min), proving contiguous prefix.
+        assert_eq!(pick.input_files[0], "l2_00.parquet");
+        assert_eq!(pick.input_files[1], "l2_01.parquet");
+        assert_eq!(pick.input_files[2], "l2_02.parquet");
     }
 
     /// Progress guarantee: even if a single L0 file exceeds the cap,
