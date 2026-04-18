@@ -66,6 +66,7 @@ use crate::manifest::{Manifest, ManifestEntry};
 pub fn to_iceberg_v2_table_metadata(manifest: &Manifest, table_location: &str) -> Value {
     let schema_json = to_iceberg_schema_v2(&manifest.schema, 0);
     let last_column_id = manifest.schema.columns.len() as i32;
+    let sort_order = to_iceberg_sort_order_v2(&manifest.schema, 1);
 
     // The manifest-list path is conventional: every Iceberg snapshot
     // references one manifest-list file. We emit a deterministic path
@@ -114,11 +115,21 @@ pub fn to_iceberg_v2_table_metadata(manifest: &Manifest, table_location: &str) -
             "fields": []
         }],
         "last-partition-id": 999i32,
-        "default-sort-order-id": 0i32,
-        "sort-orders": [{
-            "order-id": 0i32,
-            "fields": []
-        }],
+        // merutable writes every Parquet file in strict (_merutable_ikey
+        // ASC) order, which encodes (PK ASC, seq DESC). The user-visible
+        // effect — and the part an Iceberg sort-order can express — is
+        // PK ASC. Issue #20: projecting this lets Iceberg-aware engines
+        // (DuckDB, Spark, Trino) apply streaming "first row per partition"
+        // for the MVCC dedup projection (docs/HTAP_READS.md) instead of
+        // a full sort, turning an O(N log N) scan into O(N).
+        "default-sort-order-id": 1i32,
+        "sort-orders": [
+            // Iceberg requires order-id 0 to exist as the "unsorted"
+            // sentinel; table-metadata validators reject the file
+            // without it. order-id 1 is our real sort.
+            {"order-id": 0i32, "fields": []},
+            sort_order,
+        ],
         "properties": all_properties(manifest),
         "current-snapshot-id": manifest.snapshot_id,
         "snapshots": [snapshot],
@@ -186,6 +197,43 @@ pub fn to_iceberg_schema_v2(schema: &TableSchema, schema_id: i32) -> Value {
     })
 }
 
+/// Project merutable's sort discipline (`_merutable_ikey` ASC, which
+/// encodes `(PK ASC, seq DESC)`) onto an Iceberg v2 sort-order entry.
+///
+/// External engines that recognize the sort order apply streaming
+/// partition-aware reductions — specifically, the mandatory MVCC
+/// dedup projection in `docs/HTAP_READS.md` collapses from an
+/// O(N log N) full sort to an O(N) streaming pass.
+///
+/// We express only the PK ASC part. The seq DESC tail is embedded in
+/// `_merutable_ikey` but `_merutable_ikey` is not in the public
+/// Iceberg schema — we cannot reference it from a sort-order field.
+/// External engines don't need the seq dimension to do streaming
+/// dedup; they just need to know the PK is monotonic within a file.
+pub fn to_iceberg_sort_order_v2(schema: &TableSchema, order_id: i32) -> Value {
+    let fields: Vec<Value> = schema
+        .primary_key
+        .iter()
+        .map(|&col_idx| {
+            let source_id = (col_idx + 1) as i32;
+            json!({
+                "transform": "identity",
+                "source-id": source_id,
+                "direction": "asc",
+                // Iceberg v2 requires one of "nulls-first" / "nulls-last".
+                // merutable PK columns are always non-null (validated at
+                // write time), so either is acceptable; "nulls-first" is
+                // the spec's default for ascending.
+                "null-order": "nulls-first"
+            })
+        })
+        .collect();
+    json!({
+        "order-id": order_id,
+        "fields": fields,
+    })
+}
+
 fn column_type_to_iceberg(ct: &ColumnType) -> Value {
     match ct {
         ColumnType::Boolean => json!("boolean"),
@@ -221,16 +269,23 @@ pub fn to_iceberg_data_file_v2(entry: &ManifestEntry) -> Value {
             "partition": {},
             "record_count": meta.num_rows,
             "file_size_in_bytes": meta.file_size,
-            // Empty column stats — merutable tracks key-level bounds
-            // (key_min/key_max), not per-column Iceberg lower/upper bounds.
-            // Filling these is follow-on work; unset is a spec-valid state.
+            // Per-column statistics (column_sizes, value_counts,
+            // null_value_counts, lower_bounds, upper_bounds) require
+            // hoisting the Parquet row-group stats into ParquetFileMeta.
+            // That plumbing is Issue #20 Part 2 (separable PR). Unset
+            // is spec-valid; engines fall back to per-file filtering
+            // using the file-level key range indirectly via the sort
+            // order (Part 1, this PR).
             "column_sizes": {},
             "value_counts": {},
             "null_value_counts": {},
             "lower_bounds": {},
             "upper_bounds": {},
             "split_offsets": [],
-            "sort_order_id": 0,
+            // Every data file written by merutable adheres to the
+            // PK-ASC sort order (order-id 1). order-id 0 is Iceberg's
+            // "unsorted" sentinel.
+            "sort_order_id": 1,
         }
     })
 }
@@ -506,6 +561,50 @@ mod tests {
         assert_eq!(v["data_file"]["file_path"], "data/L1/foo.parquet");
         assert_eq!(v["data_file"]["record_count"], 123);
         assert_eq!(v["data_file"]["file_size_in_bytes"], 4567);
+    }
+
+    /// Issue #20 Part 1: the emitted sort-order references the PK
+    /// columns by Iceberg field id, in the declared PK order, all ASC.
+    /// Iceberg-aware engines use this to apply streaming "first row
+    /// per partition" for the MVCC dedup projection.
+    #[test]
+    fn sort_order_projects_primary_key_asc() {
+        let m = sample_manifest();
+        let v = to_iceberg_v2_table_metadata(&m, "file:///tmp/events");
+
+        // Two sort-orders emitted: 0 (unsorted sentinel) + 1 (real).
+        let orders = v["sort-orders"].as_array().unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0]["order-id"], 0);
+        assert!(orders[0]["fields"].as_array().unwrap().is_empty());
+
+        let real = &orders[1];
+        assert_eq!(real["order-id"], 1);
+        let fields = real["fields"].as_array().unwrap();
+        // sample_manifest uses primary_key: vec![0] → one PK column,
+        // Iceberg field id 1.
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["source-id"], 1);
+        assert_eq!(fields[0]["direction"], "asc");
+        assert_eq!(fields[0]["transform"], "identity");
+        // Table-level default-sort-order-id points at our real order.
+        assert_eq!(v["default-sort-order-id"], 1);
+    }
+
+    /// Per-file manifest entries must declare adherence to the real
+    /// sort order (id 1), not the unsorted sentinel (id 0).
+    #[test]
+    fn data_file_adheres_to_pk_sort_order() {
+        let entry = ManifestEntry {
+            path: "data/L1/foo.parquet".into(),
+            meta: file_meta(1, 10, 1000),
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+            status: "added".into(),
+        };
+        let v = to_iceberg_data_file_v2(&entry);
+        assert_eq!(v["data_file"]["sort_order_id"], 1);
     }
 
     #[test]
