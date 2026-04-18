@@ -5,8 +5,13 @@ symptom, the root cause, and the anti-pattern to avoid in future code.
 
 ## 1. Config knobs with no enforcement
 
-**Seen in**: Issue #2 (`max_compaction_bytes` defined but unused), Issue #5
-(`l0_slowdown_trigger` / `l0_stop_trigger` defined but not checked).
+**Seen in**:
+- Issue #2 (`max_compaction_bytes` defined but unused in the picker).
+- Issue #5 (`l0_slowdown_trigger` / `l0_stop_trigger` defined but not
+  checked by the write path).
+- Issue #4 (`compaction_parallelism` promised N workers but
+  `BackgroundWorkers::spawn` was never called from `MeruDB::open`,
+  so every deployment ran single-threaded regardless).
 
 **Symptom**: Users tune a knob expecting a behaviour change; nothing
 changes. Docs lie; debugging wastes hours.
@@ -183,6 +188,51 @@ referenced by this snapshot".
 `pin_current_snapshot()` → get `(SnapshotPin, Arc<Version>)`. The
 guard participates in GC's watermark (`min_pinned_snapshot`). Drop
 guard → GC can advance.
+
+## 11. `Notify::notify_waiters` race across registration windows
+
+**Seen in**: Issue #4 — `MeruDB::close` hung under `tokio::test`'s
+default `current_thread` runtime because background workers missed
+the shutdown notification.
+
+**Symptom**: `JoinHandle::await` never completes. Works on
+multi-thread runtimes (worker gets scheduled, times out after 1s,
+re-enters select, picks up a fresh `notified()`); deadlocks on
+single-thread runtimes (worker never gets scheduled because close()
+is awaiting its handle).
+
+**Anti-pattern**: Using `tokio::sync::Notify::notify_waiters()` as
+the sole shutdown signal. `notify_waiters()` only wakes tasks
+CURRENTLY registered as waiters via `notified().await` — any task
+between iterations of its select has missed the notification.
+
+**Discipline**: Dual signal. `AtomicBool` flag for state, `Notify`
+for wake-up. `shutdown()` sets flag FIRST, then notifies. Worker
+checks flag at top of loop and inside select. A worker that missed
+the notify sees the flag on its next iteration; a worker that got
+the notify exits via the select branch. Both paths deterministic.
+
+Alternative: `tokio_util::sync::CancellationToken` — proper
+semantics, but adds a dep. The flag+notify pattern is in-tree.
+
+## 12. Output-size limits in downstream libraries
+
+**Seen in**: Issue #3 — Arrow's `BinaryArray` uses i32 offsets,
+capping a single column's concatenated bytes at ~2.14 GiB. A
+compaction output with >2 GiB of a ByteArray column panicked
+unrecoverably.
+
+**Symptom**: A stress test crashes ~10 GiB in. No warning before
+the limit; the panic is in third-party library code.
+
+**Anti-pattern**: Using a library's default type without reading
+its interface contract. "Normal" doesn't mean "unbounded."
+
+**Discipline**: For every downstream type, find the hard limit
+(i32? i64? page size? memory cap?) and size our own thresholds
+below it with a generous margin (4× in our case). Capping at the
+producer (what we write) is safer than relying on the consumer
+to handle overflow.
 
 ## Process lessons
 

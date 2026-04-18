@@ -22,7 +22,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 `IcebergCatalog` manages the single table's native manifest chain (`metadata/v{N}.metadata.json` + `version-hint.text`). The manifest is a superset of Iceberg v2 `TableMetadata` — every field Iceberg needs (`table_uuid`, `last_updated_ms`, `parent_snapshot_id`, `sequence_number`, `schemas[]`) is already stored, so projection is a pure function with no data loss. Catalog integration (Hive, Glue, REST, etc.) is an external layer on top — merutable provides the table artifacts, not the catalog service.
 
-**Write path**: Under WAL lock: sequence allocate → WAL append → memtable insert → advance `visible_seq`. Flush when threshold crossed. Each flush writes a new Parquet SST (fsynced), then commits a new `v{N}.metadata.json` and installs a new `Version` via `ArcSwap`.
+**Write path**: Under WAL lock: sequence allocate → WAL append → memtable insert → advance `visible_seq`. Writes back off when the L0 file count or immutable-memtable queue crosses configured thresholds (graduated slowdown → hard stop). Flush when threshold crossed. Each flush writes a new Parquet SST (fsynced), then commits a new `v{N}.metadata.json` and installs a new `Version` via `ArcSwap`. `MeruDB::open` spawns configurable background workers (`flush_parallelism`, `compaction_parallelism`) so flushes and compactions run continuously without needing caller intervention.
 
 **Read path**: Memtable (active + immutable queue) → L0 files (bloom → `KvSparseIndex` page skip → scan) → L1..LN (bloom → `KvSparseIndex` → binary search).
 
