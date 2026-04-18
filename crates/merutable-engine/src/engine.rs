@@ -566,6 +566,16 @@ impl MeruEngine {
     /// new manifest exist on disk before swapping the version. If any file is
     /// missing (e.g. not yet replicated), the refresh is rejected and the
     /// current version stays in place.
+    ///
+    /// Issue #6: `visible_seq` is also advanced to the new manifest's
+    /// max sequence number. Without this, the replica's `read_seq()`
+    /// stays pinned at the open-time value and filters out any row
+    /// whose seq was allocated after the replica opened — the replica
+    /// would silently hide data that the primary wrote. The
+    /// `set_at_least` semantic (monotonic, non-decreasing) guarantees
+    /// we never regress `visible_seq` if a refresh happens to pick up
+    /// an older snapshot (shouldn't happen in practice, but the guard
+    /// is cheap).
     pub async fn refresh(&self) -> Result<()> {
         let new_version = self.catalog.refresh(self.schema.clone()).await?;
 
@@ -591,8 +601,23 @@ impl MeruEngine {
             }
         }
 
+        // Advance visible_seq (and global_seq) so the read path accepts
+        // any row newly introduced by the primary. Must be done BEFORE
+        // installing the new version — once a reader observes the new
+        // version, it must see consistent read_seq/files.
+        let new_max_seq: u64 = new_version
+            .levels
+            .values()
+            .flat_map(|files| files.iter().map(|f| f.meta.seq_max))
+            .max()
+            .unwrap_or(0);
+        if new_max_seq > 0 {
+            self.visible_seq.set_at_least(new_max_seq);
+            self.global_seq.set_at_least(new_max_seq + 1);
+        }
+
         self.version_set.install(new_version);
-        info!("version refreshed from disk");
+        info!(new_max_seq, "version refreshed from disk");
         Ok(())
     }
 

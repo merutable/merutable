@@ -483,6 +483,76 @@ async fn close_data_durable_across_reopen() {
     }
 }
 
+/// Issue #6 regression: read-only replica refresh() must see new
+/// data written by the primary.
+///
+/// Sequence:
+/// 1. Primary writes keys 0-49 and flushes.
+/// 2. Read-only replica opens and verifies visibility of 0-49.
+/// 3. Primary writes 50-99 and flushes.
+/// 4. Replica calls refresh().
+/// 5. Replica reads 50-99 — must see all of them.
+#[tokio::test]
+async fn issue6_readonly_refresh_picks_up_new_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config_rw = test_config(&tmp);
+    // Big memtable so setup produces exactly two L0 files (one per
+    // explicit flush), no auto-flush races with background tasks.
+    config_rw.memtable_size_bytes = 64 * 1024 * 1024;
+    let mut config_ro = config_rw.clone();
+    config_ro.read_only = true;
+
+    let primary = MeruEngine::open(config_rw.clone()).await.unwrap();
+    for i in 0..50i64 {
+        primary
+            .put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("first_{i}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+    }
+    primary.flush().await.unwrap();
+
+    let replica = MeruEngine::open(config_ro.clone()).await.unwrap();
+    for i in 0..50i64 {
+        let row = replica.get(&[FieldValue::Int64(i)]).unwrap();
+        assert!(row.is_some(), "pre-refresh: replica missing key {i}");
+    }
+
+    // Second batch on primary.
+    for i in 50..100i64 {
+        primary
+            .put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("second_{i}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+    }
+    primary.flush().await.unwrap();
+
+    replica.refresh().await.unwrap();
+
+    let mut missing = Vec::new();
+    for i in 0..100i64 {
+        let row = replica.get(&[FieldValue::Int64(i)]).unwrap();
+        if row.is_none() {
+            missing.push(i);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "Issue #6: replica missing keys after refresh: {missing:?}",
+    );
+}
+
 /// Narrow diagnostic for Issue #7 (kept as a fast smoke test
 /// alongside the full roundtrip): exercise empty and single-null
 /// PKs at each stage of the lifecycle.
