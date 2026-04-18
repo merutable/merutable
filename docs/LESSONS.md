@@ -396,6 +396,40 @@ drop can't *wait* for termination, but it can *signal* and *cancel*
 within microseconds, which is all we need to release held state at
 the next scheduler yield.
 
+## 20. Recovery must register, not just replay
+
+**Seen in**: Issue #22 — WAL recovery correctly replayed every batch
+from surviving WAL files into the memtable, but the new `WalManager`
+started with an empty `closed_logs` list. The first post-recovery
+flush's `mark_flushed_seq()` had no orphan logs to GC. Orphan files
+persisted across every subsequent reopen and were re-replayed every
+time. Eventually, a racing background compaction + stale seqs in the
+re-replayed memtable produced silent data loss (memtable entries
+carried pre-compaction seqs, merged below the compaction output,
+were dropped as "older versions of same key").
+
+**Symptom**: Storage that accumulates forever and data that silently
+vanishes — the combination is particularly dangerous because the
+storage leak is obvious on inspection but the data loss only shows
+up under concurrency stress.
+
+**Anti-pattern**: "Recovery is the act of reading" — as if nothing
+needs to change in the post-recovery state machine. In LSM engines,
+recovery must *rehydrate* the same bookkeeping a warm write path
+would have produced: closed-log registration, seq watermark,
+flushed-seq hint, pending-deletion queue. The replay-into-memtable
+step is only half the job.
+
+**Discipline**: Every reopen path ends with "does the in-memory
+state now match what a steady-state warm instance would have for
+the same on-disk state?" Write the assertion as code when possible
+(e.g. a recover invariant: `closed_logs.len() == disk_wal_files -
+1`). In merutable's case, the fix was to register every pre-existing
+WAL file (log_num < next_log) as a closed log with the recovered
+max_seq; a single `mark_flushed_seq` after the first post-recovery
+flush then sweeps them off disk, returning the engine to the clean
+steady-state file count.
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible

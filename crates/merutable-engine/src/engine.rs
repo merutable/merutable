@@ -237,6 +237,38 @@ impl MeruEngine {
         }
         let wal = WalManager::open(&config.wal_dir, next_log)?;
 
+        // Issue #22: register every recovered WAL file (log_num < next_log)
+        // as a closed log so the first `mark_flushed_seq()` after
+        // recovery GCs it. Without this, orphaned WAL files from prior
+        // crashes persist indefinitely, are re-replayed on every
+        // subsequent reopen, and — in the presence of racing
+        // background compaction — create a window for stale-seq
+        // memtable entries to shadow freshly-compacted L1 output.
+        // Net effect on the original reproducer was 50 rows lost per
+        // crash cycle. `max_log_number + 1 == next_log`, so any file
+        // at `log_num < next_log` is an orphan from before the new
+        // WalManager opened its own file.
+        if !read_only {
+            match WalManager::list_wal_files(&config.wal_dir) {
+                Ok(files) => {
+                    for (log_num, _path) in files {
+                        if log_num < next_log {
+                            wal.register_closed_log(log_num, wal_max_seq);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal — GC will still happen lazily via
+                    // gc_logs_before after the first Iceberg commit,
+                    // but the fast path won't fire. Log and continue.
+                    tracing::warn!(
+                        error = %e,
+                        "failed to enumerate WAL dir for orphan registration"
+                    );
+                }
+            }
+        }
+
         let row_cache = if config.row_cache_capacity > 0 {
             Some(crate::cache::RowCache::new(config.row_cache_capacity))
         } else {

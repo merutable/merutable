@@ -259,6 +259,33 @@ impl WalManager {
         Ok(())
     }
 
+    /// Issue #22: register a previously-recovered WAL file as a closed
+    /// log eligible for GC. Called by the engine's open path after
+    /// `recover_from_dir()` so that the first `mark_flushed_seq()`
+    /// after recovery sweeps the orphaned log files off disk. Without
+    /// this registration, recovered WAL files persist forever and are
+    /// re-replayed on every subsequent reopen — eventually racing
+    /// background compaction into a data-loss window (see #22).
+    ///
+    /// `max_seq` should be the highest sequence number that appears in
+    /// the recovered file; the engine plumbs `wal_max_seq` from
+    /// `recover_from_dir` here, which is a conservative upper bound
+    /// (ok: the first flush commit carries all recovered seqs too).
+    pub fn register_closed_log(&self, log_number: u64, max_seq: SeqNum) {
+        let mut closed = self.closed_logs.lock().unwrap();
+        closed.push(ClosedLog {
+            log_number,
+            max_seq,
+        });
+    }
+
+    /// Iterate the WAL files on disk. Returns `(log_number, path)` pairs
+    /// so the engine can discover which files recovery produced. Exposed
+    /// publicly for Issue #22's orphan-registration path.
+    pub fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+        wal_files_in_dir(dir)
+    }
+
     /// Recover all valid `WriteBatch`es from a WAL directory in log-number order.
     /// Returns `(batches, max_seq, max_log_number)`:
     /// - `batches`: all successfully decoded `WriteBatch`es in log order.
