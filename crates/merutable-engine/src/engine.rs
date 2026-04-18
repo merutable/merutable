@@ -626,6 +626,20 @@ impl MeruEngine {
         }
 
         self.version_set.install(new_version);
+
+        // Issue #10: clear the row cache after version install so the
+        // replica doesn't serve stale values for keys the primary
+        // overwrote or deleted. The cache is populated from Parquet
+        // file reads during point lookups; on the primary, writes
+        // invalidate per-key and compaction clears wholesale, but a
+        // read-only replica has no writes and no compactions — so
+        // without this call, a cached value from the old version
+        // survives every subsequent refresh. Same pattern as the
+        // post-compaction cache clear in `compaction/job.rs`.
+        if let Some(ref cache) = self.row_cache {
+            cache.clear();
+        }
+
         info!(new_max_seq, "version refreshed from disk");
         Ok(())
     }

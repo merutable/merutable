@@ -483,6 +483,91 @@ async fn close_data_durable_across_reopen() {
     }
 }
 
+/// Issue #10 regression: read-only replica's row cache must be
+/// cleared on refresh() so stale values aren't served after the
+/// primary overwrites or deletes keys.
+///
+/// The primary writes v1, flushes. Replica reads v1 (populating
+/// its cache). Primary writes v2 over the same keys AND deletes
+/// one key. Replica refreshes and reads:
+///   - Overwritten key must return v2.
+///   - Deleted key must return None.
+/// Without clearing the cache, both reads return the stale v1.
+#[tokio::test]
+async fn issue10_readonly_refresh_clears_row_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config_rw = test_config(&tmp);
+    config_rw.memtable_size_bytes = 64 * 1024 * 1024;
+    config_rw.row_cache_capacity = 1000;
+    let mut config_ro = config_rw.clone();
+    config_ro.read_only = true;
+
+    let primary = MeruEngine::open(config_rw.clone()).await.unwrap();
+    for i in 0..20i64 {
+        primary
+            .put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("v1_{i}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+    }
+    primary.flush().await.unwrap();
+
+    let replica = MeruEngine::open(config_ro.clone()).await.unwrap();
+    // Prime the cache: read a few keys.
+    for i in [3i64, 5, 7] {
+        let row = replica.get(&[FieldValue::Int64(i)]).unwrap().unwrap();
+        match row.get(1) {
+            Some(FieldValue::Bytes(b)) => assert_eq!(
+                b.as_ref(),
+                format!("v1_{i}").as_bytes(),
+                "expected v1 before refresh"
+            ),
+            _ => panic!("unexpected field type"),
+        }
+    }
+
+    // Primary overwrites and deletes.
+    for i in 0..20i64 {
+        primary
+            .put(
+                vec![FieldValue::Int64(i)],
+                Row::new(vec![
+                    Some(FieldValue::Int64(i)),
+                    Some(FieldValue::Bytes(bytes::Bytes::from(format!("v2_{i}")))),
+                ]),
+            )
+            .await
+            .unwrap();
+    }
+    primary.delete(vec![FieldValue::Int64(5)]).await.unwrap();
+    primary.flush().await.unwrap();
+
+    replica.refresh().await.unwrap();
+
+    // Overwritten key: must return v2, not cached v1.
+    let row = replica.get(&[FieldValue::Int64(3)]).unwrap().unwrap();
+    match row.get(1) {
+        Some(FieldValue::Bytes(b)) => assert_eq!(
+            b.as_ref(),
+            b"v2_3",
+            "Issue #10: cache must be cleared on refresh; got stale value"
+        ),
+        _ => panic!("unexpected field type"),
+    }
+
+    // Deleted key: must return None, not cached v1.
+    let row = replica.get(&[FieldValue::Int64(5)]).unwrap();
+    assert!(
+        row.is_none(),
+        "Issue #10: deleted key must return None after refresh; cache was serving stale data"
+    );
+}
+
 /// Issue #6 regression: read-only replica refresh() must see new
 /// data written by the primary.
 ///
