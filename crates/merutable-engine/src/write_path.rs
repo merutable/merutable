@@ -178,7 +178,10 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         let should_flush = engine.memtable.apply_batch(&wal_batch)?;
 
         // Advance visible_seq now that the data is in the memtable.
-        engine.visible_seq.set_at_least(base_seq.0 + batch_len);
+        // Issue #8: visible_seq is the highest visible seq (inclusive).
+        // A batch of N ops uses seqs [base, base+1, ..., base+N-1];
+        // the highest (= new frontier) is base + N - 1.
+        engine.visible_seq.set_at_least(base_seq.0 + batch_len - 1);
 
         (base_seq, should_flush)
     };
@@ -281,10 +284,13 @@ mod tests {
             ..Default::default()
         };
         let engine = crate::engine::MeruEngine::open(config).await.unwrap();
+        let pre = engine.read_seq();
         let batch = MutationBatch::new();
         let seq = apply_batch(&engine, batch).await.unwrap();
-        // Should return current seq without advancing.
-        assert!(seq.0 > 0);
+        // Should return the current visible seq WITHOUT advancing (Issue #8:
+        // visible_seq is the inclusive-latest-visible frontier; for a fresh
+        // engine that's 0).
+        assert_eq!(seq, pre);
     }
 
     #[tokio::test]
@@ -357,9 +363,12 @@ mod tests {
             );
         }
         let base_seq = apply_batch(&engine, batch).await.unwrap();
+        // Issue #8: visible_seq is the highest visible seq (inclusive).
+        // The first NEW seq = visible_seq + 1.
         assert_eq!(
-            base_seq.0, seq_before,
-            "batch should start at the pre-batch counter value"
+            base_seq.0,
+            seq_before + 1,
+            "batch's first seq must be one greater than the pre-batch visible frontier"
         );
 
         // After a 4-record batch, global_seq MUST have advanced by 4.

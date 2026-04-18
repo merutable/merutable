@@ -243,9 +243,16 @@ impl MeruEngine {
             None
         };
 
-        // IMP-02: visible_seq starts at the same value as global_seq.
-        // Both are at init_seq after recovery.
-        let visible_seq = GlobalSeq::new(init_seq);
+        // Issue #8 + IMP-02: `visible_seq` is "the highest sequence
+        // whose data is visible" (inclusive), not "the next sequence
+        // to become visible" (exclusive). On a fresh DB the next
+        // allocated seq is 1 and nothing is visible yet, so
+        // `visible_seq = 0`. On a recovered DB with iceberg/WAL max
+        // seq = M, the visible frontier is M (everything at M and
+        // below is visible; M+1 is the next to allocate). The
+        // inclusive semantic lets callers assert the natural invariant
+        // `put_result > read_seq_before_put` without an off-by-one.
+        let visible_seq = GlobalSeq::new(init_seq.saturating_sub(1));
 
         let engine = Arc::new(Self {
             config,
@@ -413,7 +420,9 @@ impl MeruEngine {
             let should_flush = self.memtable.apply_batch(&batch)?;
 
             // Advance visible_seq now that the data is in the memtable.
-            self.visible_seq.set_at_least(seq.0 + 1);
+            // visible_seq semantic is inclusive-latest-visible (Issue #8),
+            // so the just-applied seq IS the new visible frontier.
+            self.visible_seq.set_at_least(seq.0);
 
             (seq, should_flush)
         };
@@ -910,7 +919,41 @@ mod tests {
     async fn open_creates_fresh_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
-        assert!(engine.read_seq().0 > 0);
+        // Issue #8: a fresh engine has seen no writes → visible frontier is 0.
+        assert_eq!(engine.read_seq().0, 0);
+        assert_eq!(engine.schema().table_name, "test");
+    }
+
+    /// Issue #8 regression: the first put's returned seq must be
+    /// strictly greater than the pre-put read_seq. With the old
+    /// exclusive-upper-bound semantics for visible_seq, a fresh DB
+    /// had read_seq = 1 AND the first allocate returned 1 — violating
+    /// monotonicity at the first operation.
+    #[tokio::test]
+    async fn first_put_seq_greater_than_initial_read_seq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+        let pre = engine.read_seq();
+        let seq = engine
+            .put(
+                vec![FieldValue::Int64(1)],
+                Row::new(vec![Some(FieldValue::Int64(1)), None]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            seq > pre,
+            "Issue #8: first put seq {:?} must be > pre-put read_seq {:?}",
+            seq,
+            pre
+        );
+    }
+
+    #[tokio::test]
+    async fn open_after_recovery_has_correct_seq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+        assert!(engine.read_seq().0 == 0); // fresh
         assert_eq!(engine.schema().table_name, "test");
     }
 

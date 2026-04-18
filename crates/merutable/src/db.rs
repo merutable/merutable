@@ -303,7 +303,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = MeruDB::open(test_options(&tmp)).await.unwrap();
         assert_eq!(db.schema().table_name, "test");
-        assert!(db.read_seq().0 > 0);
+        // Issue #8: fresh DB has no writes → read_seq is the zero frontier.
+        assert_eq!(db.read_seq().0, 0);
     }
 
     #[tokio::test]
