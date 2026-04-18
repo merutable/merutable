@@ -16,11 +16,23 @@
 //! | Float                | 4 bytes, IEEE order-preserving (see below)          |
 //! | Double               | 8 bytes, IEEE order-preserving (see below)          |
 //! | FixedLenByteArray(n) | n bytes raw (fixed length, no terminator needed)    |
-//! | ByteArray            | escape(bytes) + 0x00 terminator                     |
+//! | ByteArray            | escape(bytes) + [0x00, 0x00] terminator             |
 //!
 //! **ByteArray escape**: replace each `0x00` in data with `[0x00, 0xFF]`;
-//! terminate with a bare `0x00`. This makes ByteArray fields sort correctly
-//! with `memcmp` even when embedded in a composite key.
+//! terminate with a two-byte `[0x00, 0x00]`. Issue #7 regression: a
+//! single-byte `0x00` terminator allowed a shorter PK's terminator to
+//! collide with a longer PK's escape-continuation byte at the same
+//! position. Because the 8-byte tag that follows the encoded user-key
+//! always begins with `0xFF` for sequence numbers in normal range
+//! (`SEQNUM_MAX - seq` has `0xFF` as its high byte), a shorter
+//! user-key's `encode(A) + tag_A` could sort AFTER a longer
+//! `encode(B) + tag_B` when A was a raw-byte prefix of B. The two-byte
+//! `[0x00, 0x00]` terminator is distinguishable from an escape
+//! continuation (`0x00, 0xFF`) — the second byte of the terminator
+//! (`0x00`) sorts strictly before `0xFF`, so the comparison resolves
+//! at the terminator itself, before any tag byte comes into play.
+//! CockroachDB hit the same class of bug and uses an equivalent
+//! two-byte-terminator scheme.
 //!
 //! **Float order preservation**:
 //! - Positive (or +0): flip sign bit → `bits ^ 0x8000_0000`
@@ -232,7 +244,12 @@ fn encode_field(val: &FieldValue, col_type: &ColumnType, buf: &mut Vec<u8>) -> R
 }
 
 /// ByteArray escape encoding for sort-safe composite key embedding.
-/// Each `0x00` byte in data → `[0x00, 0xFF]`. Terminated by a bare `0x00`.
+/// Each `0x00` byte in data → `[0x00, 0xFF]`. Terminated by a two-byte
+/// `[0x00, 0x00]`. See the module-level comment on terminator design:
+/// the second terminator byte `0x00` must be strictly less than any
+/// escape-continuation byte (`0xFF`), so `encode(A) + any_tag` sorts
+/// strictly before `encode(B) + any_tag` whenever A is a raw-byte
+/// prefix of B — independent of the tag contents.
 #[inline]
 fn escape_byte_array(bytes: &[u8], buf: &mut Vec<u8>) {
     for &b in bytes {
@@ -243,7 +260,8 @@ fn escape_byte_array(bytes: &[u8], buf: &mut Vec<u8>) {
             buf.push(b);
         }
     }
-    buf.push(0x00); // terminator
+    buf.push(0x00); // terminator byte 1
+    buf.push(0x00); // terminator byte 2
 }
 
 /// IEEE 754 order-preserving encoding for f32.
@@ -368,6 +386,10 @@ fn ensure_len(bytes: &[u8], required: usize, field: &str) -> Result<()> {
 }
 
 /// Inverse of `escape_byte_array`. Returns `(decoded_bytes, bytes_consumed_including_terminator)`.
+///
+/// Terminator is `[0x00, 0x00]`. Escape continuation is `[0x00, 0xFF]`
+/// (represents a raw `0x00` byte). Any other `[0x00, X]` where
+/// `X ∉ {0x00, 0xFF}` is invalid and returns `Corruption`.
 fn unescape_byte_array(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -378,13 +400,27 @@ fn unescape_byte_array(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
             ));
         }
         if bytes[i] == 0x00 {
-            if i + 1 < bytes.len() && bytes[i + 1] == 0xFF {
-                // Escaped null byte.
-                result.push(0x00);
-                i += 2;
-            } else {
-                // Bare 0x00 = terminator.
-                return Ok((result, i + 1));
+            if i + 1 >= bytes.len() {
+                return Err(MeruError::Corruption(
+                    "truncated escape/terminator sequence".into(),
+                ));
+            }
+            match bytes[i + 1] {
+                0xFF => {
+                    // Escape continuation: emit a raw 0x00.
+                    result.push(0x00);
+                    i += 2;
+                }
+                0x00 => {
+                    // Two-byte terminator.
+                    return Ok((result, i + 2));
+                }
+                other => {
+                    return Err(MeruError::Corruption(format!(
+                        "invalid byte sequence 0x00 followed by 0x{other:02X} \
+                         (expected 0xFF for escape or 0x00 for terminator)"
+                    )));
+                }
             }
         } else {
             result.push(bytes[i]);
@@ -582,6 +618,91 @@ mod tests {
         .unwrap();
         assert!(ka < kb);
         assert!(ka < kc);
+    }
+
+    /// Issue #7 regression: empty ByteArray, single-null ByteArray, and
+    /// multi-null ByteArray all must produce distinct encodings AND
+    /// sort in ascending order by their original bytewise comparison.
+    /// The escape function is `0x00 → [0x00, 0xFF]`, terminator `0x00`.
+    ///
+    /// This test pins down the exact expected encodings and sort order
+    /// so any regression in `escape_byte_array` / `unescape_byte_array`
+    /// is caught here rather than manifesting as silent data loss in a
+    /// stress test.
+    #[test]
+    fn bytearray_empty_and_null_keys_distinct_and_ordered() {
+        let s = bytearray_schema();
+        let k_empty = InternalKey::encode_user_key(&[FieldValue::Bytes(Bytes::new())], &s).unwrap();
+        let k_null1 =
+            InternalKey::encode_user_key(&[FieldValue::Bytes(Bytes::from_static(&[0u8]))], &s)
+                .unwrap();
+        let k_null2 =
+            InternalKey::encode_user_key(&[FieldValue::Bytes(Bytes::from_static(&[0u8, 0u8]))], &s)
+                .unwrap();
+        let k_one =
+            InternalKey::encode_user_key(&[FieldValue::Bytes(Bytes::from_static(&[0x01u8]))], &s)
+                .unwrap();
+        let k_null1_one = InternalKey::encode_user_key(
+            &[FieldValue::Bytes(Bytes::from_static(&[0u8, 0x01u8]))],
+            &s,
+        )
+        .unwrap();
+
+        // Pinned exact encodings — shape is load-bearing for the
+        // unescape logic and for the ordering invariants below.
+        // Terminator is [0x00, 0x00] (two bytes).
+        assert_eq!(k_empty, vec![0x00, 0x00]);
+        assert_eq!(k_null1, vec![0x00, 0xFF, 0x00, 0x00]);
+        assert_eq!(k_null2, vec![0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00]);
+        assert_eq!(k_one, vec![0x01, 0x00, 0x00]);
+        assert_eq!(k_null1_one, vec![0x00, 0xFF, 0x01, 0x00, 0x00]);
+
+        // Distinct.
+        assert_ne!(k_empty, k_null1);
+        assert_ne!(k_null1, k_null2);
+        assert_ne!(k_null1, k_null1_one);
+
+        // Sort order: [] < [0x00] < [0x00, 0x00] < [0x00, 0x01] < [0x01].
+        assert!(k_empty < k_null1);
+        assert!(k_null1 < k_null2);
+        assert!(k_null2 < k_null1_one);
+        assert!(k_null1_one < k_one);
+    }
+
+    /// Round-trip every edge-case key through escape + unescape: the
+    /// decoded bytes must equal the input. Regression guard for
+    /// Issue #7's "data loss on persistence" scenario.
+    #[test]
+    fn bytearray_escape_unescape_roundtrip() {
+        let cases: &[&[u8]] = &[
+            &[],
+            &[0x00],
+            &[0x00, 0x00],
+            &[0x00, 0x01],
+            &[0x01, 0x00],
+            &[0xFF],
+            &[0x00, 0xFF],
+            &[0xFF, 0x00],
+            &[0x00, 0xFF, 0x00],
+            b"hello",
+            b"hello\0world",
+        ];
+        for case in cases {
+            let mut buf = Vec::new();
+            escape_byte_array(case, &mut buf);
+            let (decoded, consumed) = unescape_byte_array(&buf).unwrap();
+            assert_eq!(
+                decoded.as_slice(),
+                *case,
+                "roundtrip failed for {case:?} (encoded={buf:?})"
+            );
+            assert_eq!(
+                consumed,
+                buf.len(),
+                "consumed={consumed} but buf.len()={} for {case:?}",
+                buf.len()
+            );
+        }
     }
 
     #[test]

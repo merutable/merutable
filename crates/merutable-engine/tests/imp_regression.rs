@@ -483,6 +483,216 @@ async fn close_data_durable_across_reopen() {
     }
 }
 
+/// Narrow diagnostic for Issue #7 (kept as a fast smoke test
+/// alongside the full roundtrip): exercise empty and single-null
+/// PKs at each stage of the lifecycle.
+#[tokio::test]
+async fn issue7_narrow_diagnostic() {
+    use merutable_types::schema::{ColumnDef, ColumnType, TableSchema};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = TableSchema {
+        table_name: "ba".into(),
+        columns: vec![
+            ColumnDef {
+                name: "k".into(),
+                col_type: ColumnType::ByteArray,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "v".into(),
+                col_type: ColumnType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![0],
+    };
+    let config = EngineConfig {
+        schema: schema.clone(),
+        catalog_uri: tmp.path().to_string_lossy().to_string(),
+        object_store_prefix: tmp.path().to_string_lossy().to_string(),
+        wal_dir: tmp.path().join("wal"),
+        memtable_size_bytes: 64 * 1024 * 1024,
+        gc_grace_period_secs: 0,
+        l0_slowdown_trigger: u32::MAX as usize,
+        l0_stop_trigger: u32::MAX as usize,
+        ..Default::default()
+    };
+    let engine = MeruEngine::open(config).await.unwrap();
+    let empty = bytes::Bytes::new();
+    let null1 = bytes::Bytes::from_static(&[0u8]);
+    engine
+        .put(
+            vec![FieldValue::Bytes(empty.clone())],
+            Row::new(vec![
+                Some(FieldValue::Bytes(empty.clone())),
+                Some(FieldValue::Int64(100)),
+            ]),
+        )
+        .await
+        .unwrap();
+    engine
+        .put(
+            vec![FieldValue::Bytes(null1.clone())],
+            Row::new(vec![
+                Some(FieldValue::Bytes(null1.clone())),
+                Some(FieldValue::Int64(200)),
+            ]),
+        )
+        .await
+        .unwrap();
+    // Stage 1: in memtable.
+    let r = engine.get(&[FieldValue::Bytes(empty.clone())]).unwrap();
+    println!("STAGE memtable empty: {r:?}");
+    let r = engine.get(&[FieldValue::Bytes(null1.clone())]).unwrap();
+    println!("STAGE memtable [0x00]: {r:?}");
+    // Stage 2: after flush (in L0 Parquet).
+    engine.flush().await.unwrap();
+    let r = engine.get(&[FieldValue::Bytes(empty.clone())]).unwrap();
+    println!("STAGE after flush empty: {r:?}");
+    let r = engine.get(&[FieldValue::Bytes(null1.clone())]).unwrap();
+    println!("STAGE after flush [0x00]: {r:?}");
+    // Stage 3: after compact.
+    engine.compact().await.unwrap();
+    let r = engine.get(&[FieldValue::Bytes(empty.clone())]).unwrap();
+    println!("STAGE after compact empty: {r:?}");
+    let r = engine.get(&[FieldValue::Bytes(null1.clone())]).unwrap();
+    println!("STAGE after compact [0x00]: {r:?}");
+    // Stage 4: close + reopen.
+    engine.close().await.unwrap();
+    drop(engine);
+    let config2 = EngineConfig {
+        schema: schema.clone(),
+        catalog_uri: tmp.path().to_string_lossy().to_string(),
+        object_store_prefix: tmp.path().to_string_lossy().to_string(),
+        wal_dir: tmp.path().join("wal"),
+        memtable_size_bytes: 64 * 1024 * 1024,
+        gc_grace_period_secs: 0,
+        l0_slowdown_trigger: u32::MAX as usize,
+        l0_stop_trigger: u32::MAX as usize,
+        ..Default::default()
+    };
+    let engine = MeruEngine::open(config2).await.unwrap();
+    let r = engine.get(&[FieldValue::Bytes(empty.clone())]).unwrap();
+    println!("STAGE after reopen empty: {r:?}");
+    let r = engine.get(&[FieldValue::Bytes(null1.clone())]).unwrap();
+    println!("STAGE after reopen [0x00]: {r:?}");
+    let scanned = engine.scan(None, None).unwrap();
+    println!("SCAN results: {} rows", scanned.len());
+    for (ik, row) in &scanned {
+        println!("  ikey_bytes={:?} row={:?}", ik.as_bytes(), row);
+    }
+}
+
+/// Issue #7 regression: ByteArray primary keys with empty bytes,
+/// single null byte, and null-byte runs must survive put → flush →
+/// compact → reopen without collision or data loss.
+///
+/// This test pins down the end-to-end durability contract for the
+/// edge cases the user's chaos-monkey flagged. The underlying
+/// `escape_byte_array` encoding was already correct (see
+/// `merutable-types::key::bytearray_*` unit tests); this test
+/// covers the full engine path.
+#[tokio::test]
+async fn issue7_bytearray_edge_case_pks_roundtrip_through_parquet() {
+    use merutable_types::schema::{ColumnDef, ColumnType, TableSchema};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let schema = TableSchema {
+        table_name: "ba".into(),
+        columns: vec![
+            ColumnDef {
+                name: "k".into(),
+                col_type: ColumnType::ByteArray,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "v".into(),
+                col_type: ColumnType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec![0],
+    };
+    let make_config = || EngineConfig {
+        schema: schema.clone(),
+        catalog_uri: tmp.path().to_string_lossy().to_string(),
+        object_store_prefix: tmp.path().to_string_lossy().to_string(),
+        wal_dir: tmp.path().join("wal"),
+        memtable_size_bytes: 64 * 1024 * 1024,
+        gc_grace_period_secs: 0,
+        l0_slowdown_trigger: u32::MAX as usize,
+        l0_stop_trigger: u32::MAX as usize,
+        ..Default::default()
+    };
+
+    // Edge-case PKs and their distinct marker values.
+    let cases: Vec<(bytes::Bytes, i64)> = vec![
+        (bytes::Bytes::new(), 100),                            // empty
+        (bytes::Bytes::from_static(&[0u8]), 200),              // [0x00]
+        (bytes::Bytes::from_static(&[0u8, 0u8]), 300),         // [0x00, 0x00]
+        (bytes::Bytes::from_static(&[0u8, 0x01u8]), 400),      // [0x00, 0x01]
+        (bytes::Bytes::from_static(&[0x01u8, 0u8]), 500),      // [0x01, 0x00]
+        (bytes::Bytes::from_static(&[0xFFu8]), 600),           // [0xFF]
+        (bytes::Bytes::from_static(&[0u8, 0xFFu8, 0u8]), 700), // [0x00, 0xFF, 0x00]
+        (bytes::Bytes::from("hello"), 800),
+    ];
+
+    // Populate + flush + compact so every key traverses the Parquet
+    // round-trip and the compaction iterator's dedup path.
+    {
+        let engine = MeruEngine::open(make_config()).await.unwrap();
+        for (k, v) in &cases {
+            engine
+                .put(
+                    vec![FieldValue::Bytes(k.clone())],
+                    Row::new(vec![
+                        Some(FieldValue::Bytes(k.clone())),
+                        Some(FieldValue::Int64(*v)),
+                    ]),
+                )
+                .await
+                .unwrap();
+        }
+        engine.flush().await.unwrap();
+        engine.compact().await.unwrap();
+        engine.close().await.unwrap();
+    }
+
+    // Reopen — WAL is already GC'd (the flush wrote everything), so
+    // reads must be served from Parquet.
+    let engine = MeruEngine::open(make_config()).await.unwrap();
+    for (k, expected_v) in &cases {
+        let row = engine
+            .get(&[FieldValue::Bytes(k.clone())])
+            .unwrap()
+            .unwrap_or_else(|| panic!("Issue #7: key {k:?} missing after reopen"));
+        match row.get(1) {
+            Some(FieldValue::Int64(got)) => assert_eq!(
+                *got, *expected_v,
+                "Issue #7: key {k:?} returned wrong value (got {got}, want {expected_v})"
+            ),
+            other => panic!("expected Int64 for key {k:?}, got {other:?}"),
+        }
+    }
+
+    // Scan ordering: results must be in ascending PK order.
+    let scanned = engine.scan(None, None).unwrap();
+    let scanned_keys: Vec<bytes::Bytes> = scanned
+        .iter()
+        .map(|(_ik, row)| match row.get(0) {
+            Some(FieldValue::Bytes(b)) => b.clone(),
+            _ => panic!("unexpected field type in scan result"),
+        })
+        .collect();
+    let mut expected_keys: Vec<bytes::Bytes> = cases.iter().map(|(k, _)| k.clone()).collect();
+    expected_keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    assert_eq!(
+        scanned_keys, expected_keys,
+        "Issue #7: scan must return keys in ascending order"
+    );
+}
+
 /// Issue #5 regression: L0 stop trigger must block writes.
 ///
 /// Before this fix, `l0_stop_trigger` was defined in config but
