@@ -234,6 +234,88 @@ below it with a generous margin (4× in our case). Capping at the
 producer (what we write) is safer than relying on the consumer
 to handle overflow.
 
+## 13. Key encoding prefix-collision across tag boundary
+
+**Seen in**: Issue #7 — ByteArray PKs with empty or null-byte prefixes
+produced correctly distinct encoded user_keys, yet point lookups
+returned wrong rows. The encoded user_key terminator (`0x00`)
+collided with the first byte of the following tag (`0xFF` for normal
+seqs), making a shorter user_key's full ikey sort AFTER a longer
+user_key's ikey — the opposite of raw-byte order.
+
+**Symptom**: Data corruption / wrong-row reads for keys near the
+empty/null-prefix region. Manifests silently correct; Parquet
+silently correct; just the memtable/skiplist iteration was wrong.
+
+**Anti-pattern**: Using a single-byte terminator for variable-length
+field encoding without verifying that the next byte (the start of
+the next field or the tag) ALWAYS sorts strictly greater than the
+terminator. Even a "sort-preserving escape" scheme can be defeated
+by what follows it.
+
+**Discipline**: Choose a terminator that sorts strictly BEFORE any
+possible continuation byte. `[0x00, 0x00]` works because the second
+`0x00` is strictly less than any escape-continuation byte (`0xFF`).
+CockroachDB and FoundationDB independently arrived at the same
+scheme. If your encoding has a variable-length field followed by a
+fixed-size suffix (tag, seq, anything), the encoding's terminator
+must be bitwise-less-than every possible first byte of that suffix
+— across all values the suffix can take.
+
+## 14. State reloaders that forget some state
+
+**Seen in**: Issue #6 — read-only replica's `refresh()` reloaded the
+manifest (`Version`) but left `visible_seq` pinned at the open-time
+value. New data with seq > pinned visible_seq was filtered out of
+every read.
+
+**Symptom**: "Refresh works for manifest/file list but returns
+None for any key whose seq was allocated after open." The files are
+there; reads don't see them.
+
+**Anti-pattern**: Thinking of "current state" as a single unit
+(here, the Version) when it's actually several correlated pieces
+(Version + seq counters + in-memory mirrors). A reload function
+must update EVERY piece that can become stale.
+
+**Discipline**: When writing a reload / refresh function, ask: "if
+this function was called immediately after a primary-side commit,
+what ELSE in our state would be inconsistent with the new manifest?"
+For merutable: the manifest's `seq_max` field is the ground truth
+for seq consistency after refresh — `visible_seq` and `global_seq`
+are mirrors that must be advanced.
+
+## 15. Semantic off-by-one in monotonic counters
+
+**Seen in**: Issue #8 — `visible_seq` was exclusive-upper-bound
+("next seq to become visible") but consumers naturally treated it
+as inclusive ("latest visible seq"). On a fresh DB, `visible_seq
+== 1` meant "no data is at seq 1 yet," but the first put
+immediately returned seq = 1, violating monotonicity the user
+expected from `put_seq > read_seq_before_put`.
+
+**Symptom**: User-facing invariants fail at the very first operation
+of a fresh database. Cosmetic in isolation, but erodes trust.
+
+**Anti-pattern**: Not documenting the semantic of a counter
+(exclusive vs inclusive, pre-allocation vs post-allocation). Both
+producer and consumer have to reason about it, and they'll each
+pick the interpretation that makes their code simpler.
+
+**Discipline**: Counters that readers inspect should use the
+**inclusive-latest** semantic ("the highest thing that has
+happened"). Internal allocation counters should use
+**next-to-allocate** semantic. Keep them as separate types if the
+invariant needs to hold across threads. merutable now has:
+- `global_seq`: next-to-allocate (`fetch_add` before use).
+- `visible_seq`: inclusive-latest-visible (`set_at_least(seq)`
+  after apply).
+
+## 16. Arrow i32 offset limits on aggregate column bytes
+
+(Moved to entry 9; retained here so the table of contents around
+Issue #3 still makes sense.)
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible
