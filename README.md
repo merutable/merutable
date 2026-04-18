@@ -11,7 +11,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 ## Why merutable
 
 - **One table, two workloads**: Write rows through a KV API, query them with SQL. Same Parquet files, zero ETL.
-- **Open format, no lock-in**: Data is Parquet. Metadata is Iceberg. DuckDB, Spark, Trino, Snowflake read it natively.
+- **Open format, no lock-in**: Data is Parquet. Metadata is Iceberg. DuckDB, Spark, Trino, Snowflake read it natively via the exported Iceberg manifest — apply the MVCC dedup projection ([docs/HTAP_READS.md](docs/HTAP_READS.md)) once and any v2-aware reader sees consistent results.
 - **Embed, don't deploy**: Link one crate. No server, no cluster, no JVM.
 
 ## Architecture
@@ -130,9 +130,24 @@ db.flush()              # → L0 Parquet file + new v{N}.metadata.json
 db.compact()            # → L1 columnstore + Deletion Vectors (Puffin v3)
 print(db.stats())       # includes cache hit/miss counters
 
-# HTAP: DuckDB reads the same Parquet files
+# HTAP: register merutable's Iceberg metadata with DuckDB.
+# Always go through the Iceberg manifest — raw-glob `read_parquet` picks
+# up files still in the GC grace window and skips the MVCC dedup
+# projection, producing wrong answers on any non-trivial workload.
+# See docs/HTAP_READS.md for the canonical projection.
 import duckdb
-duckdb.sql(f"SELECT * FROM read_parquet('{db.catalog_path()}/data/L1/*.parquet')").show()
+db.export_iceberg("/tmp/events-iceberg")  # metadata.json + version-hint
+duckdb.sql("INSTALL iceberg; LOAD iceberg;")
+duckdb.sql(f"""
+    SELECT * EXCLUDE (_merutable_ikey)
+    FROM iceberg_scan('/tmp/events-iceberg/metadata/v1.metadata.json')
+    -- MVCC dedup: pick newest seq per PK, drop tombstones.
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY id
+        ORDER BY merutable_seq(_merutable_ikey) DESC
+    ) = 1
+       AND merutable_op(_merutable_ikey) = 'Put';
+""").show()
 
 # Read-only replica — opens same catalog, no WAL, no writes
 replica = MeruDB("/tmp/mydb", "events", [...], read_only=True)
