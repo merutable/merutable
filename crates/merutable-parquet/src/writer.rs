@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use merutable_types::{
     key::InternalKey,
-    level::{Level, ParquetFileMeta},
+    level::{FileFormat, Level, ParquetFileMeta},
     schema::{ColumnType, TableSchema},
     value::Row,
     MeruError, Result,
@@ -100,21 +100,21 @@ pub fn target_data_page_bytes(level: Level) -> usize {
 fn build_column_encoding_props(
     mut builder: WriterPropertiesBuilder,
     schema: &TableSchema,
-    level: Level,
+    format: FileFormat,
 ) -> WriterPropertiesBuilder {
     let ikey_col = ColumnPath::new(vec!["_merutable_ikey".to_string()]);
     builder = builder
         .set_column_encoding(ikey_col.clone(), Encoding::PLAIN)
         .set_column_dictionary_enabled(ikey_col, false);
 
-    if level.0 == 0 {
-        // L0: postcard value blob — PLAIN, no dictionary
+    if format.has_value_blob() {
+        // Dual format: postcard value blob — PLAIN, no dictionary
         let value_col = ColumnPath::new(vec!["_merutable_value".to_string()]);
         builder = builder
             .set_column_encoding(value_col.clone(), Encoding::PLAIN)
             .set_column_dictionary_enabled(value_col, false);
 
-        // L0 typed columns: PLAIN for rowstore fast decode
+        // Dual typed columns: PLAIN for rowstore fast decode
         for col_def in &schema.columns {
             let col_path = ColumnPath::new(vec![col_def.name.clone()]);
             builder = builder
@@ -177,6 +177,7 @@ pub fn write_sorted_rows(
     rows: Vec<(InternalKey, Row)>,
     schema: Arc<TableSchema>,
     level: Level,
+    format: FileFormat,
     bloom_bits_per_key: u8,
 ) -> Result<(Vec<u8>, Bytes, ParquetFileMeta)> {
     if rows.is_empty() {
@@ -191,12 +192,13 @@ pub fn write_sorted_rows(
             dv_path: None,
             dv_offset: None,
             dv_length: None,
+            format: Some(format),
         };
         return Ok((Vec::new(), Bytes::new(), meta));
     }
 
     let estimated = rows.len();
-    let arrow_schema = codec::arrow_schema(&schema, level);
+    let arrow_schema = codec::arrow_schema(&schema, format);
 
     // Track stats.
     let mut bloom = FastLocalBloom::new(estimated.max(1000), bloom_bits_per_key);
@@ -232,6 +234,7 @@ pub fn write_sorted_rows(
         dv_path: None,
         dv_offset: None,
         dv_length: None,
+        format: Some(format),
     };
 
     let bloom_bytes = bloom.to_bytes();
@@ -245,7 +248,7 @@ pub fn write_sorted_rows(
     // Pass 1: write the file with base KV. Pages land at their final byte
     // offsets in the data section, which is invariant across passes — only
     // the trailing footer KV changes.
-    let pass1_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, &base_kv)?;
+    let pass1_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, format, &base_kv)?;
 
     // Inspect pass-1's OffsetIndex to learn page boundaries on the
     // `_merutable_ikey` column, then build a `(first_key_on_page → location)`
@@ -261,7 +264,7 @@ pub fn write_sorted_rows(
         kv_index::KV_INDEX_FOOTER_KEY.to_string(),
         hex::encode(&kv_index_bytes),
     ));
-    let pass2_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, &full_kv)?;
+    let pass2_bytes = arrow_write_pass(&rows, &arrow_schema, &schema, level, format, &full_kv)?;
 
     let mut final_meta = meta;
     final_meta.file_size = pass2_bytes.len() as u64;
@@ -283,6 +286,7 @@ fn arrow_write_pass(
     arrow_schema: &Arc<arrow::datatypes::Schema>,
     schema: &TableSchema,
     level: Level,
+    format: FileFormat,
     kv: &[(String, String)],
 ) -> Result<Vec<u8>> {
     let kv_meta: Vec<parquet::format::KeyValue> = kv
@@ -298,14 +302,14 @@ fn arrow_write_pass(
         .set_max_row_group_size(target_rows_per_row_group(level))
         .set_data_page_size_limit(target_data_page_bytes(level))
         .set_key_value_metadata(Some(kv_meta));
-    let builder = build_column_encoding_props(builder, schema, level);
+    let builder = build_column_encoding_props(builder, schema, format);
     let props = builder.build();
 
     let buf: Vec<u8> = Vec::new();
     let mut writer = ArrowWriter::try_new(buf, arrow_schema.clone(), Some(props))
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
 
-    let batch = codec::rows_to_record_batch(rows, schema, level)?;
+    let batch = codec::rows_to_record_batch(rows, schema, format)?;
     writer
         .write(&batch)
         .map_err(|e| MeruError::Parquet(e.to_string()))?;
@@ -589,8 +593,14 @@ mod tests {
     fn writer_emits_kv_index_in_footer() {
         let schema = kv_index_test_schema();
         let rows = make_test_rows(16_384, &schema);
-        let (file_bytes, _bloom, _meta) =
-            write_sorted_rows(rows.clone(), Arc::new(schema), Level(0), 10).unwrap();
+        let (file_bytes, _bloom, _meta) = write_sorted_rows(
+            rows.clone(),
+            Arc::new(schema),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
 
         let idx =
             read_kv_index_from_file(&file_bytes).expect("writer must emit merutable.kv_index.v1");
@@ -620,8 +630,14 @@ mod tests {
     fn kv_index_predecessor_holds_for_every_input_key() {
         let schema = kv_index_test_schema();
         let rows = make_test_rows(16_384, &schema);
-        let (file_bytes, _bloom, _meta) =
-            write_sorted_rows(rows.clone(), Arc::new(schema), Level(0), 10).unwrap();
+        let (file_bytes, _bloom, _meta) = write_sorted_rows(
+            rows.clone(),
+            Arc::new(schema),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
 
         let idx = read_kv_index_from_file(&file_bytes).unwrap();
 
@@ -658,8 +674,14 @@ mod tests {
     fn kv_index_entries_are_strictly_ascending() {
         let schema = kv_index_test_schema();
         let rows = make_test_rows(1500, &schema);
-        let (file_bytes, _bloom, _meta) =
-            write_sorted_rows(rows, Arc::new(schema), Level(0), 10).unwrap();
+        let (file_bytes, _bloom, _meta) = write_sorted_rows(
+            rows,
+            Arc::new(schema),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
 
         let idx = read_kv_index_from_file(&file_bytes).unwrap();
         let mut prev: Option<Vec<u8>> = None;
@@ -685,9 +707,22 @@ mod tests {
         let schema = kv_index_test_schema();
         let rows = make_test_rows(64, &schema);
 
-        let (l0_bytes, _, _) =
-            write_sorted_rows(rows.clone(), Arc::new(schema.clone()), Level(0), 10).unwrap();
-        let (l1_bytes, _, _) = write_sorted_rows(rows, Arc::new(schema), Level(1), 10).unwrap();
+        let (l0_bytes, _, _) = write_sorted_rows(
+            rows.clone(),
+            Arc::new(schema.clone()),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
+        let (l1_bytes, _, _) = write_sorted_rows(
+            rows,
+            Arc::new(schema),
+            Level(1),
+            merutable_types::level::FileFormat::Columnar,
+            10,
+        )
+        .unwrap();
 
         let l0_reader = SerializedFileReader::new(BBytes::from(l0_bytes)).unwrap();
         let l1_reader = SerializedFileReader::new(BBytes::from(l1_bytes)).unwrap();
@@ -732,8 +767,14 @@ mod tests {
     #[test]
     fn empty_input_emits_no_kv_index() {
         let schema = kv_index_test_schema();
-        let (file_bytes, _bloom, _meta) =
-            write_sorted_rows(vec![], Arc::new(schema), Level(0), 10).unwrap();
+        let (file_bytes, _bloom, _meta) = write_sorted_rows(
+            vec![],
+            Arc::new(schema),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         assert!(file_bytes.is_empty());
         // Nothing to read; just confirm we don't crash trying.
         assert!(read_kv_index_from_file(&file_bytes).is_none());

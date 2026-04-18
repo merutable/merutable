@@ -128,6 +128,7 @@ impl MeruDB {
             compaction_parallelism: options.compaction_parallelism,
             gc_grace_period_secs: options.gc_grace_period_secs,
             read_only: options.read_only,
+            dual_format_max_level: options.dual_format_max_level,
         };
 
         let engine = MeruEngine::open(config).await?;

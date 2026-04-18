@@ -475,7 +475,14 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
     ) -> Result<ProjectionMask> {
         let mut leaf_indices: Vec<usize> = Vec::new();
         leaf_indices.push(find_leaf(parquet_schema, IKEY_COLUMN_NAME)?);
-        if codec::level_has_value_blob(self.meta.level) {
+        // Issue #15: switch on the file's stamped format rather than
+        // its level. Legacy files that predate the stamp fall through
+        // to `FileFormat::default_for_level` which matches the old
+        // level-based behavior (Dual iff L0).
+        let format = self.meta.format.unwrap_or_else(|| {
+            merutable_types::level::FileFormat::default_for_level(self.meta.level)
+        });
+        if format.has_value_blob() {
             leaf_indices.push(find_leaf(parquet_schema, VALUE_BLOB_COLUMN_NAME)?);
         } else {
             for col in &self.schema.columns {
@@ -529,8 +536,14 @@ mod tests {
     }
 
     fn write_test_file(rows: Vec<(InternalKey, Row)>, schema: &TableSchema) -> Vec<u8> {
-        let (parquet_bytes, _bloom, _meta) =
-            crate::writer::write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+        let (parquet_bytes, _bloom, _meta) = crate::writer::write_sorted_rows(
+            rows,
+            Arc::new(schema.clone()),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         parquet_bytes
     }
 
@@ -767,6 +780,7 @@ mod tests {
             originals.clone(),
             Arc::new(schema.clone()),
             Level(1),
+            merutable_types::level::FileFormat::Columnar,
             10,
         )
         .unwrap();
@@ -824,8 +838,14 @@ mod tests {
                 (ikey, row)
             })
             .collect();
-        let (bytes, _, _) =
-            crate::writer::write_sorted_rows(rows.clone(), schema.clone(), Level(0), 10).unwrap();
+        let (bytes, _, _) = crate::writer::write_sorted_rows(
+            rows.clone(),
+            schema.clone(),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         let reader = ParquetReader::open(BBytes::from(bytes), schema).unwrap();
         (rows, reader)
     }
@@ -1057,8 +1077,14 @@ mod tests {
         // Re-sort by InternalKey bytes to satisfy the writer contract.
         rows.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
-        let (bytes, _, _) =
-            crate::writer::write_sorted_rows(rows.clone(), schema.clone(), Level(0), 10).unwrap();
+        let (bytes, _, _) = crate::writer::write_sorted_rows(
+            rows.clone(),
+            schema.clone(),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         let reader = ParquetReader::open(BBytes::from(bytes), schema).unwrap();
         assert!(reader.kv_index.is_some());
 
@@ -1202,8 +1228,14 @@ mod tests {
         }
         // Already in ascending ikey order (higher seq → smaller tag → earlier).
 
-        let (bytes, _, _) =
-            crate::writer::write_sorted_rows(rows.clone(), schema.clone(), Level(0), 10).unwrap();
+        let (bytes, _, _) = crate::writer::write_sorted_rows(
+            rows.clone(),
+            schema.clone(),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         let reader = ParquetReader::open(BBytes::from(bytes), schema).unwrap();
         assert!(
             reader.kv_index.is_some(),
@@ -1267,9 +1299,14 @@ mod tests {
     #[test]
     fn empty_file_roundtrip() {
         let schema = test_schema();
-        let (bytes, _bloom, meta) =
-            crate::writer::write_sorted_rows(vec![], Arc::new(schema.clone()), Level(0), 10)
-                .unwrap();
+        let (bytes, _bloom, meta) = crate::writer::write_sorted_rows(
+            vec![],
+            Arc::new(schema.clone()),
+            Level(0),
+            merutable_types::level::FileFormat::Dual,
+            10,
+        )
+        .unwrap();
         assert!(bytes.is_empty());
         assert_eq!(meta.num_rows, 0);
     }

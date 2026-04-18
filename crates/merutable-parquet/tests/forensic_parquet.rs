@@ -136,8 +136,14 @@ fn all_footer_kv(file_bytes: &[u8]) -> Vec<(String, String)> {
 fn l0_footer_kv_contains_every_expected_merutable_key() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _bloom, _meta) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _bloom, _meta) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let kv = all_footer_kv(&file_bytes);
     let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
@@ -184,8 +190,14 @@ fn l0_footer_kv_contains_every_expected_merutable_key() {
 fn every_footer_kv_value_decodes_cleanly() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
     let kv = all_footer_kv(&file_bytes);
 
     let meta_json = kv
@@ -240,9 +252,22 @@ fn physical_column_layout_matches_level_contract() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(64, &schema);
 
-    let (l0, _, _) =
-        write_sorted_rows(rows.clone(), Arc::new(schema.clone()), Level(0), 10).unwrap();
-    let (l1, _, _) = write_sorted_rows(rows, Arc::new(schema.clone()), Level(1), 10).unwrap();
+    let (l0, _, _) = write_sorted_rows(
+        rows.clone(),
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
+    let (l1, _, _) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(1),
+        merutable_types::level::FileFormat::Columnar,
+        10,
+    )
+    .unwrap();
 
     let l0_reader = SerializedFileReader::new(Bytes::from(l0)).unwrap();
     let l1_reader = SerializedFileReader::new(Bytes::from(l1)).unwrap();
@@ -291,8 +316,14 @@ fn physical_column_layout_matches_level_contract() {
 fn footer_num_rows_matches_row_group_total() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, meta) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, meta) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let reader = SerializedFileReader::new(Bytes::from(file_bytes)).unwrap();
     let rg_total: i64 = (0..reader.metadata().num_row_groups())
@@ -313,8 +344,14 @@ fn footer_num_rows_matches_row_group_total() {
 fn every_column_chunk_uses_snappy_compression() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let reader = SerializedFileReader::new(Bytes::from(file_bytes)).unwrap();
     let md = reader.metadata();
@@ -342,8 +379,14 @@ fn every_column_chunk_uses_snappy_compression() {
 fn offset_and_column_indexes_exist_on_every_column_chunk() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let opts = ReadOptionsBuilder::new().with_page_index().build();
     let reader = SerializedFileReader::new_with_options(Bytes::from(file_bytes), opts).unwrap();
@@ -378,8 +421,14 @@ fn offset_and_column_indexes_exist_on_every_column_chunk() {
 fn kv_index_entries_point_at_real_pages_with_matching_first_key() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(8_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows.clone(), Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows.clone(),
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     // Load the kv_index from the footer.
     let kv = all_footer_kv(&file_bytes);
@@ -462,8 +511,14 @@ fn kv_index_entries_point_at_real_pages_with_matching_first_key() {
 fn every_written_user_key_passes_the_footer_bloom() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows.clone(), Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows.clone(),
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let kv = all_footer_kv(&file_bytes);
     let bloom_hex = kv
@@ -495,8 +550,14 @@ fn every_written_user_key_passes_the_footer_bloom() {
 fn bloom_rejects_most_random_non_matching_probes() {
     let schema = forensic_schema();
     let rows = build_forensic_rows(2_000, &schema);
-    let (file_bytes, _, _) =
-        write_sorted_rows(rows, Arc::new(schema.clone()), Level(0), 10).unwrap();
+    let (file_bytes, _, _) = write_sorted_rows(
+        rows,
+        Arc::new(schema.clone()),
+        Level(0),
+        merutable_types::level::FileFormat::Dual,
+        10,
+    )
+    .unwrap();
 
     let kv = all_footer_kv(&file_bytes);
     let bloom_hex = kv

@@ -316,6 +316,61 @@ invariant needs to hold across threads. merutable now has:
 (Moved to entry 9; retained here so the table of contents around
 Issue #3 still makes sense.)
 
+## 17. Hard-coded physical layout keyed off logical level
+
+**Seen in**: Issue #15 — the row-blob fast path (`_merutable_value`
+column) was hard-coded to "L0 iff `level == 0`". Operators tuning for
+OLTP-heavy workloads (hot L1) had no way to extend the fast path;
+OLAP / append-only workloads had no way to disable it.
+
+**Symptom**: A knob that should be workload-driven is instead hard-wired
+to a proxy dimension. The code reads the proxy (level) and pretends it's
+the answer (format). When a user wants to decouple them, every call site
+has to change.
+
+**Anti-pattern**: `if level == 0 { dual_format } else { columnar }`
+scattered across writer, reader, codec, compactor. Each call site looks
+"obvious" in isolation, but together they form a distributed hard-coded
+policy that's invisible to grep-for-config.
+
+**Discipline**: When physical layout derives from logical identity,
+stamp the physical layout into the file's own metadata at write time
+and read it back via that stamp — never recompute from the logical
+identity on the read side. `ParquetFileMeta::format: Option<FileFormat>`
+makes the format a persistent property of the file; `EngineConfig::
+file_format_for(level)` is the single decision point at write time.
+Legacy files (without the stamp) fall back to
+`FileFormat::default_for_level(level)` which reproduces the old
+hardcoded behavior, guaranteeing zero-migration safety.
+
+## 18. Regex surgery on multi-field structs is dangerous
+
+**Seen in**: During Issue #15 I added a `format: Option<FileFormat>`
+field to `ParquetFileMeta` and used a Python regex to insert
+`format: None,` at every construction site. The pattern was "after
+`dv_length: ... ,` and before the closing `}`" — but `DvLocation`
+also has a `dv_length` field (and closes with `}`), so the regex
+fired inside structs it had no business touching. Build broke in
+half a dozen places with "struct X has no field named format".
+
+**Symptom**: A "safe" batch edit that compiles half the callers and
+silently corrupts the other half. The compiler catches it eventually,
+but only after the diff has spread across 10+ files and mental state
+has drifted.
+
+**Anti-pattern**: Regex-editing source as if field names are unique
+across structs. They aren't. `path`, `dv_length`, `meta` all appear
+in multiple structs in this codebase; `dv_length` is especially
+dangerous because it appears in both `ParquetFileMeta` *and*
+`DvLocation`.
+
+**Discipline**: For struct-field additions across many files: add
+`#[serde(default)]` to the new field AND make the struct use
+`..Default::default()` or a constructor so callers don't have to
+change at all. When mass edits are unavoidable, use an AST tool
+(rust-analyzer "add field" refactor) or handwrite each call site —
+regex on Rust struct literals is a foot-cannon.
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible

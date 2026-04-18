@@ -503,10 +503,15 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
         let file_id = uuid::Uuid::new_v4().to_string();
         let output_path = format!("data/L{}/{file_id}.parquet", pick.output_level.0);
 
+        // Issue #15: per-output-level format. A compaction moving from
+        // Dual-at-L0 to Columnar-at-L1 drops the `_merutable_value`
+        // blob; moving Dual-deeper retains it.
+        let format = engine.config.file_format_for(pick.output_level);
         let (parquet_bytes, _, _) = merutable_parquet::writer::write_sorted_rows(
             chunk.rows,
             engine.schema.clone(),
             pick.output_level,
+            format,
             engine.config.bloom_bits_per_key,
         )?;
 
@@ -554,6 +559,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
             dv_path: None,
             dv_offset: None,
             dv_length: None,
+            format: Some(format),
         };
 
         txn.add_file(IcebergDataFile {

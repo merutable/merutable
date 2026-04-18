@@ -126,10 +126,15 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     let num_rows = rows.len() as u64;
 
     // Write Parquet file to an in-memory buffer.
+    // Issue #15: flush always writes to L0; ask the config which
+    // format L0 uses. Default config keeps this Dual for
+    // zero-migration parity with pre-#15 behavior.
+    let format = engine.config.file_format_for(Level(0));
     let (parquet_bytes, _bloom_bytes, _meta) = merutable_parquet::writer::write_sorted_rows(
         rows,
         engine.schema.clone(),
         Level(0),
+        format,
         engine.config.bloom_bits_per_key,
     )?;
 
@@ -190,6 +195,7 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         dv_path: None,
         dv_offset: None,
         dv_length: None,
+        format: Some(format),
     };
 
     let mut txn = SnapshotTransaction::new();

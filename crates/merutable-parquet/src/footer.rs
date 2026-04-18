@@ -86,6 +86,7 @@ mod tests {
             dv_path: Some("s3://bucket/path.puffin".into()),
             dv_offset: Some(42),
             dv_length: Some(128),
+            format: None,
         }
     }
 

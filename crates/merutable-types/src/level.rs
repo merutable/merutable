@@ -44,6 +44,53 @@ pub struct ParquetFileMeta {
     pub dv_path: Option<String>,
     pub dv_offset: Option<i64>,
     pub dv_length: Option<i64>,
+    /// Issue #15: per-file physical format stamp. Legacy files
+    /// written before the stamp existed omit this field —
+    /// deserialization produces `None`, and readers must fall back
+    /// to `FileFormat::default_for_level(level)` which matches the
+    /// pre-Issue-#15 hard-coded behavior (Dual iff L0).
+    #[serde(default)]
+    pub format: Option<FileFormat>,
+}
+
+/// Physical layout stamp for a Parquet SSTable (Issue #15).
+///
+/// The cutoff between "blob fast path" and "typed columns only" is
+/// now operator-controlled via `EngineConfig::dual_format_max_level`
+/// rather than hard-coded to `level == 0`. The format is stamped
+/// per file at write time and preserved forever; config changes
+/// affect NEW compactions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    /// Typed columns only. No `_merutable_value` blob. Smaller on
+    /// disk at the cost of a reconstruct-from-typed-columns step
+    /// on point lookup.
+    Columnar,
+    /// Typed columns + `_merutable_value` postcard blob. Fast-path
+    /// for point lookups at hot tiers.
+    Dual,
+}
+
+impl FileFormat {
+    /// Infer the default format for a file whose manifest entry
+    /// lacks the `format` stamp (legacy / pre-Issue-#15 files).
+    /// Matches the pre-fix behavior: L0 = Dual, L1+ = Columnar.
+    #[inline]
+    pub fn default_for_level(level: Level) -> Self {
+        if level.0 == 0 {
+            FileFormat::Dual
+        } else {
+            FileFormat::Columnar
+        }
+    }
+
+    /// Whether this format carries the `_merutable_value` blob
+    /// column. Point-lookup strategy switches on this.
+    #[inline]
+    pub fn has_value_blob(self) -> bool {
+        matches!(self, FileFormat::Dual)
+    }
 }
 
 impl ParquetFileMeta {

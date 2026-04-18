@@ -53,6 +53,12 @@ pub struct OpenOptions {
 
     // Lifecycle
     pub read_only: bool,
+
+    /// Issue #15: highest level (inclusive) that carries the row-blob
+    /// fast path. `Some(0)` matches the default; `None` = columnar
+    /// everywhere; `Some(N)` pushes fast-path deeper for OLTP-heavy
+    /// workloads.
+    pub dual_format_max_level: Option<u8>,
 }
 
 impl OpenOptions {
@@ -82,7 +88,18 @@ impl OpenOptions {
             compaction_parallelism: ec.compaction_parallelism,
             gc_grace_period_secs: ec.gc_grace_period_secs,
             read_only: ec.read_only,
+            dual_format_max_level: ec.dual_format_max_level,
         }
+    }
+
+    /// Issue #15: highest LSM level whose SSTables carry the
+    /// `_merutable_value` row-blob fast path. `Some(0)` (default)
+    /// matches the pre-Issue-#15 hard boundary; `Some(N)` pushes the
+    /// fast path to L0..=LN for OLTP-heavy workloads; `None` = every
+    /// level columnar-only for OLAP / append-only.
+    pub fn dual_format_max_level(mut self, max: Option<u8>) -> Self {
+        self.dual_format_max_level = max;
+        self
     }
 
     pub fn catalog_uri(mut self, uri: impl Into<String>) -> Self {

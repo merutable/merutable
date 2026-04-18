@@ -23,7 +23,7 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use merutable_types::{
     key::InternalKey,
-    level::Level,
+    level::{FileFormat, Level},
     schema::{ColumnType, TableSchema},
     value::{FieldValue, Row},
     MeruError, Result,
@@ -40,23 +40,27 @@ pub const IKEY_COLUMN_NAME: &str = "_merutable_ikey";
 pub const VALUE_BLOB_COLUMN_NAME: &str = "_merutable_value";
 
 /// Whether files at the given level carry a `_merutable_value` blob column.
-/// Centralized so writer + reader + codec all agree on the per-level
-/// schema shape.
+/// Legacy helper — retained for callers that haven't plumbed the
+/// explicit `FileFormat` through yet. Delegates to
+/// `FileFormat::default_for_level`, so the per-level default matches
+/// the pre-Issue-#15 hard-coded behavior.
+///
+/// Prefer `FileFormat::has_value_blob` directly at new call sites.
 #[inline]
 pub fn level_has_value_blob(level: Level) -> bool {
-    level.0 == 0
+    FileFormat::default_for_level(level).has_value_blob()
 }
 
-/// Build the Arrow schema for a given `TableSchema` and target LSM level.
+/// Build the Arrow schema for a given `TableSchema` and target format.
 ///
 /// Layout:
 /// - Column 0: `_merutable_ikey` (always)
-/// - Column 1: `_merutable_value` (L0 only)
+/// - Column 1: `_merutable_value` (FileFormat::Dual only)
 /// - Remaining: one typed column per `TableSchema::columns` entry, in
 ///   schema order. These are the columns external HTAP readers see.
-pub fn arrow_schema(schema: &TableSchema, level: Level) -> Arc<Schema> {
+pub fn arrow_schema(schema: &TableSchema, format: FileFormat) -> Arc<Schema> {
     let mut fields = vec![Field::new(IKEY_COLUMN_NAME, DataType::Binary, false)];
-    if level_has_value_blob(level) {
+    if format.has_value_blob() {
         fields.push(Field::new(VALUE_BLOB_COLUMN_NAME, DataType::Binary, false));
     }
     for col in &schema.columns {
@@ -87,9 +91,9 @@ fn column_type_to_arrow(ct: &ColumnType) -> DataType {
 pub fn rows_to_record_batch(
     rows: &[(InternalKey, Row)],
     schema: &TableSchema,
-    level: Level,
+    format: FileFormat,
 ) -> Result<RecordBatch> {
-    let arrow_sch = arrow_schema(schema, level);
+    let arrow_sch = arrow_schema(schema, format);
     if rows.is_empty() {
         return Ok(RecordBatch::new_empty(arrow_sch));
     }
@@ -100,8 +104,8 @@ pub fn rows_to_record_batch(
     ));
     let mut col_arrays: Vec<ArrayRef> = vec![ikey_col];
 
-    // Optional _merutable_value blob column at L0.
-    if level_has_value_blob(level) {
+    // Optional _merutable_value blob column for Dual format.
+    if format.has_value_blob() {
         let blobs: Vec<Vec<u8>> = rows
             .iter()
             .map(|(_, row)| {
@@ -510,7 +514,8 @@ mod tests {
             })
             .collect();
 
-        let batch = rows_to_record_batch(&rows, &schema, Level(1)).unwrap();
+        let batch =
+            rows_to_record_batch(&rows, &schema, FileFormat::default_for_level(Level(1))).unwrap();
         let decoded = record_batch_to_rows(&batch, &schema).unwrap();
         assert_eq!(decoded.len(), rows.len());
         for ((orig_ik, orig_row), (got_ik, got_row)) in rows.iter().zip(decoded.iter()) {
@@ -538,7 +543,8 @@ mod tests {
             InternalKey::encode(&[FieldValue::Int32(1)], SeqNum(1), OpType::Put, &schema).unwrap();
         // Schema says Int32 but we hand it an Int64 — classic drift.
         let rows = vec![(ikey, Row::new(vec![Some(FieldValue::Int64(0x1_0000_0000))]))];
-        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let err = rows_to_record_batch(&rows, &schema, FileFormat::default_for_level(Level(1)))
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("type mismatch") && msg.contains("Int32") && msg.contains("Int64"),
@@ -562,7 +568,8 @@ mod tests {
             ikey,
             Row::new(vec![Some(FieldValue::Bytes(Bytes::from("nope")))]),
         )];
-        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let err = rows_to_record_batch(&rows, &schema, FileFormat::default_for_level(Level(1)))
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("Boolean") && msg.contains("Bytes"), "{msg}");
     }
@@ -586,7 +593,8 @@ mod tests {
             ikey,
             Row::new(vec![Some(FieldValue::Bytes(Bytes::from("too_long_bytes")))]),
         )];
-        let err = rows_to_record_batch(&rows, &schema, Level(1)).unwrap_err();
+        let err = rows_to_record_batch(&rows, &schema, FileFormat::default_for_level(Level(1)))
+            .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("FixedLenByteArray") && msg.contains("wrong length"),
@@ -611,7 +619,8 @@ mod tests {
             ikey,
             Row::new(vec![Some(FieldValue::Bytes(Bytes::from("abcd")))]),
         )];
-        let batch = rows_to_record_batch(&rows, &schema, Level(1)).unwrap();
+        let batch =
+            rows_to_record_batch(&rows, &schema, FileFormat::default_for_level(Level(1))).unwrap();
         let decoded = record_batch_to_rows(&batch, &schema).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].1, rows[0].1);
@@ -627,7 +636,12 @@ mod tests {
             None, // flag is nullable
             Some(FieldValue::Double(123.456)),
         ]);
-        let batch = rows_to_record_batch(&[(ikey, row.clone())], &schema, Level(1)).unwrap();
+        let batch = rows_to_record_batch(
+            &[(ikey, row.clone())],
+            &schema,
+            merutable_types::level::FileFormat::Columnar,
+        )
+        .unwrap();
         let decoded = record_batch_to_rows(&batch, &schema).unwrap();
         assert_eq!(decoded[0].1, row);
         assert_eq!(decoded[0].1.get(1), None);
@@ -640,7 +654,8 @@ mod tests {
     #[test]
     fn empty_batch_decodes_to_empty_vec() {
         let schema = scalar_schema();
-        let batch = rows_to_record_batch(&[], &schema, Level(1)).unwrap();
+        let batch =
+            rows_to_record_batch(&[], &schema, FileFormat::default_for_level(Level(1))).unwrap();
         assert_eq!(batch.num_rows(), 0);
         let decoded = record_batch_to_rows(&batch, &schema).unwrap();
         assert!(decoded.is_empty());

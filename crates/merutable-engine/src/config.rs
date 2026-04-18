@@ -1,3 +1,4 @@
+use merutable_types::level::{FileFormat, Level};
 use merutable_types::schema::TableSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -51,6 +52,36 @@ pub struct EngineConfig {
     /// older snapshot may still be mid-read of the old files; deleting them
     /// causes read failures. Default: 300 (5 minutes). Set to 0 for tests.
     pub gc_grace_period_secs: u64,
+
+    /// Issue #15: highest LSM level (inclusive) whose SSTables carry
+    /// the row-blob fast-path (`_merutable_value`) alongside typed
+    /// columns. Levels beyond this carry typed columns only.
+    ///
+    /// - `Some(0)` — L0 dual, L1+ columnar-only. Default; matches
+    ///   the pre-Issue-#15 hard-coded behavior (HTAP generic bias).
+    /// - `Some(N)` — L0..=LN dual, LN+1+ columnar-only (OLTP-leaning,
+    ///   push fast-path deeper so hot keys at L2/L3 resolve in a
+    ///   single column-chunk decode).
+    /// - `None`    — every level columnar-only (OLAP / append-only;
+    ///   saves bytes across the whole tree).
+    ///
+    /// Changing this at runtime affects NEW compactions only.
+    /// Existing files retain their write-time format (stamped in
+    /// `ParquetFileMeta::format`).
+    pub dual_format_max_level: Option<u8>,
+}
+
+impl EngineConfig {
+    /// Issue #15: the physical format that a NEWLY-WRITTEN file at
+    /// `output_level` should use. Called by flush and compaction
+    /// when handing off to `write_sorted_rows`.
+    #[inline]
+    pub fn file_format_for(&self, output_level: Level) -> FileFormat {
+        match self.dual_format_max_level {
+            Some(max) if output_level.0 <= max => FileFormat::Dual,
+            _ => FileFormat::Columnar,
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -82,6 +113,8 @@ impl Default for EngineConfig {
             compaction_parallelism: 2,
             read_only: false,
             gc_grace_period_secs: 300,
+            // Default matches the pre-Issue-#15 hard-coded behavior.
+            dual_format_max_level: Some(0),
         }
     }
 }

@@ -580,6 +580,7 @@ mod tests {
             dv_path: None,
             dv_offset: None,
             dv_length: None,
+            format: None,
         }
     }
 

@@ -292,8 +292,14 @@ async fn l1_file_is_readable_by_upstream_parquet_without_value_blob() {
         rows.push((ikey, row));
     }
 
-    let (parquet_bytes, _bloom, _meta) =
-        write_sorted_rows(rows, schema.clone(), Level(1), 10).unwrap();
+    let (parquet_bytes, _bloom, _meta) = write_sorted_rows(
+        rows,
+        schema.clone(),
+        Level(1),
+        merutable_types::level::FileFormat::Columnar,
+        10,
+    )
+    .unwrap();
     assert!(!parquet_bytes.is_empty(), "L1 writer produced empty file");
 
     // Open with the upstream parquet crate, again zero merutable code on
