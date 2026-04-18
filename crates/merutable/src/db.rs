@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use merutable_engine::{config::EngineConfig, engine::MeruEngine};
+use merutable_engine::{background::BackgroundWorkers, config::EngineConfig, engine::MeruEngine};
 use merutable_types::{
     key::InternalKey,
     schema::TableSchema,
@@ -61,6 +61,17 @@ use crate::options::OpenOptions;
 /// ```
 pub struct MeruDB {
     engine: Arc<MeruEngine>,
+    /// Background flush + compaction workers — spawned automatically
+    /// on a non-read-only `open` whenever `flush_parallelism > 0` or
+    /// `compaction_parallelism > 0`. Fixes Issue #4: the configuration
+    /// promised N parallel workers, but without this spawn call
+    /// `compact()` and `flush()` only ran when the caller invoked
+    /// them, so a deep L2→L3 compaction could block L0 drainage for
+    /// tens of minutes even with `compaction_parallelism: 2`
+    /// configured. Held behind a `tokio::sync::Mutex<Option<_>>` so
+    /// `close()` can `take()` and `shutdown().await` the workers
+    /// before the engine's final flush.
+    background: tokio::sync::Mutex<Option<BackgroundWorkers>>,
 }
 
 impl MeruDB {
@@ -79,7 +90,21 @@ impl MeruDB {
 
         let engine = MeruEngine::open(config).await?;
 
-        Ok(Self { engine })
+        // Spawn background workers for non-read-only instances. Users
+        // who set `flush_parallelism = 0` AND `compaction_parallelism = 0`
+        // can still opt out: `BackgroundWorkers::spawn` is a no-op when
+        // both counts are zero. Read-only replicas never need writers —
+        // they use `refresh()` to pick up new snapshots from the primary.
+        let background = if options.read_only {
+            None
+        } else {
+            Some(BackgroundWorkers::spawn(engine.clone()))
+        };
+
+        Ok(Self {
+            engine,
+            background: tokio::sync::Mutex::new(background),
+        })
     }
 
     /// Open a read-only replica. No WAL, no writes. Call `refresh()` to
@@ -202,6 +227,16 @@ impl MeruDB {
     ///
     /// Calling `close()` more than once is a no-op.
     pub async fn close(&self) -> Result<()> {
+        // Shut down background workers FIRST so they don't fight with
+        // the engine's final flush for the rotation lock, and so any
+        // in-flight compaction finishes cleanly. `shutdown()` awaits
+        // each worker's `JoinHandle`, guaranteeing no background
+        // tokio task is still holding `Arc<MeruEngine>` when we
+        // proceed to seal the engine.
+        let workers = self.background.lock().await.take();
+        if let Some(w) = workers {
+            w.shutdown().await;
+        }
         self.engine.close().await
     }
 
