@@ -20,7 +20,11 @@ use merutable_iceberg::{
 };
 use merutable_parquet::reader::ParquetReader;
 use merutable_types::{
-    level::Level, level::ParquetFileMeta, schema::TableSchema, MeruError, Result,
+    level::Level,
+    level::ParquetFileMeta,
+    schema::TableSchema,
+    value::{FieldValue, Row},
+    MeruError, Result,
 };
 use roaring::RoaringBitmap;
 use tracing::{debug, info, instrument, warn};
@@ -80,6 +84,88 @@ fn open_source_file(
     };
 
     Ok((reader, dv))
+}
+
+/// Estimate the in-memory byte footprint of a row — sum of field byte
+/// sizes across the schema's columns. Used to bound compaction output
+/// file size (Issue #3: Arrow's `BinaryArray` uses i32 offsets, so a
+/// single `ByteArray` column aggregated across all rows cannot exceed
+/// `i32::MAX` ≈ 2.14 GiB, and exceeding it panics the process). The
+/// estimate is conservative: the actual Parquet encoding is typically
+/// smaller due to dictionary + RLE + compression, so capping on this
+/// estimate leaves a comfortable safety margin versus the hard Arrow
+/// limit.
+fn estimate_row_bytes(row: &Row) -> u64 {
+    let mut total: u64 = 0;
+    for fv in row.fields.iter().flatten() {
+        total += match fv {
+            FieldValue::Boolean(_) => 1,
+            FieldValue::Int32(_) | FieldValue::Float(_) => 4,
+            FieldValue::Int64(_) | FieldValue::Double(_) => 8,
+            // +8 accounts for the i32 offset + dictionary overhead
+            // that inflates the accumulated in-memory representation
+            // before compression.
+            FieldValue::Bytes(b) => b.len() as u64 + 8,
+        };
+    }
+    total
+}
+
+/// Target uncompressed bytes per compaction output file. Arrow's
+/// `BinaryArray` caps a single column at i32::MAX (~2.14 GiB); keep
+/// output files well under that so even a pathological skewed payload
+/// distribution cannot overflow a single column. 512 MiB gives a 4×
+/// safety margin versus the hard limit.
+const TARGET_OUTPUT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Per-chunk accumulator while splitting compaction output into
+/// multiple files. A new chunk starts when the current one exceeds
+/// `TARGET_OUTPUT_FILE_BYTES` AND the next entry has a different
+/// `user_key` — splitting inside a user_key would produce two L1+
+/// files both containing the same user_key, breaking the non-overlap
+/// invariant that point-lookup binary search relies on.
+struct OutputChunk {
+    rows: Vec<(merutable_types::key::InternalKey, Row)>,
+    seq_min: u64,
+    seq_max: u64,
+    key_min: Vec<u8>,
+    key_max: Vec<u8>,
+    approx_bytes: u64,
+    last_user_key: Vec<u8>,
+}
+
+impl OutputChunk {
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            seq_min: u64::MAX,
+            seq_max: 0,
+            key_min: Vec::new(),
+            key_max: Vec::new(),
+            approx_bytes: 0,
+            last_user_key: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, ikey: merutable_types::key::InternalKey, row: Row, est_bytes: u64) {
+        let uk = ikey.user_key_bytes().to_vec();
+        let s = ikey.seq.0;
+        if s < self.seq_min {
+            self.seq_min = s;
+        }
+        if s > self.seq_max {
+            self.seq_max = s;
+        }
+        if self.key_min.is_empty() || uk.as_slice() < self.key_min.as_slice() {
+            self.key_min = uk.clone();
+        }
+        if uk.as_slice() > self.key_max.as_slice() {
+            self.key_max.clone_from(&uk);
+        }
+        self.approx_bytes = self.approx_bytes.saturating_add(est_bytes);
+        self.last_user_key = uk;
+        self.rows.push((ikey, row));
+    }
 }
 
 /// Compute the union `[key_min, key_max]` range across a set of files.
@@ -350,57 +436,75 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
         );
     }
 
-    // Collect surviving entries. Since this path always reads every
-    // physical row of every input file (see the `read_physical_rows_*`
-    // call above), every input file is fully consumed and will be removed
-    // from the manifest below. A future partial-compaction mode could
-    // re-introduce per-file DV stamping, but the current model is
-    // full-level in → full-level out, so tracking "promoted" positions is
-    // redundant — and the old path was buggy because it only marked
-    // *winner* positions, leaving deduped-away older duplicates in the
-    // source file for the read path to rediscover.
-    let mut output_rows: Vec<(
-        merutable_types::key::InternalKey,
-        merutable_types::value::Row,
-    )> = Vec::new();
-    let mut seq_min: u64 = u64::MAX;
-    let mut seq_max: u64 = 0;
-    let mut key_min: Option<Vec<u8>> = None;
-    let mut key_max: Option<Vec<u8>> = None;
+    // Collect surviving entries and split into multiple output chunks
+    // so no single file's aggregate-column-bytes can overflow Arrow's
+    // i32 byte-array offset limit (~2.14 GiB per column). Issue #3:
+    // a 10 GiB HTAP stress test panicked in
+    // `arrow_array::builder::GenericBytesBuilder::append_value` when
+    // a single ByteArray column in the output exceeded 2 GiB. Cap at
+    // `TARGET_OUTPUT_FILE_BYTES` per chunk with 4× safety margin.
+    //
+    // Chunk boundaries MUST fall between different user_keys: two
+    // L1+ files both containing user_key `X` would violate the
+    // non-overlap invariant that `find_file_for_key` binary search
+    // relies on. The iterator emits entries sorted by (user_key ASC,
+    // seq DESC), so consecutive entries with the same user_key stay
+    // in the same chunk even if the byte budget is exceeded.
+    let mut chunks: Vec<OutputChunk> = Vec::new();
+    let mut current = OutputChunk::empty();
 
     for entry in iter {
-        let uk = entry.ikey.user_key_bytes().to_vec();
-        let s = entry.ikey.seq.0;
-        if s < seq_min {
-            seq_min = s;
+        let est = estimate_row_bytes(&entry.row) + entry.ikey.user_key_bytes().len() as u64 + 16;
+        let uk = entry.ikey.user_key_bytes();
+        // Start a new chunk when:
+        //   (a) the current chunk has content,
+        //   (b) adding this entry would exceed the target size,
+        //   (c) this entry's user_key differs from the last — safe
+        //       split point (otherwise two files would share a key).
+        if !current.rows.is_empty()
+            && current.approx_bytes.saturating_add(est) > TARGET_OUTPUT_FILE_BYTES
+            && current.last_user_key.as_slice() != uk
+        {
+            chunks.push(std::mem::replace(&mut current, OutputChunk::empty()));
         }
-        if s > seq_max {
-            seq_max = s;
-        }
-        match &key_min {
-            Some(k) if k.as_slice() <= uk.as_slice() => {}
-            _ => key_min = Some(uk.clone()),
-        }
-        match &key_max {
-            Some(k) if k.as_slice() >= uk.as_slice() => {}
-            _ => key_max = Some(uk.clone()),
-        }
-        output_rows.push((entry.ikey, entry.row));
+        current.push(entry.ikey, entry.row, est);
+    }
+    if !current.rows.is_empty() {
+        chunks.push(current);
     }
 
-    let num_output_rows = output_rows.len();
+    let total_output_rows: u64 = chunks.iter().map(|c| c.rows.len() as u64).sum();
 
     // Build the snapshot transaction up front so we can commit even when
     // the compaction output is empty (pure tombstone drop at the bottom).
     let mut txn = SnapshotTransaction::new();
 
-    if num_output_rows > 0 {
-        // Write output Parquet file.
+    // Write each chunk as its own Parquet file. Each gets its own
+    // UUID, its own bloom filter, its own KvSparseIndex. Output L1+
+    // non-overlap is preserved because chunk boundaries are between
+    // different user_keys (see iterator contract above).
+    if !chunks.is_empty() {
+        engine.catalog.ensure_level_dir(pick.output_level).await?;
+    }
+    for chunk in chunks {
+        if chunk.rows.is_empty() {
+            continue;
+        }
+        let chunk_rows = chunk.rows.len() as u64;
+        let seq_min = if chunk.seq_min == u64::MAX {
+            0
+        } else {
+            chunk.seq_min
+        };
+        let seq_max = chunk.seq_max;
+        let key_min = chunk.key_min;
+        let key_max = chunk.key_max;
+
         let file_id = uuid::Uuid::new_v4().to_string();
         let output_path = format!("data/L{}/{file_id}.parquet", pick.output_level.0);
 
         let (parquet_bytes, _, _) = merutable_parquet::writer::write_sorted_rows(
-            output_rows,
+            chunk.rows,
             engine.schema.clone(),
             pick.output_level,
             engine.config.bloom_bits_per_key,
@@ -413,7 +517,6 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
         }
         let file_size = parquet_bytes.len() as u64;
 
-        engine.catalog.ensure_level_dir(pick.output_level).await?;
         let full_path = engine.catalog.data_file_path(pick.output_level, &file_id);
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -442,11 +545,11 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
 
         let meta = ParquetFileMeta {
             level: pick.output_level,
-            seq_min: if seq_min == u64::MAX { 0 } else { seq_min },
+            seq_min,
             seq_max,
-            key_min: key_min.unwrap_or_default(),
-            key_max: key_max.unwrap_or_default(),
-            num_rows: num_output_rows as u64,
+            key_min,
+            key_max,
+            num_rows: chunk_rows,
             file_size,
             dv_path: None,
             dv_offset: None,
@@ -456,7 +559,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
         txn.add_file(IcebergDataFile {
             path: output_path,
             file_size,
-            num_rows: num_output_rows as u64,
+            num_rows: chunk_rows,
             meta,
         });
     }
@@ -521,7 +624,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     info!(
         input_level = pick.input_level.0,
         output_level = pick.output_level.0,
-        output_rows = num_output_rows,
+        output_rows = total_output_rows,
         "compaction committed"
     );
 
