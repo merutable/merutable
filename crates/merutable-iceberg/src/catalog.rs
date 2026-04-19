@@ -97,9 +97,11 @@ impl IcebergCatalog {
                 .trim()
                 .parse()
                 .map_err(|_| MeruError::Corruption("bad version-hint".into()))?;
-            let meta_path = metadata_dir.join(format!("v{ver}.metadata.json"));
-            let data = tokio::fs::read(&meta_path).await.map_err(MeruError::Io)?;
-            let mut manifest = Manifest::from_json(&data)?;
+            // Issue #28 Phase 3: dual-read. Prefer .pb (protobuf)
+            // if present; fall back to .json. Both decoders then
+            // produce the same native `Manifest` struct.
+            let data = read_manifest_payload(&metadata_dir, ver).await?;
+            let mut manifest = decode_manifest(&data)?;
             // Legacy-upgrade path: manifests written by pre-Iceberg-enrichment
             // merutable carry neither a `table_uuid` nor `last_updated_ms`.
             // Mint the uuid here — `apply()` will carry it forward to every
@@ -123,7 +125,11 @@ impl IcebergCatalog {
                 while let Ok(Some(e)) = entries.next_entry().await {
                     let name = e.file_name();
                     let n = name.to_string_lossy();
-                    if n.starts_with('v') && n.ends_with(".metadata.json") {
+                    // Issue #28 Phase 3: recognise both the legacy
+                    // `.metadata.json` and the new `.metadata.pb`.
+                    if n.starts_with('v')
+                        && (n.ends_with(".metadata.json") || n.ends_with(".metadata.pb"))
+                    {
                         has_existing_metadata = true;
                         break;
                     }
@@ -537,6 +543,41 @@ impl IcebergCatalog {
     }
 }
 
+// ── Dual-read helpers (Issue #28 Phase 3) ────────────────────────────────────
+
+/// Locate the on-disk bytes for version `ver`. Prefers
+/// `v{ver}.metadata.pb` (the Issue #28 Phase-3+ protobuf format).
+/// Falls back to `v{ver}.metadata.json` (legacy) when the `.pb`
+/// file is absent. Returns the raw bytes so the caller can dispatch
+/// on magic — this keeps the I/O step separate from the decode step
+/// for cleaner error attribution.
+async fn read_manifest_payload(metadata_dir: &std::path::Path, ver: i64) -> Result<Vec<u8>> {
+    let pb_path = metadata_dir.join(format!("v{ver}.metadata.pb"));
+    if pb_path.exists() {
+        return tokio::fs::read(&pb_path).await.map_err(MeruError::Io);
+    }
+    let json_path = metadata_dir.join(format!("v{ver}.metadata.json"));
+    tokio::fs::read(&json_path).await.map_err(MeruError::Io)
+}
+
+/// Decode a manifest payload by sniffing the leading bytes. The
+/// protobuf wire format always starts with the "MRUB" magic; JSON
+/// always starts with `{`. Anything else is a corrupted header and
+/// surfaces as `MeruError::Corruption` rather than a misleading
+/// parse error deep inside the decoder.
+fn decode_manifest(data: &[u8]) -> Result<Manifest> {
+    if data.len() >= 4 && &data[0..4] == b"MRUB" {
+        Manifest::from_protobuf(data)
+    } else if data.first().copied() == Some(b'{') {
+        Manifest::from_json(data)
+    } else {
+        let head: Vec<u8> = data.iter().take(8).copied().collect();
+        Err(MeruError::Corruption(format!(
+            "manifest payload has neither \"MRUB\" magic nor leading '{{': head={head:02X?}"
+        )))
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -935,5 +976,93 @@ mod tests {
         let tm = parsed.unwrap();
         assert_eq!(tm.last_sequence_number(), 1);
         assert_eq!(tm.current_snapshot_id(), Some(1));
+    }
+
+    /// Issue #28 Phase 3: dual-read. A catalog directory that was
+    /// seeded with a `v1.metadata.pb` (protobuf, "MRUB" magic) opens
+    /// cleanly and the loaded manifest round-trips every field.
+    #[tokio::test]
+    async fn open_reads_protobuf_manifest_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed the catalog dir with a protobuf-encoded v1 manifest.
+        let metadata = tmp.path().join("metadata");
+        tokio::fs::create_dir_all(&metadata).await.unwrap();
+        let mut m = Manifest::empty(test_schema());
+        m.snapshot_id = 1;
+        let pb_bytes = m.to_protobuf().unwrap();
+        tokio::fs::write(metadata.join("v1.metadata.pb"), &pb_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("version-hint.text"), "1")
+            .await
+            .unwrap();
+
+        // Reopen. The catalog must pick up the .pb file, decode it
+        // via protobuf (not JSON), and expose the same snapshot_id.
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+        let current = catalog.current_manifest().await;
+        assert_eq!(current.snapshot_id, 1);
+        assert_eq!(current.schema.table_name, "test");
+    }
+
+    /// Dual-read: when BOTH v1.metadata.pb and v1.metadata.json
+    /// exist for the same version, the protobuf wins. Rationale:
+    /// the dual-write path (Phase 4, future) will emit both; if they
+    /// ever disagree it's a bug, and we pick the canonical new
+    /// format. Document this tiebreak as an explicit test.
+    #[tokio::test]
+    async fn dual_read_prefers_protobuf_over_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata = tmp.path().join("metadata");
+        tokio::fs::create_dir_all(&metadata).await.unwrap();
+
+        // Write conflicting snapshot_ids to show which one wins:
+        // JSON claims 999, protobuf claims 7. Protobuf must win.
+        let mut json_m = Manifest::empty(test_schema());
+        json_m.snapshot_id = 999;
+        tokio::fs::write(metadata.join("v1.metadata.json"), json_m.to_json().unwrap())
+            .await
+            .unwrap();
+        let mut pb_m = Manifest::empty(test_schema());
+        pb_m.snapshot_id = 7;
+        tokio::fs::write(metadata.join("v1.metadata.pb"), pb_m.to_protobuf().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("version-hint.text"), "1")
+            .await
+            .unwrap();
+
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+        assert_eq!(catalog.current_manifest().await.snapshot_id, 7);
+    }
+
+    /// Orphan-metadata detection recognises both .pb and .json.
+    /// Without this the orphan check misses pre-existing protobuf
+    /// snapshots and silently initializes a fresh catalog over them.
+    #[tokio::test]
+    async fn open_rejects_initializing_fresh_over_existing_protobuf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata = tmp.path().join("metadata");
+        tokio::fs::create_dir_all(&metadata).await.unwrap();
+        // Create a .pb file WITHOUT a version-hint to simulate
+        // lost-hint recovery scenario.
+        let m = Manifest::empty(test_schema());
+        tokio::fs::write(metadata.join("v42.metadata.pb"), m.to_protobuf().unwrap())
+            .await
+            .unwrap();
+
+        let err = match IcebergCatalog::open(tmp.path(), test_schema()).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected open to refuse orphan-metadata scenario"),
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("version-hint.text is missing"),
+            "expected orphan detection to fire, got: {msg}"
+        );
     }
 }
