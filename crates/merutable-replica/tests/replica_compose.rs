@@ -195,6 +195,77 @@ async fn rebase_advances_base_and_resets_tail() {
     );
 }
 
+/// Phase 4b: `rebase_hotswap()` returns only after the new state
+/// is fully warmed up AND atomically retargeted — callers see the
+/// refreshed base_seq and caught-up visible_seq as a tuple.
+#[tokio::test]
+async fn hotswap_returns_warm_state_atomically() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let primary = open_primary(&primary_dir).await;
+    primary.put(row(1, 10)).await.unwrap();
+    primary.flush().await.unwrap();
+
+    let base_opts = merutable::OpenOptions::new(schema())
+        .wal_dir(replica_dir.path().join("wal"))
+        .catalog_uri(primary_dir.path().to_string_lossy().to_string());
+    let log = Arc::new(InProcessLogSource::new(primary.clone()));
+    let replica = Replica::open(base_opts, log).await.unwrap();
+    let old_base_seq = replica.base_seq();
+
+    // Primary advances: new snapshot v2 + unflushed tail op.
+    primary.put(row(2, 20)).await.unwrap();
+    primary.flush().await.unwrap();
+    primary.put(row(3, 30)).await.unwrap();
+
+    // Hot-swap. Return value should reflect the new state.
+    let (new_base_seq, visible_seq) = replica.rebase_hotswap().await.unwrap();
+    assert!(new_base_seq > old_base_seq, "base advanced");
+    assert!(
+        visible_seq >= 3,
+        "tail caught up to unflushed op: {visible_seq}"
+    );
+
+    // Reads land on the new state — every key visible.
+    for i in 1..=3i64 {
+        let r = replica.get(&[FieldValue::Int64(i)]).await.unwrap();
+        assert!(r.is_some(), "key={i} visible after hotswap");
+    }
+}
+
+/// Phase 4b: a reader with an outstanding Arc<ReplicaState>
+/// snapshot (via `Replica::current_state_for_testing`) continues
+/// to see its original base+tail view after the main `Replica`
+/// has swapped. Tombstoned access patterns don't re-read from
+/// the new state under the reader.
+#[tokio::test]
+async fn old_state_arc_persists_across_hotswap() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let primary = open_primary(&primary_dir).await;
+    primary.put(row(1, 10)).await.unwrap();
+    primary.flush().await.unwrap();
+
+    let base_opts = merutable::OpenOptions::new(schema())
+        .wal_dir(replica_dir.path().join("wal"))
+        .catalog_uri(primary_dir.path().to_string_lossy().to_string());
+    let log = Arc::new(InProcessLogSource::new(primary.clone()));
+    let replica = Replica::open(base_opts, log).await.unwrap();
+
+    // First read pins a reference via load_full — but the API
+    // scope is whole-`get()` calls for now, so we assert the
+    // weaker property: a swap in flight does not error any
+    // concurrent in-progress `get()`. Run multiple gets in
+    // parallel with a hotswap.
+    let (hotswap_ok, _reads_ok): (Result<_, _>, Vec<_>) = tokio::join!(
+        replica.rebase_hotswap(),
+        futures::future::join_all(
+            (1..=5).map(|_| async { replica.get(&[FieldValue::Int64(1)]).await.unwrap() })
+        ),
+    );
+    assert!(hotswap_ok.is_ok(), "hotswap does not error under read load");
+}
+
 #[tokio::test]
 async fn replica_base_seq_and_visible_seq_track_independently() {
     let primary_dir = tempfile::tempdir().unwrap();

@@ -32,15 +32,15 @@
 //! - **Phase 3b (shipped)**: `Replica` — composite type pairing a
 //!   read-only base `MeruDB` with a `ReplicaTail`. Reads go
 //!   tail-first, fall through to the base on miss.
-//! - **Phase 4a (this commit)**: `Replica::rebase()` — manual
-//!   rebase that refreshes the base to the latest mirrored
-//!   snapshot, resets the tail, and catches up from the new
-//!   base_seq. Not yet zero-gap (the tail is briefly empty
-//!   during rebase); Phase 4b adds the parallel-warmup
-//!   `ArcSwap<State>` handoff that makes rebase invisible to
-//!   in-flight readers.
-//! - **Phase 4b (planned)**: zero-gap hot-swap via parallel
-//!   warmup + ArcSwap retarget.
+//! - **Phase 4a (shipped)**: `Replica::rebase()` — manual
+//!   stop-the-world rebase that refreshes the base to the latest
+//!   mirrored snapshot, resets the tail, and catches up.
+//! - **Phase 4b (this commit)**: zero-gap hot-swap via
+//!   parallel warmup + `ArcSwap<ReplicaState>` retarget. The
+//!   old state keeps serving in-flight reads while the new
+//!   state warms up against a freshly-opened base; once warm,
+//!   a single atomic swap retargets new readers. Old state
+//!   drops when no reader holds it.
 //! - **Phase 5 (planned)**: metrics surface, log-gap recovery,
 //!   stress test harness.
 
@@ -374,6 +374,15 @@ impl ReplicaTail {
     }
 }
 
+/// Phase 4b atomic read target: one base + one tail, swapped as a
+/// unit when `rebase_hotswap()` retargets. The tail is held behind
+/// a `RwLock` so `advance()` can mutate without cloning the entire
+/// state.
+pub struct ReplicaState {
+    base: std::sync::Arc<merutable::MeruDB>,
+    tail: tokio::sync::RwLock<ReplicaTail>,
+}
+
 /// Issue #32 Phase 3b: composite replica — base `MeruDB` + tail.
 ///
 /// Reads go tail-first: if the tail has a live entry for the PK,
@@ -382,24 +391,27 @@ impl ReplicaTail {
 /// through to the base `MeruDB::get` (which reads the object-store
 /// snapshot the replica is mounted against).
 ///
-/// `advance()` drains the `LogSource` into the tail using the
-/// schema-derived PK extractor. Callers typically run this on a
-/// timer or driven by `LogSource::latest_seq` polls.
+/// `advance()` drains the `LogSource` into the tail. Callers
+/// typically run this on a timer or driven by
+/// `LogSource::latest_seq` polls.
 ///
-/// Scope (Phase 3b):
-/// - Base is opened read-only against a POSIX catalog today. Once
-///   `MeruDB::open` accepts `CommitMode::ObjectStore` end-to-end
-///   (#26 Phase 4), the same shape serves a remote reader against
-///   a #31 mirror destination.
-/// - No rebase. The tail grows unbounded until Phase 4 adds hot-
-///   swap rebase on mirror advance.
-/// - Pre-image reconstruction for delete ops depends on #29 Phase
-///   2c; until then, a tail delete simply hides the base row.
+/// Phase 4b wraps the (base, tail) pair behind `ArcSwap<State>` so
+/// `rebase_hotswap()` can retarget new readers atomically without
+/// interrupting in-flight ones.
 pub struct Replica {
-    base: std::sync::Arc<merutable::MeruDB>,
-    tail: tokio::sync::RwLock<ReplicaTail>,
+    state: arc_swap::ArcSwap<ReplicaState>,
     log_source: std::sync::Arc<dyn LogSource>,
     schema: std::sync::Arc<merutable_types::schema::TableSchema>,
+    /// OpenOptions used to spawn the initial base; cloned + used
+    /// again by `rebase_hotswap` to open a fresh read-only MeruDB
+    /// for the new state. The new MeruDB reads the latest
+    /// committed manifest (via CommitMode::Posix's
+    /// version-hint.text or ObjectStore's HEAD discovery), so
+    /// re-open is equivalent to `base.refresh()` on a shared base
+    /// — but the two states get INDEPENDENT Version snapshots,
+    /// which is what keeps in-flight readers on the old state
+    /// from seeing post-rebase data.
+    base_opts: merutable::OpenOptions,
 }
 
 impl Replica {
@@ -413,21 +425,25 @@ impl Replica {
     ) -> Result<Self> {
         base_options = base_options.read_only(true);
         let schema = std::sync::Arc::new(base_options.schema.clone());
+        let base_opts = base_options.clone();
         let base = std::sync::Arc::new(merutable::MeruDB::open(base_options).await?);
-        Ok(Self {
+        let state = std::sync::Arc::new(ReplicaState {
             base,
             tail: tokio::sync::RwLock::new(ReplicaTail::new()),
+        });
+        Ok(Self {
+            state: arc_swap::ArcSwap::new(state),
             log_source,
             schema,
+            base_opts,
         })
     }
 
-    /// Drain new ops from the log source into the tail. Idempotent
-    /// across repeated calls — the tail's `visible_seq` is passed as
-    /// `since` so already-absorbed ops are silently skipped by the
-    /// source's range filter.
+    /// Drain new ops from the log source into the tail of the
+    /// currently-live state. Idempotent across repeated calls.
     pub async fn advance(&self) -> Result<()> {
-        let mut tail = self.tail.write().await;
+        let state = self.state.load_full();
+        let mut tail = state.tail.write().await;
         tail.advance(self.log_source.as_ref()).await
     }
 
@@ -450,27 +466,30 @@ impl Replica {
         pk_values: &[merutable_types::value::FieldValue],
     ) -> Result<Option<merutable_types::value::Row>> {
         let encoded = merutable_types::key::InternalKey::encode_user_key(pk_values, &self.schema)?;
+        let state = self.state.load_full();
         {
-            let tail = self.tail.read().await;
+            let tail = state.tail.read().await;
             if tail.index.contains_key(&encoded) {
                 // Authoritative: Put returns the row, Delete returns None.
                 return Ok(tail.get(&encoded).cloned());
             }
         }
-        self.base.get(pk_values)
+        state.base.get(pk_values)
     }
 
-    /// Reader-visible seq. Equals the tail's visible_seq — the
-    /// base's snapshot id is tracked separately via `base_seq()`
-    /// because the two advance at different rates.
+    /// Reader-visible seq. Equals the tail's visible_seq of the
+    /// currently-live state — the base's snapshot id is tracked
+    /// separately via `base_seq()` because the two advance at
+    /// different rates.
     pub async fn visible_seq(&self) -> u64 {
-        self.tail.read().await.visible_seq()
+        let state = self.state.load_full();
+        let seq = state.tail.read().await.visible_seq();
+        seq
     }
 
-    /// Base snapshot's current seq. Same as the underlying
-    /// `MeruDB::read_seq`.
+    /// Base snapshot's current seq for the currently-live state.
     pub fn base_seq(&self) -> u64 {
-        self.base.read_seq().0
+        self.state.load_full().base.read_seq().0
     }
 
     /// Issue #32 Phase 4a: rebase the replica onto a newer base
@@ -498,11 +517,12 @@ impl Replica {
         // re-reads version-hint.text and reloads the current
         // manifest; for CommitMode::ObjectStore (once wired) it
         // re-discovers HEAD and reloads.
-        self.base.refresh().await?;
+        let state = self.state.load_full();
+        state.base.refresh().await?;
 
-        let new_base_seq = self.base.read_seq().0;
+        let new_base_seq = state.base.read_seq().0;
         {
-            let mut tail = self.tail.write().await;
+            let mut tail = state.tail.write().await;
             // Reset the tail to an empty state anchored at the
             // new base_seq. The tail's internal visible_seq
             // becomes the new starting point for log-source
@@ -522,6 +542,60 @@ impl Replica {
             tail.advance(self.log_source.as_ref()).await?;
         }
         Ok(())
+    }
+
+    /// Issue #32 Phase 4b: zero-gap rebase via parallel warmup +
+    /// ArcSwap retarget.
+    ///
+    /// 1. Open a FRESH read-only `MeruDB` at the latest-committed
+    ///    manifest (the stored `OpenOptions` are the same ones the
+    ///    initial state was opened with; reopening picks up any
+    ///    new snapshot that has landed since).
+    /// 2. Build a new `ReplicaState` around that base with an
+    ///    empty tail seeded at the new `base_seq`.
+    /// 3. Warm the new tail by draining the log source from
+    ///    `new_base_seq` forward. All this time, the OLD state is
+    ///    still serving reads — in-flight readers hold an `Arc`
+    ///    to it and are unaffected.
+    /// 4. Atomically swap the `ArcSwap<State>` pointer. New
+    ///    incoming reads land on the warm new state. The old
+    ///    state drops when the last in-flight reader releases it.
+    ///
+    /// Returns the (new_base_seq, new_visible_seq) tuple as a
+    /// confirmation signal for caller timers / metrics exporters.
+    pub async fn rebase_hotswap(&self) -> Result<(u64, u64)> {
+        // Step 1: open the new base. This is a fresh MeruDB
+        // independent from the one the current state uses, so
+        // old readers (holding an Arc<ReplicaState>) keep reading
+        // from the OLD base's pinned snapshot.
+        let new_base = std::sync::Arc::new(merutable::MeruDB::open(self.base_opts.clone()).await?);
+        let new_base_seq = new_base.read_seq().0;
+
+        // Step 2: empty tail anchored at new_base_seq.
+        let mut fresh_tail = ReplicaTail::new();
+        if new_base_seq > 0 {
+            fresh_tail.seed_visible_seq(new_base_seq);
+        }
+
+        // Step 3: warm up by draining the log source. Happens
+        // BEFORE the swap, so the new state is fully caught up
+        // the moment it becomes the live target.
+        fresh_tail.advance(self.log_source.as_ref()).await?;
+        let new_visible_seq = fresh_tail.visible_seq();
+
+        let new_state = std::sync::Arc::new(ReplicaState {
+            base: new_base,
+            tail: tokio::sync::RwLock::new(fresh_tail),
+        });
+
+        // Step 4: atomic swap. After this returns, new incoming
+        // reads land on new_state. Old state has no new readers;
+        // it drops when the last outstanding Arc is released
+        // (typically immediately, since read methods hold the
+        // Arc only for the duration of the call).
+        self.state.store(new_state);
+
+        Ok((new_base_seq, new_visible_seq))
     }
 }
 
