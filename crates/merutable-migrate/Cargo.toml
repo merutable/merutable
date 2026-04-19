@@ -16,6 +16,7 @@ merutable-iceberg     = { path = "../merutable-iceberg" }
 merutable-store       = { path = "../merutable-store" }
 merutable-types       = { path = "../merutable-types" }
 clap                  = { version = "4", features = ["derive"] }
+sha2                  = "0.10"
 tokio                 = { workspace = true, features = ["full"] }
 tracing               = { workspace = true }
 tracing-subscriber    = { version = "0.3", features = ["env-filter"] }

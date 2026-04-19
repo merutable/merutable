@@ -21,8 +21,12 @@
 //!   single transaction adding every copied file (v2). No DV
 //!   migration yet — a source catalog with non-empty DVs errors out;
 //!   Phase 3b will extend the copy step to puffin blobs.
-//! - Phase 4 (planned): `--resume`, `--verify`, `--keep-source` /
-//!   `--delete-source` lifecycle.
+//! - Phase 4a (this commit): `--verify` re-reads every destination
+//!   file and SHA-256 compares against the source. Catches silent
+//!   corruption / truncation beyond what tokio::fs::copy's OK return
+//!   proves.
+//! - Phase 4b (planned): `--resume` (re-entrant after crash),
+//!   `--keep-source` / `--delete-source` lifecycle.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -302,6 +306,61 @@ fn clone_meta(m: &ParquetFileMeta) -> ParquetFileMeta {
     }
 }
 
+/// Phase 4a: `--verify`. Re-read every migrated file from the
+/// destination and compare its content hash against the source.
+/// Doubles the I/O cost of a migration but catches corruption or
+/// truncation that slipped past the copy step (silent disk errors,
+/// partial writes on a crash, etc.).
+///
+/// We use SHA-256 so caller error reports don't accidentally match
+/// on a weak hash collision. The operations are parallelized via the
+/// same semaphore budget as the copy step.
+async fn verify_destination(
+    src: &str,
+    dst: &str,
+    plan: &MigrationPlan,
+    parallelism: usize,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let src_path = PathBuf::from(src);
+    let dst_path = PathBuf::from(dst);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallelism.max(1)));
+    let mut join = tokio::task::JoinSet::new();
+    for entry in &plan.data_files {
+        let sem = semaphore.clone();
+        let src_abs = src_path.join(&entry.path);
+        let dst_abs = dst_path.join(&entry.path);
+        let path = entry.path.clone();
+        join.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore never closed");
+            let src_bytes = tokio::fs::read(&src_abs).await.map_err(MeruError::Io)?;
+            let dst_bytes = tokio::fs::read(&dst_abs).await.map_err(MeruError::Io)?;
+            let src_hash = Sha256::digest(&src_bytes);
+            let dst_hash = Sha256::digest(&dst_bytes);
+            if src_hash != dst_hash {
+                return Err(MeruError::Corruption(format!(
+                    "verify: content mismatch at '{path}' \
+                     (src sha256 {src_hash:x} != dst sha256 {dst_hash:x})"
+                )));
+            }
+            Ok::<(), MeruError>(())
+        });
+    }
+    while let Some(res) = join.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => {
+                return Err(MeruError::ObjectStore(format!(
+                    "verify task panicked: {join_err}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Re-open the source catalog to grab the schema + entries — the
 /// initial plan builder hands back only file-level info, but Phase 3
 /// needs the full manifest to rebuild `IcebergDataFile` records.
@@ -450,6 +509,21 @@ fn run() -> std::result::Result<(), (i32, String)> {
             "migration complete: destination committed at v{committed_version} ({} files)",
             plan.data_files.len()
         );
+        if args.verify {
+            eprintln!(
+                "--verify: SHA-256 comparing {} source↔destination files...",
+                plan.data_files.len()
+            );
+            runtime
+                .block_on(verify_destination(
+                    &args.src,
+                    &args.dst,
+                    &plan,
+                    args.copy_parallelism,
+                ))
+                .map_err(|e| (9, format!("verification failed: {e}")))?;
+            eprintln!("--verify: all {} files match.", plan.data_files.len());
+        }
         return Ok(());
     }
 
@@ -662,6 +736,114 @@ mod tests {
             m.entries.iter().filter(|e| e.status != "deleted").count(),
             3
         );
+    }
+
+    /// Phase 4a: verify_destination passes when the destination
+    /// bytes match source bytes and fails loudly when any file
+    /// diverges.
+    #[tokio::test]
+    async fn verify_detects_destination_divergence() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dst.path().join("data/L0"))
+            .await
+            .unwrap();
+
+        // Write three files to both directories; the third one
+        // differs between src and dst.
+        for i in 0..3 {
+            let path = format!("data/L0/f{i}.parquet");
+            let src_body = format!("body-{i}").into_bytes();
+            tokio::fs::write(src.path().join(&path), &src_body)
+                .await
+                .unwrap();
+            let dst_body = if i == 2 {
+                b"CORRUPT".to_vec()
+            } else {
+                src_body.clone()
+            };
+            tokio::fs::write(dst.path().join(&path), &dst_body)
+                .await
+                .unwrap();
+        }
+
+        let plan = MigrationPlan {
+            source_snapshot_id: 1,
+            source_table_uuid: "fake".into(),
+            data_files: (0..3)
+                .map(|i| PlanEntry {
+                    path: format!("data/L0/f{i}.parquet"),
+                    bytes: 10,
+                    num_rows: 1,
+                    dv_path: None,
+                })
+                .collect(),
+            total_bytes: 30,
+        };
+
+        let err = verify_destination(
+            src.path().to_str().unwrap(),
+            dst.path().to_str().unwrap(),
+            &plan,
+            2,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("f2.parquet"),
+            "error must name divergent file: {msg}"
+        );
+        assert!(msg.contains("mismatch"), "error must name mismatch: {msg}");
+    }
+
+    /// Phase 4a: verify_destination passes when every file matches.
+    #[tokio::test]
+    async fn verify_passes_on_match() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dst.path().join("data/L0"))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let path = format!("data/L0/f{i}.parquet");
+            let body = format!("body-{i}").into_bytes();
+            tokio::fs::write(src.path().join(&path), &body)
+                .await
+                .unwrap();
+            tokio::fs::write(dst.path().join(&path), &body)
+                .await
+                .unwrap();
+        }
+
+        let plan = MigrationPlan {
+            source_snapshot_id: 1,
+            source_table_uuid: "fake".into(),
+            data_files: (0..3)
+                .map(|i| PlanEntry {
+                    path: format!("data/L0/f{i}.parquet"),
+                    bytes: 10,
+                    num_rows: 1,
+                    dv_path: None,
+                })
+                .collect(),
+            total_bytes: 30,
+        };
+
+        verify_destination(
+            src.path().to_str().unwrap(),
+            dst.path().to_str().unwrap(),
+            &plan,
+            2,
+        )
+        .await
+        .unwrap();
     }
 
     /// Phase 3 refuses to migrate a source with live DVs (deferred
