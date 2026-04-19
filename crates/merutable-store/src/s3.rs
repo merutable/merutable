@@ -90,6 +90,39 @@ impl MeruStore for S3Store {
         }
     }
 
+    /// Issue #26: S3-native conditional-PUT via `If-None-Match: *`
+    /// (GA November 2024). Uses `object_store`'s `PutMode::Create`,
+    /// which translates to the `If-None-Match: *` header and makes S3
+    /// reject the write with `412 Precondition Failed` when the key
+    /// already exists. That rejection surfaces here as
+    /// `object_store::Error::AlreadyExists` → mapped to our
+    /// `MeruError::AlreadyExists`.
+    ///
+    /// This override is mandatory for `CommitMode::ObjectStore` — the
+    /// racy `exists + put` default would let two concurrent writers
+    /// both succeed at committing the same version, corrupting the
+    /// backward-pointer chain.
+    async fn put_if_absent(&self, path: &str, data: Bytes) -> Result<()> {
+        use object_store::{ObjectStore, PutMode, PutOptions};
+        let loc = self.object_path(path);
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.inner.put_opts(&loc, data.into(), opts).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                Err(MeruError::AlreadyExists(path.into()))
+            }
+            // S3's If-None-Match failure also arrives as Precondition.
+            // Treat it identically — a concurrent writer won.
+            Err(object_store::Error::Precondition { .. }) => {
+                Err(MeruError::AlreadyExists(path.into()))
+            }
+            Err(e) => Err(MeruError::ObjectStore(e.to_string())),
+        }
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         use futures::TryStreamExt;
         use object_store::ObjectStore;
