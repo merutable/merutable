@@ -120,10 +120,7 @@ async fn single_flush_commit_writes_v1_metadata_and_hint() {
     names.sort();
     assert_eq!(
         names,
-        vec![
-            "v1.metadata.json".to_string(),
-            "v1.metadata.pb".to_string(),
-        ]
+        vec!["v1.metadata.json".to_string(), "v1.metadata.pb".to_string(),]
     );
 
     // The JSON must parse cleanly with the catalog's own decoder.
