@@ -477,6 +477,71 @@ person with a repro has a test to bisect against. If the bug is
 real, they'll land the fix; if it was a test-harness artifact, the
 scaffold clarifies that too.
 
+## HEAD discovery and the low-water pointer
+
+**Seen in**: Issue #26 Phase 6 — `ObjectStoreCatalog::reclaim_old_manifests`
+initially just deleted old manifests and called `refresh()`. Reopening
+landed on HEAD=0 because `discover_head` probes v1; with v1 reclaimed
+discovery thinks the catalog is empty.
+
+**Symptom**: Successful reclaim silently strands a multi-terabyte
+catalog: `open()` returns as if fresh and the next commit writes v1
+over the live chain.
+
+**Anti-pattern**: Running a pruning operation that breaks the very
+structural invariant the reader relies on to locate HEAD. "Delete
+old files" is never just a delete — the reader's contract must
+accommodate the new shape.
+
+**Discipline**: Every structural prune writes a pointer BEFORE the
+delete. `reclaim_old_manifests` writes `metadata/low_water.txt` with
+`cutoff+1`, then deletes `v1..=cutoff`. A crash between write and
+delete is harmless: discovery reads the pointer, starts probing from
+the new low-water, finds the chain intact. The pointer is small
+(single integer), cheap (one PUT), and monotonic (never rolls back),
+so concurrent openers and recovery agree on HEAD without locks.
+
+## Idempotent re-runs require explicit opt-in
+
+**Seen in**: Issue #27 Phase 4b — the migrator would write a second
+"all files added" commit to an already-migrated destination,
+producing duplicate entries or applier errors depending on apply()'s
+tolerance.
+
+**Symptom**: A perfectly-successful first run followed by an innocent
+ops-playbook rerun corrupts the destination manifest.
+
+**Anti-pattern**: Assuming tools will only be run once and making no
+provision for the opposite. Operators re-run tools constantly (cron,
+watchdogs, "did that actually work?" impulses); durable writes need
+to handle it.
+
+**Discipline**: Add an explicit `--resume` flag that short-circuits
+on "destination already matches source". Don't make this the default —
+the short-circuit hides genuine misconfiguration (wrong --dst),
+which operators need to see as an error. A structured "file sets
+differ" error when HEAD>1 but paths diverge tells them the
+destination was used for a different migration.
+
+## pending_deletions is a surface for operators, not a private cache
+
+**Seen in**: Issue #30 — RSS grows 2.6x logical writes with no
+introspection available to correlate the spike against any specific
+engine-side structure.
+
+**Symptom**: Operators report a memory leak; the fix requires
+guessing which internal queue is to blame.
+
+**Anti-pattern**: Maintaining operationally-critical state inside a
+tokio `Mutex<Vec<_>>` that `stats()` can't read synchronously. The
+blocking-on-a-locked-mutex workaround is worse than no stats at all.
+
+**Discipline**: Mirror the critical counters to lock-free primitives
+(`AtomicUsize`, `RwLock<Option<Instant>>`) updated at the Vec's
+mutation sites. `stats()` reads the mirror, never the Vec. A read
+during a GC sweep sees a by-one stale value — acceptable for a
+snapshot view, and still strictly better than no value.
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible
