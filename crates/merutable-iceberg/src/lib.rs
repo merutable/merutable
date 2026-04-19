@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod deletion_vector;
 pub mod manifest;
+pub mod manifest_pb;
 pub mod snapshot;
 pub mod translate;
 pub mod version;

@@ -1,0 +1,101 @@
+// Issue #28: merutable's internal catalog manifest format.
+//
+// Protobuf replaces JSON on disk (both CommitMode::Posix and
+// CommitMode::ObjectStore — see Issue #26). This is purely the
+// internal catalog file; Iceberg v2 translation (translate.rs) still
+// emits JSON `metadata.json` for external consumers.
+//
+// On-disk wire format wraps the protobuf payload in a small
+// framing header:
+//   +----------------+--------------+----------------+--------------------+
+//   | 4-byte magic   | 1-byte fmt   | 4-byte length  | protobuf payload   |
+//   | "MRUB" (0x4D52 | version      | (LE u32)       | (prost-encoded     |
+//   |   0x5542)      |              |                |  Manifest)         |
+//   +----------------+--------------+----------------+--------------------+
+//
+// Evolution rules:
+//   - Every Option-able field is `optional`.
+//   - Field numbers are immutable. Renames are editorial only.
+//   - New fields get new numbers. Never reuse removed numbers — we
+//     `reserved` the removed range.
+//   - A reader that encounters an unknown tag silently skips it
+//     (protobuf's default behavior). That's the correct forward-
+//     compat story for "new writer, old reader".
+
+syntax = "proto3";
+package merutable.catalog.v1;
+
+// A single data file in the manifest (Parquet SSTable).
+message DataFileRef {
+  string path = 1;
+  int64  file_size = 2;
+  int64  num_rows = 3;
+  int32  level = 4;
+
+  // Sequence number bounds for the file's contents.
+  int64  seq_min = 5;
+  int64  seq_max = 6;
+
+  // Primary-key bounds (PK-encoded bytes, no InternalKey tag).
+  bytes  key_min = 7;
+  bytes  key_max = 8;
+
+  // Deletion-Vector pointer (optional — only set if the file has a DV).
+  optional string dv_path = 9;
+  optional int64  dv_offset = 10;
+  optional int64  dv_length = 11;
+
+  // Status: 0 = existing, 1 = added, 2 = deleted.
+  int32 status = 12;
+
+  // File format stamp (Issue #15): 0 = Columnar, 1 = Dual.
+  optional int32 format = 13;
+
+  // Reserve space for per-column stats hoist (Issue #20 Part 2b) —
+  // will be filled via a submessage repeated field once we wire it.
+  reserved 14 to 20;
+}
+
+// A delete file reference (placeholder; merutable does not yet
+// produce position-delete / equality-delete files but Iceberg v2
+// distinguishes them). Held as an empty placeholder so the field
+// number is reserved even before the first use.
+message DeleteFileRef {
+  string path = 1;
+  int64  file_size = 2;
+  int32  content = 3;  // 1 = position delete, 2 = equality delete
+  reserved 4 to 10;
+}
+
+// One commit's manifest.
+message Manifest {
+  int64  snapshot_id = 1;
+  int64  sequence_number = 2;
+
+  // Schema id at this snapshot (Issue #25's TableSchema::schema_id).
+  int32  schema_id = 3;
+
+  // Partition spec id (merutable is single-spec today; reserved for future).
+  int32  partition_spec_id = 4;
+
+  repeated DataFileRef data_files = 5;
+  repeated DeleteFileRef delete_files = 6;
+
+  // Issue #26: backward pointer for the ObjectStore commit-chain.
+  // Unset on Posix commits and on genesis v1.
+  optional int64 previous_snapshot_id = 7;
+
+  // Iceberg-facing fields (Issue #18 made these load-bearing for
+  // the translator output).
+  string table_uuid = 8;
+  int64  last_updated_ms = 9;
+
+  // Free-form snapshot summary properties.
+  map<string, string> properties = 10;
+
+  // Issue #25 persistence of schema-chain id.
+  int32 last_column_id = 11;
+
+  // Reserve generous headroom for near-term evolution.
+  reserved 12 to 24;
+}

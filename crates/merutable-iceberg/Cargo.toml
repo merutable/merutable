@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Iceberg v3 manifest layer, deletion vectors (Puffin), and version management for merutable"
 publish = false  # internal crate — not a stable API surface; only `merutable` is published
+build   = "build.rs"
+
+[build-dependencies]
+prost-build         = { workspace = true }
 
 [dependencies]
+prost               = { workspace = true }
 metrics             = { workspace = true }
 merutable-types   = { workspace = true }
 merutable-parquet = { workspace = true }
