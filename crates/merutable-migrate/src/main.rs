@@ -14,13 +14,17 @@
 //!   and prints the migration plan — file paths, sizes, total bytes,
 //!   planned v1 genesis shape. NO writes against the destination.
 //!   Exits 0 on a well-formed plan.
-//! - Phase 3 (this commit): execution path for `--from posix --to
+//! - Phase 3 (shipped): execution path for `--from posix --to
 //!   object-store`. Opens an `ObjectStoreCatalog` at the destination
 //!   (writes genesis v1), streams the source's live data files via
 //!   `tokio::fs::copy` with bounded parallelism, then commits a
-//!   single transaction adding every copied file (v2). No DV
-//!   migration yet — a source catalog with non-empty DVs errors out;
-//!   Phase 3b will extend the copy step to puffin blobs.
+//!   single transaction adding every copied file (v2).
+//! - Phase 3b (this commit): deletion vectors survive the migration.
+//!   For every live DV in the source manifest the tool reads the
+//!   puffin blob at the exact byte range, decodes the roaring bitmap,
+//!   and commits a follow-up `txn.dvs` transaction that the
+//!   ObjectStoreCatalog re-encodes and attaches on the destination
+//!   (lands as v3 after the base adds at v2).
 //! - Phase 4a (shipped): `--verify` re-reads every destination
 //!   file and SHA-256 compares against the source. Catches silent
 //!   corruption / truncation beyond what tokio::fs::copy's OK return
@@ -40,6 +44,7 @@ use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use merutable_iceberg::{
+    deletion_vector::DeletionVector,
     manifest::Manifest,
     object_store_catalog::ObjectStoreCatalog,
     snapshot::{IcebergDataFile, SnapshotTransaction},
@@ -188,13 +193,15 @@ async fn build_plan_posix_source(src: &str) -> Result<MigrationPlan> {
 /// `tokio::fs::copy` — streaming, no full-file buffering, single
 /// syscall pair per file.
 ///
-/// # Current limitations (Phase 3, will be lifted in 3b / 4)
-/// - No DV migration: source manifests with live DVs error out early.
-/// - No resume: a crash mid-copy leaves orphan files at the
-///   destination; rerun with the same args to re-do the copy (puts
-///   are idempotent via `tokio::fs::copy` overwrite semantics).
-/// - No verify: `--verify` is accepted but not wired to a re-read
-///   pass yet.
+/// # DV handling (Phase 3b)
+///
+/// After the base adds commit, every source entry with a live DV is
+/// read from the POSIX puffin (get_range via tokio::fs), decoded into
+/// a roaring bitmap, and committed in a follow-up `txn.dvs` batch.
+/// The ObjectStoreCatalog re-encodes each DV at the destination's
+/// snapshot_id and writes the destination puffin under its own
+/// version-qualified path, so source and destination coordinates
+/// differ even though the deleted-row set is preserved exactly.
 async fn execute_posix_to_object_store(
     src: &str,
     dst: &str,
@@ -204,24 +211,6 @@ async fn execute_posix_to_object_store(
     source_manifest_entries: &[merutable_iceberg::manifest::ManifestEntry],
     resume: bool,
 ) -> Result<i64> {
-    // Inspect the source manifest entries directly (not the plan)
-    // because DV coordinates live on `ManifestEntry` or
-    // `ParquetFileMeta`, and the plan only carries a subset.
-    let has_dv = source_manifest_entries.iter().any(|e| {
-        e.status != "deleted"
-            && (e.dv_path.is_some()
-                || e.meta.dv_path.is_some()
-                || e.meta.dv_length.unwrap_or(0) > 0)
-    });
-    if has_dv {
-        return Err(MeruError::InvalidArgument(
-            "Issue #27 Phase 3 does not yet migrate deletion vectors. The source \
-             catalog contains live DVs; rerun after compacting them away (`MeruDB::compact()`) \
-             or wait for Phase 3b which will extend the copy step to puffin blobs."
-                .into(),
-        ));
-    }
-
     let src_path = PathBuf::from(src);
     let dst_path = PathBuf::from(dst);
     tokio::fs::create_dir_all(&dst_path)
@@ -334,8 +323,68 @@ async fn execute_posix_to_object_store(
         });
     }
     let schema_arc = Arc::new(catalog.current_manifest().await.schema);
-    let version = catalog.commit(&txn, schema_arc).await?;
-    Ok(version.snapshot_id)
+    let version = catalog.commit(&txn, schema_arc.clone()).await?;
+
+    // Phase 3b: carry deletion vectors forward. For every source
+    // entry that had a live DV, read the puffin from the source POSIX
+    // path, decode the roaring bitmap, and build a follow-up
+    // transaction in terms of `txn.dvs`. ObjectStoreCatalog's commit
+    // path handles the re-encoding, destination-relative path
+    // assignment, and manifest attachment (Phase 5 of #26).
+    //
+    // We do this as a second commit rather than bundling with the
+    // initial adds because IcebergDataFile doesn't carry DV coords —
+    // the convention is "add the file, then attach the DV in a later
+    // partial-compaction commit." Following that convention keeps
+    // ObjectStoreCatalog invariants simple and matches how the engine
+    // would have produced the same state over time.
+    let mut dv_txn = SnapshotTransaction::new();
+    for entry in source_manifest_entries {
+        if entry.status == "deleted" {
+            continue;
+        }
+        let (dv_path, dv_offset, dv_length) =
+            match (&entry.dv_path, entry.dv_offset, entry.dv_length) {
+                (Some(p), Some(o), Some(l)) if l > 0 => (p, o, l),
+                _ => continue,
+            };
+        if dv_offset < 0 || dv_length < 0 {
+            return Err(MeruError::Corruption(format!(
+                "source manifest entry '{}' has negative DV offset/length ({}, {})",
+                entry.path, dv_offset, dv_length
+            )));
+        }
+        // Read the source puffin blob at the exact byte range and
+        // decode into a DeletionVector. The destination re-encodes at
+        // its own version during commit.
+        let puffin_abs = src_path.join(dv_path);
+        let puffin_bytes = tokio::fs::read(&puffin_abs).await.map_err(MeruError::Io)?;
+        let off = dv_offset as usize;
+        let len = dv_length as usize;
+        let end = off.checked_add(len).ok_or_else(|| {
+            MeruError::Corruption(format!(
+                "source DV for '{}' offset+length overflows usize",
+                entry.path
+            ))
+        })?;
+        if end > puffin_bytes.len() {
+            return Err(MeruError::Corruption(format!(
+                "source DV for '{}' extends past puffin file size {} (off={off}, len={len})",
+                entry.path,
+                puffin_bytes.len()
+            )));
+        }
+        let dv = DeletionVector::from_puffin_blob(&puffin_bytes[off..end])?;
+        dv_txn.dvs.insert(entry.path.clone(), dv);
+    }
+
+    let committed_version = if !dv_txn.dvs.is_empty() {
+        let v = catalog.commit(&dv_txn, schema_arc).await?;
+        v.snapshot_id
+    } else {
+        version.snapshot_id
+    };
+    Ok(committed_version)
 }
 
 /// `ParquetFileMeta` doesn't derive `Clone` in every field; the
@@ -1183,52 +1232,106 @@ mod tests {
         .unwrap();
     }
 
-    /// Phase 3 refuses to migrate a source with live DVs (deferred
-    /// to Phase 3b). The error must name the limitation. We bypass
-    /// the catalog and hand-craft the manifest-entries slice so the
-    /// DV field is guaranteed to be set regardless of how
-    /// IcebergCatalog handles the pass-through.
+    /// Phase 3b: a source carrying a live deletion vector migrates
+    /// end-to-end. The destination's final manifest carries the DV
+    /// on the same parquet path; reading the destination puffin at
+    /// the recorded offset/length yields the same deleted-row set as
+    /// the source.
     #[tokio::test]
-    async fn execute_rejects_source_with_dvs() {
+    async fn execute_carries_source_deletion_vectors() {
+        use merutable_store::traits::MeruStore;
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(src.path(), test_schema())
+            .await
+            .unwrap();
 
-        // Build a tiny fake manifest entry carrying a DV directly.
-        let entries = vec![merutable_iceberg::manifest::ManifestEntry {
-            path: "data/L0/fake.parquet".into(),
-            meta: test_meta(1024),
-            dv_path: Some("data/L0/fake.puffin".into()),
-            dv_offset: Some(4),
-            dv_length: Some(32),
-            status: "added".into(),
-        }];
-        let plan = MigrationPlan {
-            source_snapshot_id: 1,
-            source_table_uuid: "fake".into(),
-            data_files: vec![PlanEntry {
-                path: "data/L0/fake.parquet".into(),
-                bytes: 1024,
-                num_rows: 100,
-                dv_path: Some("data/L0/fake.puffin".into()),
-            }],
-            total_bytes: 1024,
-        };
+        // Source setup: add a single parquet file, then attach a DV
+        // via IcebergCatalog::commit (which uploads the puffin under
+        // the POSIX catalog's `data/L0/*.puffin` layout).
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        let pq_path = "data/L0/hot.parquet".to_string();
+        tokio::fs::write(src.path().join(&pq_path), b"pq-body")
+            .await
+            .unwrap();
+        let mut add = SnapshotTransaction::new();
+        add.add_file(IcebergDataFile {
+            path: pq_path.clone(),
+            file_size: 7,
+            num_rows: 100,
+            meta: test_meta(7),
+        });
+        catalog.commit(&add, schema.clone()).await.unwrap();
 
-        let err = execute_posix_to_object_store(
+        // Partial-compaction DV: mark rows {5, 10, 50} deleted.
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(5);
+        dv.mark_deleted(10);
+        dv.mark_deleted(50);
+        let mut dv_txn = SnapshotTransaction::new();
+        dv_txn.dvs.insert(pq_path.clone(), dv);
+        catalog.commit(&dv_txn, schema).await.unwrap();
+
+        // Sanity: the source manifest now has a live DV on hot.parquet.
+        let source_manifest = read_source_manifest(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let src_entry = source_manifest
+            .entries
+            .iter()
+            .find(|e| e.status != "deleted" && e.path == pq_path)
+            .expect("live entry for hot.parquet");
+        assert!(src_entry.dv_path.is_some(), "source must have DV");
+
+        // Migrate.
+        let plan = build_plan_posix_source(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let committed = execute_posix_to_object_store(
             src.path().to_str().unwrap(),
             dst.path().to_str().unwrap(),
             &plan,
             2,
-            test_schema(),
-            &entries,
+            source_manifest.schema.clone(),
+            &source_manifest.entries,
             /*resume=*/ false,
         )
         .await
-        .unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("deletion vectors") || msg.contains("DV"),
-            "error should name the DV limitation: {msg}"
-        );
+        .unwrap();
+        // 2 commits: base adds (v2), DV attach (v3). Committed
+        // version is v3.
+        assert_eq!(committed, 3, "expected genesis + adds + DV attach");
+
+        // Open destination and verify the DV survives round-trip.
+        let dst_store = Arc::new(LocalFileStore::new(dst.path()).unwrap());
+        let dst_cat = ObjectStoreCatalog::open(dst_store.clone(), source_manifest.schema.clone())
+            .await
+            .unwrap();
+        let dst_entry = dst_cat
+            .current_manifest()
+            .await
+            .entries
+            .iter()
+            .find(|e| e.status != "deleted" && e.path == pq_path)
+            .cloned()
+            .expect("live entry at destination");
+        let dv_rel = dst_entry.dv_path.expect("DV path set on destination");
+        let blob = dst_store
+            .get_range(
+                &dv_rel,
+                dst_entry.dv_offset.unwrap() as usize,
+                dst_entry.dv_length.unwrap() as usize,
+            )
+            .await
+            .unwrap();
+        let decoded = DeletionVector::from_puffin_blob(&blob).unwrap();
+        assert!(decoded.is_deleted(5));
+        assert!(decoded.is_deleted(10));
+        assert!(decoded.is_deleted(50));
+        assert!(!decoded.is_deleted(99));
+        assert_eq!(decoded.cardinality(), 3);
     }
 }
