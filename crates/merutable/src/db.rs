@@ -115,6 +115,13 @@ impl MeruDB {
     }
 
     pub async fn open(options: OpenOptions) -> Result<Self> {
+        // Issue #31 Phase 1: reject incoherent mirror+mode combinations
+        // at the API boundary BEFORE we touch the WAL or the catalog.
+        // The mirror ships in phases (this one locks the type surface
+        // and the validation; the worker is Phase 2).
+        if let Err(msg) = options.validate_mirror() {
+            return Err(merutable_types::MeruError::InvalidArgument(msg));
+        }
         // Issue #26 Phase 1: reject ObjectStore commit mode until the
         // protobuf-manifest + conditional-PUT implementation lands.
         // The type shape is stable; the behavior is phased.
@@ -128,6 +135,16 @@ impl MeruDB {
                  on local filesystems for now."
                     .into(),
             ));
+        }
+        // Issue #31 Phase 1: mirror is accepted (coherent with Posix
+        // above) but not yet spawned. Log a notice so operators see
+        // that the knob is recognized before Phase 2 lands the worker.
+        if options.mirror.is_some() {
+            tracing::info!(
+                "MirrorConfig accepted (Issue #31 Phase 1 validation only). \
+                 The mirror worker will be spawned in Phase 2; no uploads \
+                 happen yet."
+            );
         }
         // Issue #9: surface the full tuning matrix through
         // `OpenOptions`. Previously only 7/14 EngineConfig fields

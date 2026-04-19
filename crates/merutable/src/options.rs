@@ -12,6 +12,81 @@
 pub use merutable_engine::config::CommitMode;
 use merutable_types::schema::TableSchema;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Issue #31: async object-store mirror of flushed files + manifests.
+/// Attached to a `CommitMode::Posix` deployment; never to
+/// `CommitMode::ObjectStore` (the latter IS the object-store commit
+/// surface, so mirroring is redundant and would double-write every
+/// manifest).
+///
+/// The mirror layout is byte-for-byte identical to the
+/// `CommitMode::ObjectStore` layout (Issue #26), which means a remote
+/// reader can open the mirror destination with
+/// `OpenOptions::read_only(true) + CommitMode::ObjectStore` and see
+/// the primary's committed state modulo `mirror_lag`.
+///
+/// ## Crash-loss model
+///
+/// The WAL is NEVER mirrored. A primary crash loses the un-flushed
+/// in-memory tail. Readers on the mirror see the most recent
+/// fully-mirrored snapshot. For stricter RPO, use
+/// `CommitMode::ObjectStore` directly.
+///
+/// ## Phases
+///
+/// - Phase 1 (this type): struct, builder, validation. Creating a
+///   `MirrorConfig` and attaching it compiles and round-trips through
+///   `OpenOptions`; the mirror worker is not yet spawned.
+/// - Phase 2 (planned): mirror worker spawned alongside flush +
+///   compaction workers, commit-order-preserving upload loop.
+/// - Phase 3 (planned): `mirror_seq` tracking via `stats()`.
+/// - Phase 4 (planned): alert on `max_lag_alert_secs`.
+#[derive(Clone)]
+pub struct MirrorConfig {
+    /// S3 / GCS / Azure destination. Must implement `MeruStore`.
+    pub target: Arc<dyn merutable_store::traits::MeruStore>,
+    /// Warn above this lag (seconds between primary commit_time and
+    /// last-mirrored commit_time). Alert-only in v1; writes never
+    /// block on mirror lag.
+    pub max_lag_alert_secs: u64,
+    /// Concurrent uploads during a single mirror sweep. Higher =
+    /// faster catch-up after a sustained primary burst; higher also
+    /// = more in-flight object-store connections. Default: 4.
+    pub mirror_parallelism: usize,
+}
+
+impl std::fmt::Debug for MirrorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirrorConfig")
+            .field("target", &"Arc<dyn MeruStore>")
+            .field("max_lag_alert_secs", &self.max_lag_alert_secs)
+            .field("mirror_parallelism", &self.mirror_parallelism)
+            .finish()
+    }
+}
+
+impl MirrorConfig {
+    /// Production defaults for lag alert (60s) and parallelism (4).
+    /// Callers must still provide `target`.
+    pub fn new(target: Arc<dyn merutable_store::traits::MeruStore>) -> Self {
+        Self {
+            target,
+            max_lag_alert_secs: 60,
+            mirror_parallelism: 4,
+        }
+    }
+
+    pub fn max_lag_alert_secs(mut self, secs: u64) -> Self {
+        self.max_lag_alert_secs = secs;
+        self
+    }
+
+    pub fn mirror_parallelism(mut self, n: usize) -> Self {
+        self.mirror_parallelism = n.max(1);
+        self
+    }
+}
 
 /// Builder for opening a `MeruDB` instance.
 #[derive(Clone, Debug)]
@@ -65,6 +140,10 @@ pub struct OpenOptions {
     /// atomic rename; `ObjectStore` uses conditional-PUT for
     /// S3/GCS/Azure correctness.
     pub commit_mode: CommitMode,
+
+    /// Issue #31: optional async mirror to an object-store target.
+    /// Valid only with `commit_mode = Posix`. See [`MirrorConfig`].
+    pub mirror: Option<MirrorConfig>,
 }
 
 impl OpenOptions {
@@ -96,7 +175,38 @@ impl OpenOptions {
             read_only: ec.read_only,
             dual_format_max_level: ec.dual_format_max_level,
             commit_mode: ec.commit_mode,
+            mirror: None,
         }
+    }
+
+    /// Issue #31: attach an async mirror to an object-store target.
+    /// Valid only with `commit_mode = Posix`. Passing a `MirrorConfig`
+    /// when `commit_mode = ObjectStore` is rejected at `open()` —
+    /// the two modes target the same layout and mirroring while
+    /// writing directly to the object store would double-write every
+    /// manifest under different paths.
+    ///
+    /// Phase 1 (today) validates the combination; phases 2–4 spawn
+    /// the worker and surface lag metrics.
+    pub fn mirror(mut self, cfg: MirrorConfig) -> Self {
+        self.mirror = Some(cfg);
+        self
+    }
+
+    /// Phase 1 validator for the #31 mirror knob. Returns `Err` if
+    /// the combination is incoherent — today, that means
+    /// `mirror.is_some() && commit_mode == ObjectStore`. Invoked by
+    /// `MeruDB::open` before any I/O so configuration errors fail at
+    /// the API boundary, not deep inside the engine.
+    pub fn validate_mirror(&self) -> std::result::Result<(), String> {
+        if self.mirror.is_some() && matches!(self.commit_mode, CommitMode::ObjectStore) {
+            return Err("MirrorConfig requires `commit_mode = Posix`. \
+                 `CommitMode::ObjectStore` already writes directly to the object store; \
+                 mirroring would double-write every manifest and corrupt the \
+                 conditional-PUT chain. Either drop the mirror or switch to Posix."
+                .into());
+        }
+        Ok(())
     }
 
     /// Issue #26: select the catalog commit mode.
@@ -228,5 +338,76 @@ impl OpenOptions {
     pub fn read_only(mut self, enabled: bool) -> Self {
         self.read_only = enabled;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use merutable_store::local::LocalFileStore;
+    use merutable_types::schema::{ColumnDef, ColumnType};
+
+    fn schema() -> TableSchema {
+        TableSchema {
+            table_name: "mirror-test".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Int64,
+                nullable: false,
+                ..Default::default()
+            }],
+            primary_key: vec![0],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mirror_defaults_are_production_sane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let cfg = MirrorConfig::new(store);
+        assert_eq!(cfg.max_lag_alert_secs, 60);
+        assert_eq!(cfg.mirror_parallelism, 4);
+    }
+
+    #[test]
+    fn mirror_parallelism_floored_at_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let cfg = MirrorConfig::new(store).mirror_parallelism(0);
+        assert_eq!(cfg.mirror_parallelism, 1, "zero coerced to one");
+    }
+
+    #[test]
+    fn mirror_with_posix_passes_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let opts = OpenOptions::new(schema())
+            .commit_mode(CommitMode::Posix)
+            .mirror(MirrorConfig::new(store));
+        assert!(opts.validate_mirror().is_ok());
+    }
+
+    #[test]
+    fn mirror_with_object_store_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let opts = OpenOptions::new(schema())
+            .commit_mode(CommitMode::ObjectStore)
+            .mirror(MirrorConfig::new(store));
+        let err = opts.validate_mirror().unwrap_err();
+        assert!(
+            err.contains("Posix") && err.contains("ObjectStore"),
+            "error must name both modes: {err}"
+        );
+    }
+
+    #[test]
+    fn no_mirror_no_validation_error() {
+        // Both modes should pass validation when no mirror is set.
+        let opts_posix = OpenOptions::new(schema()).commit_mode(CommitMode::Posix);
+        assert!(opts_posix.validate_mirror().is_ok());
+        let opts_os = OpenOptions::new(schema()).commit_mode(CommitMode::ObjectStore);
+        assert!(opts_os.validate_mirror().is_ok());
     }
 }

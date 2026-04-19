@@ -10,6 +10,7 @@ license     = "Apache-2.0"
 metrics  = { workspace = true }
 merutable-types  = { workspace = true }
 merutable-engine = { workspace = true }
+merutable-store  = { workspace = true }
 tokio            = { workspace = true }
 futures          = { workspace = true }
 tracing          = { workspace = true }
