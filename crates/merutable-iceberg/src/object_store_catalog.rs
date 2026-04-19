@@ -29,10 +29,19 @@
 //!   `catalog.commit`; those paths need a shared commit trait that
 //!   both `IcebergCatalog` and `ObjectStoreCatalog` implement).
 //!   Phase 4.
-//! - Puffin DV file handling. The existing `SnapshotTransaction`
-//!   shape includes a DV map; the ObjectStore catalog currently
-//!   errors on a non-empty `txn.dvs`. Phase 5.
 //! - Manifest GC walking back via `previous_snapshot_id`. Phase 6.
+//!
+//! # Phase 5: Puffin DV file handling
+//!
+//! Partial-compaction deletion vectors now go end-to-end: the commit
+//! path fetches any pre-existing DV via `store.get_range`, unions it
+//! with the caller's new DV, encodes a fresh Puffin blob, writes it
+//! under `data/L{n}/{stem}.dv-{attempted_version}.puffin`, and records
+//! the real `(dv_path, dv_offset, dv_length)` in the manifest. On
+//! race-loss the retry loop re-reads HEAD, re-loads whatever DV the
+//! winner installed (not our stale cache), re-unions, re-encodes, and
+//! re-writes at the bumped version. The losing-writer's puffin is
+//! orphaned on the store — Phase 6 GC will reclaim it.
 
 use std::sync::Arc;
 
@@ -40,6 +49,7 @@ use merutable_store::traits::MeruStore;
 use merutable_types::{schema::TableSchema, MeruError, Result};
 use tokio::sync::Mutex;
 
+use crate::deletion_vector::DeletionVector;
 use crate::head_discovery::discover_head;
 use crate::manifest::{DvLocation, Manifest};
 use crate::object_store_commit::manifest_path;
@@ -130,6 +140,103 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
         Ok(())
     }
 
+    /// Phase 5 helper. For each `(parquet_path, new_dv)` in the
+    /// transaction, union with any pre-existing DV from the base
+    /// manifest, encode as Puffin bytes, write to the store under a
+    /// version-qualified path, and return the `DvLocation` map the
+    /// manifest applier needs. Errors if a transaction references a
+    /// Parquet path that does not appear (live) in the base manifest.
+    ///
+    /// Contention safety: `attempted_version` is embedded in every
+    /// puffin path, so two writers whose retries land on different
+    /// attempt numbers never collide. A writer whose attempt loses
+    /// leaves an orphan — the caller deletes it best-effort before the
+    /// next retry; worst case Phase 6 GC sweeps it.
+    async fn upload_dvs_for_attempt(
+        &self,
+        base: &Manifest,
+        txn: &SnapshotTransaction,
+        attempted_version: i64,
+    ) -> Result<std::collections::HashMap<String, DvLocation>> {
+        let mut out = std::collections::HashMap::new();
+        if txn.dvs.is_empty() {
+            return Ok(out);
+        }
+        for (parquet_path, new_dv) in &txn.dvs {
+            // Locate the live base entry this DV applies to.
+            let entry = base
+                .entries
+                .iter()
+                .find(|e| e.status != "deleted" && e.path == *parquet_path)
+                .ok_or_else(|| {
+                    MeruError::InvalidArgument(format!(
+                        "ObjectStoreCatalog::commit: txn.dvs references '{parquet_path}' \
+                         but no live entry exists in the base manifest"
+                    ))
+                })?;
+
+            // Merge with any pre-existing DV the base manifest already
+            // points at. Missing tri-state tolerated — treat as "no
+            // existing DV", same as IcebergCatalog.
+            let merged_dv = match (entry.dv_path.as_ref(), entry.dv_offset, entry.dv_length) {
+                (Some(dv_path), Some(offset), Some(length)) => {
+                    if offset < 0 || length < 0 {
+                        return Err(MeruError::Corruption(format!(
+                            "existing DV for '{parquet_path}' has negative offset \
+                             ({offset}) or length ({length})"
+                        )));
+                    }
+                    let blob = self
+                        .store
+                        .get_range(dv_path, offset as usize, length as usize)
+                        .await?;
+                    let existing = DeletionVector::from_puffin_blob(&blob)?;
+                    let existing_card = existing.cardinality();
+                    let new_card = new_dv.cardinality();
+                    let mut merged = existing;
+                    merged.union_with(new_dv);
+                    // IMP-17 invariant: a union can never shrink. If
+                    // it does, bits got lost and rows will reappear.
+                    let merged_card = merged.cardinality();
+                    let min_expected = existing_card.max(new_card);
+                    if merged_card < min_expected {
+                        return Err(MeruError::Corruption(format!(
+                            "DV union for '{parquet_path}' shrank: \
+                             existing={existing_card} new={new_card} merged={merged_card}"
+                        )));
+                    }
+                    merged
+                }
+                _ => new_dv.clone(),
+            };
+
+            let encoded =
+                merged_dv.encode_puffin(parquet_path, attempted_version, attempted_version)?;
+
+            // Derive puffin path from the parquet path: same level dir,
+            // stem + `.dv-{version}.puffin`. Matches IcebergCatalog's
+            // layout so a tool that knows one knows the other.
+            let pq = std::path::Path::new(parquet_path);
+            let stem = pq.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+            let level_dir = pq.parent().and_then(|p| p.to_str()).unwrap_or("data/L0");
+            let puffin_path = format!("{level_dir}/{stem}.dv-{attempted_version}.puffin");
+
+            self.store
+                .put(&puffin_path, bytes::Bytes::from(encoded.bytes.to_vec()))
+                .await?;
+
+            out.insert(
+                parquet_path.clone(),
+                DvLocation {
+                    dv_path: puffin_path,
+                    dv_offset: encoded.blob_offset,
+                    dv_length: encoded.blob_length,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     /// Commit a snapshot transaction. Applies `txn` to the current
     /// in-memory manifest, puts via `put_if_absent`, and on race-loss
     /// re-reads HEAD, reloads the winning manifest from the store,
@@ -141,18 +248,6 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
         txn: &SnapshotTransaction,
         schema: Arc<TableSchema>,
     ) -> Result<Version> {
-        if !txn.dvs.is_empty() {
-            return Err(MeruError::InvalidArgument(
-                "ObjectStoreCatalog does not yet support DV writes in a transaction \
-                 (Issue #26 Phase 5). Use CommitMode::Posix if your workload produces \
-                 partial-compaction DVs."
-                    .into(),
-            ));
-        }
-
-        let dv_locations: std::collections::HashMap<String, DvLocation> =
-            std::collections::HashMap::new();
-
         // Start from cached HEAD + cached manifest; fall through to a
         // store-reload on race-loss. Bounded retries and exponential
         // backoff mirror `commit_with_retry`.
@@ -163,21 +258,39 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
         let committed_version: i64 = {
             let mut committed: Option<i64> = None;
             for attempt in 0..MAX_RETRIES {
-                let new_manifest = base.apply(txn, head + 1, &dv_locations)?;
+                let attempted_version = head + 1;
+
+                // Phase 5: upload puffin DVs for every entry in txn.dvs.
+                // Puffin paths embed `attempted_version`, so each retry
+                // iteration writes fresh bytes under a fresh path —
+                // no conditional-PUT dance needed on the DV blob itself.
+                // The committed manifest is what makes a puffin "live";
+                // losing-attempt puffins become orphans for Phase 6 GC.
+                let dv_locations = self
+                    .upload_dvs_for_attempt(&base, txn, attempted_version)
+                    .await?;
+
+                let new_manifest = base.apply(txn, attempted_version, &dv_locations)?;
                 let bytes = new_manifest.to_protobuf()?;
-                let path = manifest_path(head + 1);
+                let path = manifest_path(attempted_version);
                 match self
                     .store
                     .put_if_absent(&path, bytes::Bytes::from(bytes))
                     .await
                 {
                     Ok(()) => {
-                        committed = Some(head + 1);
+                        committed = Some(attempted_version);
                         break;
                     }
                     Err(MeruError::AlreadyExists(_)) => {
                         // Race-lost. Back off, re-discover HEAD,
-                        // reload the winning manifest.
+                        // reload the winning manifest. The puffin
+                        // files we wrote this round are orphaned
+                        // (best-effort delete so the store doesn't
+                        // accumulate leaks under heavy contention).
+                        for loc in dv_locations.values() {
+                            let _ = self.store.delete(&loc.dv_path).await;
+                        }
                         let backoff_ms = 2u64.pow(attempt as u32).min(200);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         let store = self.store.clone();
@@ -190,7 +303,14 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
                         base = Manifest::from_protobuf(&winner_bytes)?;
                         head = new_head;
                     }
-                    Err(other) => return Err(other),
+                    Err(other) => {
+                        // Any other error — also clean up this attempt's
+                        // puffins so we don't leak on permanent failure.
+                        for loc in dv_locations.values() {
+                            let _ = self.store.delete(&loc.dv_path).await;
+                        }
+                        return Err(other);
+                    }
                 }
             }
             committed.ok_or_else(|| {
@@ -413,6 +533,146 @@ mod tests {
                 assert_eq!(m.parent_snapshot_id, Some(v - 1));
             }
         }
+    }
+
+    /// Phase 5: a transaction carrying a DV for a live file uploads a
+    /// puffin blob to the store, records real (path, offset, length) in
+    /// the new manifest, and the DV round-trips to a roaring bitmap
+    /// when read back from the store.
+    #[tokio::test]
+    async fn commit_with_dv_uploads_puffin_and_records_real_coordinates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+
+        // Commit 1: add a data file.
+        let mut txn = SnapshotTransaction::new();
+        txn.add_file(test_data_file("data/L0/hot.parquet"));
+        cat.commit(&txn, schema_arc.clone()).await.unwrap();
+
+        // Commit 2: attach a DV to that file (partial compaction).
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(3);
+        dv.mark_deleted(7);
+        dv.mark_deleted(42);
+        let mut txn2 = SnapshotTransaction::new();
+        txn2.dvs.insert("data/L0/hot.parquet".into(), dv);
+        cat.commit(&txn2, schema_arc.clone()).await.unwrap();
+
+        // Verify the manifest entry now carries real DV coordinates.
+        let m = cat.current_manifest().await;
+        assert_eq!(m.snapshot_id, 3);
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == "data/L0/hot.parquet" && e.status != "deleted")
+            .expect("live entry for hot.parquet");
+        let dv_path = entry.dv_path.as_ref().expect("DV path set");
+        let dv_offset = entry.dv_offset.expect("DV offset set");
+        let dv_length = entry.dv_length.expect("DV length set");
+        assert!(
+            dv_path.ends_with(".dv-3.puffin"),
+            "DV path {dv_path} should embed the committed version"
+        );
+        assert!(dv_offset > 0, "non-zero offset");
+        assert!(dv_length > 0, "non-zero length");
+
+        // Round-trip: read the blob range from the store, decode,
+        // verify the three deleted rows.
+        let blob = store
+            .get_range(dv_path, dv_offset as usize, dv_length as usize)
+            .await
+            .unwrap();
+        let decoded = DeletionVector::from_puffin_blob(&blob).unwrap();
+        assert!(decoded.is_deleted(3));
+        assert!(decoded.is_deleted(7));
+        assert!(decoded.is_deleted(42));
+        assert!(!decoded.is_deleted(99));
+        assert_eq!(decoded.cardinality(), 3);
+    }
+
+    /// Phase 5: two successive DVs on the same file union under the
+    /// hood — the second commit's DV does not replace the first.
+    #[tokio::test]
+    async fn consecutive_dvs_union_not_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+
+        // Add file.
+        let mut add = SnapshotTransaction::new();
+        add.add_file(test_data_file("data/L0/warm.parquet"));
+        cat.commit(&add, schema_arc.clone()).await.unwrap();
+
+        // First DV: delete rows {1, 2}.
+        let mut first = DeletionVector::new();
+        first.mark_deleted(1);
+        first.mark_deleted(2);
+        let mut txn1 = SnapshotTransaction::new();
+        txn1.dvs.insert("data/L0/warm.parquet".into(), first);
+        cat.commit(&txn1, schema_arc.clone()).await.unwrap();
+
+        // Second DV: delete rows {5, 6}. Must union.
+        let mut second = DeletionVector::new();
+        second.mark_deleted(5);
+        second.mark_deleted(6);
+        let mut txn2 = SnapshotTransaction::new();
+        txn2.dvs.insert("data/L0/warm.parquet".into(), second);
+        cat.commit(&txn2, schema_arc.clone()).await.unwrap();
+
+        let m = cat.current_manifest().await;
+        let entry = m
+            .entries
+            .iter()
+            .find(|e| e.path == "data/L0/warm.parquet" && e.status != "deleted")
+            .unwrap();
+        let dv_path = entry.dv_path.as_ref().unwrap();
+        let blob = store
+            .get_range(
+                dv_path,
+                entry.dv_offset.unwrap() as usize,
+                entry.dv_length.unwrap() as usize,
+            )
+            .await
+            .unwrap();
+        let decoded = DeletionVector::from_puffin_blob(&blob).unwrap();
+        assert_eq!(decoded.cardinality(), 4, "all four rows must remain marked");
+        for row in [1, 2, 5, 6] {
+            assert!(decoded.is_deleted(row), "row {row} must survive union");
+        }
+    }
+
+    /// Phase 5: a DV whose parquet target is not in the base manifest
+    /// is a caller bug — returns InvalidArgument.
+    #[tokio::test]
+    async fn dv_for_unknown_file_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+
+        let mut dv = DeletionVector::new();
+        dv.mark_deleted(1);
+        let mut txn = SnapshotTransaction::new();
+        txn.dvs.insert("data/L0/ghost.parquet".into(), dv);
+
+        let err = cat.commit(&txn, schema_arc.clone()).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ghost.parquet"),
+            "error must name the missing path: {msg}"
+        );
     }
 
     /// `refresh()` on a reader catalog picks up commits from a
