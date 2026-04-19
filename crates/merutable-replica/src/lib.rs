@@ -23,15 +23,16 @@
 //!
 //! - **Phase 1 (shipped)**: `LogSource` trait, `OpRecord` type shape,
 //!   `LogGap` error, placeholder `ChangeFeedLogSource` stub.
-//! - **Phase 2 (this commit)**: `InProcessLogSource` — a `LogSource`
+//! - **Phase 2 (shipped)**: `InProcessLogSource` — a `LogSource`
 //!   implementation that pulls from a co-located `Arc<MeruDB>` via
-//!   #29 Phase 2a's `ChangeFeedCursor`. Usable immediately for
-//!   single-machine replica experiments + integration tests without
-//!   waiting for the Flight SQL endpoint (#29 Phase 2d).
-//! - **Phase 2b (planned)**: `ChangeFeedLogSource` real impl over
-//!   the Flight SQL endpoint once #29 Phase 2d lands.
-//! - **Phase 3 (planned)**: `ReplicaState` + append-only tail
-//!   advance. No rebase; growing tail OK for this phase.
+//!   #29 Phase 2a's `ChangeFeedCursor`.
+//! - **Phase 3a (this commit)**: `ReplicaTail` — in-memory tail
+//!   state + `advance()` that replays ops from any `LogSource`.
+//!   PK-indexed `get()` resolves last-writer-wins. No object-store
+//!   base yet; the replica's view is tail-only.
+//! - **Phase 3b (planned)**: fold in an object-store base mount —
+//!   `MeruDB::open_read_only(CommitMode::ObjectStore)` — so reads
+//!   fall through to the mirror when a PK isn't in the tail.
 //! - **Phase 4 (planned)**: hot-swap rebase worker + drain TTL.
 //! - **Phase 5 (planned)**: metrics surface, log-gap recovery,
 //!   stress test harness.
@@ -211,6 +212,143 @@ impl LogSource for InProcessLogSource {
 
     async fn latest_seq(&self) -> Result<u64> {
         Ok(self.db.read_seq().0)
+    }
+}
+
+/// Issue #32 Phase 3a: in-memory tail state.
+///
+/// Maintains every op the replica has replayed from its `LogSource`,
+/// indexed by primary-key bytes for last-writer-wins point lookups
+/// and by seq for feed inspection. `advance()` drains a log-source
+/// stream into the tail and bumps `visible_seq`.
+///
+/// Scope: tail-only. `get()` returns `None` both for "deleted" and
+/// for "never seen in the tail." Phase 3b lifts the latter to a
+/// fall-through read of the object-store base; until then, the
+/// tail is the whole world and keys below `since_seq` at
+/// construction time are invisible.
+///
+/// Not thread-safe — callers wrap in `RwLock<ReplicaTail>` or
+/// equivalent. Phase 4's hot-swap machinery does this via
+/// `ArcSwap<ReplicaTail>` so a reader's snapshot isn't torn by a
+/// concurrent advance.
+pub struct ReplicaTail {
+    /// Latest op per user-key. Last-writer-wins by seq; a later
+    /// Delete overwrites an earlier Put.
+    index: std::collections::HashMap<Vec<u8>, TailEntry>,
+    /// Highest seq the tail has absorbed. Zero on a fresh tail.
+    visible_seq: u64,
+    /// Count of ops ever applied — monotonic, for observability.
+    /// Doesn't shrink when deletes overwrite earlier puts.
+    ops_applied: u64,
+}
+
+/// Internal tail entry — the op-type + payload Row, tagged with seq
+/// for debug/LWW resolution. `row` is meaningful only for
+/// `op == ChangeOp::Insert` / `Update`; for `Delete` it's stored
+/// as an empty `Row` (pre-image reconstruction is #29 Phase 2c).
+#[derive(Clone, Debug)]
+struct TailEntry {
+    seq: u64,
+    op: ChangeOp,
+    row: merutable_types::value::Row,
+}
+
+impl Default for ReplicaTail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplicaTail {
+    pub fn new() -> Self {
+        Self {
+            index: std::collections::HashMap::new(),
+            visible_seq: 0,
+            ops_applied: 0,
+        }
+    }
+
+    /// Reader-visible seq: the highest seq the tail has applied.
+    pub fn visible_seq(&self) -> u64 {
+        self.visible_seq
+    }
+
+    /// Lifetime count of ops absorbed. Useful for metrics +
+    /// regression tests that want to see work actually happened.
+    pub fn ops_applied(&self) -> u64 {
+        self.ops_applied
+    }
+
+    /// Point-lookup by PK-encoded bytes. Returns the most recent
+    /// op the tail has for this key:
+    /// - `Some(Row)` for an Insert/Update.
+    /// - `None` for a Delete OR a key the tail has never seen.
+    ///
+    /// Phase 3b will add a fall-through to the object-store base
+    /// so "never seen in tail" becomes a proper cache miss instead
+    /// of masquerading as a Delete.
+    pub fn get(&self, pk_bytes: &[u8]) -> Option<&merutable_types::value::Row> {
+        let entry = self.index.get(pk_bytes)?;
+        match entry.op {
+            ChangeOp::Insert | ChangeOp::Update => Some(&entry.row),
+            ChangeOp::Delete => None,
+        }
+    }
+
+    /// Apply a single op into the tail. Last-writer-wins — an op
+    /// with `seq <= existing.seq` for the same key is silently
+    /// dropped (pins the contract against an out-of-order log
+    /// source). Advances `visible_seq` to the max seq seen.
+    ///
+    /// Primary-key derivation: the `OpRecord` carries a full `Row`,
+    /// from which we extract PK bytes via `schema.primary_key` on
+    /// the index columns. The replica doesn't yet carry a schema
+    /// (Phase 3b wires it), so Phase 3a uses the caller-supplied
+    /// `pk_bytes` directly.
+    pub fn apply(&mut self, pk_bytes: Vec<u8>, op_record: OpRecord) {
+        if let Some(existing) = self.index.get(&pk_bytes) {
+            if op_record.seq <= existing.seq {
+                // Out-of-order or duplicate — silent drop. A real
+                // log source (#32 v1's InProcessLogSource) never
+                // produces this, but bad actors shouldn't corrupt
+                // state.
+                return;
+            }
+        }
+        let seq = op_record.seq;
+        self.index.insert(
+            pk_bytes,
+            TailEntry {
+                seq,
+                op: op_record.op,
+                row: op_record.row,
+            },
+        );
+        if seq > self.visible_seq {
+            self.visible_seq = seq;
+        }
+        self.ops_applied += 1;
+    }
+
+    /// Drain a log-source stream into the tail. The caller supplies
+    /// `pk_extractor` because the replica doesn't know the schema
+    /// until Phase 3b; Phase 3a's tests pass a closure that
+    /// encodes the PK from the Row.
+    pub async fn advance<S, F>(&mut self, source: &S, mut pk_extractor: F) -> Result<()>
+    where
+        S: LogSource + ?Sized,
+        F: FnMut(&merutable_types::value::Row) -> Vec<u8>,
+    {
+        use futures::stream::StreamExt;
+        let since = self.visible_seq;
+        let mut stream = source.stream(since).await?;
+        while let Some(rec) = stream.next().await {
+            let rec = rec?;
+            let pk = pk_extractor(&rec.row);
+            self.apply(pk, rec);
+        }
+        Ok(())
     }
 }
 
