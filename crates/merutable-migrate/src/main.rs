@@ -25,11 +25,15 @@
 //!   file and SHA-256 compares against the source. Catches silent
 //!   corruption / truncation beyond what tokio::fs::copy's OK return
 //!   proves.
-//! - Phase 4b (this commit): `--resume` makes a re-run against an
+//! - Phase 4b (shipped): `--resume` makes a re-run against an
 //!   already-migrated destination idempotent. Destinations whose
 //!   committed manifest diverges from the source are rejected with a
 //!   clear error pointing at cross-migration conflicts.
-//! - Phase 4c (planned): `--keep-source` / `--delete-source` lifecycle.
+//! - Phase 4c (this commit): source lifecycle flags.
+//!   `--delete-source` (requires `--keep-source=false`) removes the
+//!   source's live data files after a successful migration.
+//!   `--keep-source` (default) instead drops a `MIGRATED.txt` marker
+//!   at the source root naming the destination + committed version.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -355,6 +359,56 @@ fn clone_meta(m: &ParquetFileMeta) -> ParquetFileMeta {
     }
 }
 
+/// Phase 4c: delete the source catalog's live data files + puffin DVs
+/// after a successful migration. Metadata files (`metadata/*.json`,
+/// `version-hint.text`) are left in place — they're cheap and they
+/// let operators confirm the pre-migration shape if needed. Only the
+/// big-ticket data is reclaimed.
+async fn delete_source_files(src: &str, plan: &MigrationPlan) -> Result<()> {
+    let src_path = PathBuf::from(src);
+    for entry in &plan.data_files {
+        let abs = src_path.join(&entry.path);
+        match tokio::fs::remove_file(&abs).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(MeruError::Io(e)),
+        }
+        if let Some(dv) = &entry.dv_path {
+            let abs_dv = src_path.join(dv);
+            match tokio::fs::remove_file(&abs_dv).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(MeruError::Io(e)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 4c: drop a small plain-text MIGRATED.txt at the source root
+/// documenting when and where the migration completed. Future operators
+/// opening the directory know this is no longer the canonical store.
+async fn write_migrated_marker(src: &str, dst: &str, committed_version: i64) -> Result<()> {
+    let marker = PathBuf::from(src).join("MIGRATED.txt");
+    let body = format!(
+        "This merutable catalog has been migrated to CommitMode::ObjectStore.\n\
+         Destination: {dst}\n\
+         Committed version: v{committed_version}\n\
+         Migrated at: {now}\n\
+         Tool: merutable-migrate (Issue #27).\n\
+         \n\
+         Do NOT resume writes against this source directory — reads may appear\n\
+         consistent but new commits will diverge from the ObjectStore destination.\n",
+        now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    tokio::fs::write(&marker, body.as_bytes())
+        .await
+        .map_err(MeruError::Io)
+}
+
 /// Phase 4a: `--verify`. Re-read every migrated file from the
 /// destination and compare its content hash against the source.
 /// Doubles the I/O cost of a migration but catches corruption or
@@ -573,6 +627,42 @@ fn run() -> std::result::Result<(), (i32, String)> {
                 ))
                 .map_err(|e| (9, format!("verification failed: {e}")))?;
             eprintln!("--verify: all {} files match.", plan.data_files.len());
+        }
+
+        // Phase 4c: source lifecycle. --delete-source takes precedence
+        // over --keep-source; both are safe only after a successful
+        // migration (and, if --verify was asked for, a successful
+        // verification pass — both checks above would have returned
+        // errors before reaching here).
+        if args.delete_source {
+            if args.keep_source {
+                // Ambiguous combination — refuse rather than guess.
+                return Err((
+                    10,
+                    "--delete-source and --keep-source=true are mutually \
+                     exclusive. Pass --keep-source=false with --delete-source."
+                        .to_string(),
+                ));
+            }
+            eprintln!(
+                "--delete-source: removing {} source files...",
+                plan.data_files.len()
+            );
+            runtime
+                .block_on(delete_source_files(&args.src, &plan))
+                .map_err(|e| (11, format!("delete source: {e}")))?;
+            eprintln!("--delete-source: source files removed.");
+        } else if args.keep_source {
+            // Drop a durable MIGRATED.txt at the source root so future
+            // operators know not to re-migrate or accidentally write
+            // to the abandoned catalog.
+            runtime
+                .block_on(write_migrated_marker(
+                    &args.src,
+                    &args.dst,
+                    committed_version,
+                ))
+                .map_err(|e| (12, format!("write MIGRATED.txt: {e}")))?;
         }
         return Ok(());
     }
@@ -849,6 +939,68 @@ mod tests {
             "error must name divergent file: {msg}"
         );
         assert!(msg.contains("mismatch"), "error must name mismatch: {msg}");
+    }
+
+    /// Phase 4c: `delete_source_files` removes the listed data files
+    /// (and any puffin DVs) but leaves metadata intact.
+    #[tokio::test]
+    async fn delete_source_removes_data_files() {
+        let src = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(src.path().join("metadata"))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            tokio::fs::write(
+                src.path().join(format!("data/L0/f{i}.parquet")),
+                format!("body-{i}"),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::fs::write(src.path().join("metadata/v1.metadata.json"), "{}")
+            .await
+            .unwrap();
+
+        let plan = MigrationPlan {
+            source_snapshot_id: 1,
+            source_table_uuid: "fake".into(),
+            data_files: (0..3)
+                .map(|i| PlanEntry {
+                    path: format!("data/L0/f{i}.parquet"),
+                    bytes: 6,
+                    num_rows: 1,
+                    dv_path: None,
+                })
+                .collect(),
+            total_bytes: 18,
+        };
+        delete_source_files(src.path().to_str().unwrap(), &plan)
+            .await
+            .unwrap();
+
+        // Data files gone; metadata preserved.
+        for i in 0..3 {
+            assert!(!src.path().join(format!("data/L0/f{i}.parquet")).exists());
+        }
+        assert!(src.path().join("metadata/v1.metadata.json").exists());
+    }
+
+    /// Phase 4c: `write_migrated_marker` drops a MIGRATED.txt at the
+    /// source root naming the destination and committed version.
+    #[tokio::test]
+    async fn migrated_marker_names_destination() {
+        let src = tempfile::tempdir().unwrap();
+        write_migrated_marker(src.path().to_str().unwrap(), "/some/dst", 7)
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(src.path().join("MIGRATED.txt"))
+            .await
+            .unwrap();
+        assert!(body.contains("/some/dst"));
+        assert!(body.contains("v7"));
     }
 
     /// Phase 4b: `--resume` against an already-migrated destination
