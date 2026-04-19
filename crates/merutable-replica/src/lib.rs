@@ -37,13 +37,15 @@
 //!   mirrored snapshot, resets the tail, and catches up.
 //! - **Phase 4b (shipped)**: zero-gap hot-swap via parallel warmup
 //!   + `ArcSwap<ReplicaState>` retarget.
-//! - **Phase 5 (this commit)**: metrics surface. `Replica::stats()`
-//!   returns a `ReplicaStats` snapshot — `visible_seq`, `base_seq`,
-//!   `tail_length`, `rebase_count`, `last_rebase_warmup_millis` —
-//!   so operators can correlate replica lag against primary write
-//!   rate and size their mirror cadence against the
-//!   rebase-warmup distribution. Log-gap recovery + stress-test
-//!   harness land in Phase 6.
+//! - **Phase 5 (shipped)**: metrics surface — `Replica::stats()`
+//!   returns visible_seq / base_seq / tail_length / rebase_count /
+//!   last_rebase_warmup_millis.
+//! - **Phase 6 (this commit)**: log-gap recovery. When the log
+//!   source returns `ChangeFeedBelowRetention`, the replica can
+//!   hard-reset by opening a fresh base at the latest-mirrored
+//!   snapshot with an empty tail (via `advance_or_recover()` or
+//!   the explicit `recover_from_log_gap()` call). Stress-test
+//!   harness is a future, outside-the-crate effort.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -649,7 +651,23 @@ impl Replica {
         // Step 3: warm up by draining the log source. Happens
         // BEFORE the swap, so the new state is fully caught up
         // the moment it becomes the live target.
-        fresh_tail.advance(self.log_source.as_ref()).await?;
+        //
+        // Phase 6: tolerate `ChangeFeedBelowRetention` during
+        // warmup. This IS the recovery path from a retention gap —
+        // the log source can't catch the new tail up because
+        // it's already too far behind, but the new base is fresh,
+        // so leaving the tail empty at new_base_seq is the
+        // correct end state. Every other error propagates.
+        match fresh_tail.advance(self.log_source.as_ref()).await {
+            Ok(()) => {}
+            Err(MeruError::ChangeFeedBelowRetention { .. }) => {
+                // Fresh tail stays empty; visible_seq stays at
+                // seeded new_base_seq. Readers see the base
+                // snapshot only, which is exactly the recovered
+                // state.
+            }
+            Err(other) => return Err(other),
+        }
         let new_visible_seq = fresh_tail.visible_seq();
 
         let new_state = std::sync::Arc::new(ReplicaState {
@@ -674,6 +692,62 @@ impl Replica {
 
         Ok((new_base_seq, new_visible_seq))
     }
+
+    /// Issue #32 Phase 6: advance-or-recover. Call `advance()`;
+    /// on `ChangeFeedBelowRetention` (the retention gap signal),
+    /// fall back to `rebase_hotswap` for a hard reset to the
+    /// latest mirrored snapshot with an empty tail. The replica
+    /// resumes serving reads at the new base_seq.
+    ///
+    /// Returns:
+    /// - `Ok(AdvanceOutcome::Advanced)` — normal path, tail picked
+    ///   up new ops (possibly zero).
+    /// - `Ok(AdvanceOutcome::Recovered { new_base_seq })` — the
+    ///   log source told us we're below retention, we reset.
+    ///   Callers typically log this and reset any downstream
+    ///   consumer state that depended on continuity of the tail
+    ///   stream.
+    /// - `Err(_)` — the error was NOT a retention gap (I/O,
+    ///   corruption, etc.); caller's usual error-handling path.
+    ///
+    /// Note: operationally, repeated Recovered outcomes indicate
+    /// the replica is chronically behind — size the mirror
+    /// cadence or bump `gc_grace_period_secs` on the primary.
+    pub async fn advance_or_recover(&self) -> Result<AdvanceOutcome> {
+        match self.advance().await {
+            Ok(()) => Ok(AdvanceOutcome::Advanced),
+            Err(MeruError::ChangeFeedBelowRetention { .. }) => {
+                let (new_base_seq, _) = self.rebase_hotswap().await?;
+                Ok(AdvanceOutcome::Recovered { new_base_seq })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Issue #32 Phase 6: explicit hard-reset for log-gap
+    /// recovery. Alias for `rebase_hotswap` with an
+    /// operator-facing name. Callers who detect a retention gap
+    /// out-of-band (e.g., their monitoring told them so) use
+    /// this to pre-emptively reset without waiting for the next
+    /// `advance()` to discover the gap.
+    pub async fn recover_from_log_gap(&self) -> Result<u64> {
+        let (new_base_seq, _) = self.rebase_hotswap().await?;
+        Ok(new_base_seq)
+    }
+}
+
+/// Phase 6 return shape for `advance_or_recover`. Operators log
+/// on `Recovered` variants; automated pipelines treat both as
+/// success but may want to reset their downstream state on
+/// `Recovered`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdvanceOutcome {
+    /// Normal append-only advance: tail picked up zero or more ops.
+    Advanced,
+    /// Log source said we're below retention; we hard-reset via
+    /// `rebase_hotswap`. `new_base_seq` is the replica's base
+    /// after recovery.
+    Recovered { new_base_seq: u64 },
 }
 
 #[cfg(test)]
