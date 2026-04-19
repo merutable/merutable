@@ -101,6 +101,18 @@ pub struct MeruEngine {
     /// Both must hold: version-pin protects internal readers,
     /// time-grace protects external ones.
     pub(crate) pending_deletions: Mutex<Vec<PendingDelete>>,
+    /// Issue #30 observability: cached size of `pending_deletions`,
+    /// maintained by `enqueue_for_deletion` and `gc_pending_deletions`.
+    /// Readable synchronously from `stats()` without touching the
+    /// tokio Mutex (which holds across `remove_file().await` during
+    /// GC). Stays eventually consistent with the Vec — a stats read
+    /// in the middle of a GC sweep may be off by O(queue size).
+    pub(crate) pending_deletions_len: std::sync::atomic::AtomicUsize,
+    /// Issue #30 observability: Instant at which the oldest currently-
+    /// pending deletion was enqueued. `None` when the queue is empty.
+    /// Maintained alongside the Vec so `stats()` can compute the age
+    /// without holding the tokio Mutex.
+    pub(crate) pending_oldest_enqueue: std::sync::RwLock<Option<std::time::Instant>>,
     /// Notified by compaction after a successful commit that reduced
     /// the L0 file count. Writers stalled on the L0 stop trigger park
     /// on this notify; waking them on L0 drainage (rather than on the
@@ -306,6 +318,8 @@ impl MeruEngine {
             read_only,
             visible_seq,
             pending_deletions: Mutex::new(Vec::new()),
+            pending_deletions_len: std::sync::atomic::AtomicUsize::new(0),
+            pending_oldest_enqueue: std::sync::RwLock::new(None),
             l0_drained: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_snapshots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             closed: AtomicBool::new(false),
@@ -753,12 +767,22 @@ impl MeruEngine {
         }
         let now = std::time::Instant::now();
         let mut pending = self.pending_deletions.lock().await;
+        let added = paths.len();
         for path in paths {
             pending.push(PendingDelete {
                 path,
                 obsoleted_at: now,
                 obsoleted_after_snapshot,
             });
+        }
+        // #30 observability: bump the cached counter and record the
+        // oldest-enqueue timestamp under the lock so stats() sees a
+        // value consistent with the Vec until the next GC sweep.
+        self.pending_deletions_len
+            .store(pending.len(), std::sync::atomic::Ordering::Relaxed);
+        let mut oldest = self.pending_oldest_enqueue.write().unwrap();
+        if oldest.is_none() && added > 0 {
+            *oldest = Some(now);
         }
     }
 
@@ -816,7 +840,14 @@ impl MeruEngine {
                 remaining.push(entry);
             }
         }
+        // #30: refresh the cached counter + oldest-enqueue timestamp
+        // to match the trimmed Vec. The oldest is now the min over
+        // what remains; empty Vec → None (queue fully drained).
+        let new_oldest = remaining.iter().map(|e| e.obsoleted_at).min();
         *pending = remaining;
+        self.pending_deletions_len
+            .store(pending.len(), std::sync::atomic::Ordering::Relaxed);
+        *self.pending_oldest_enqueue.write().unwrap() = new_oldest;
         crate::metrics::inc(crate::metrics::GC_SWEEPS_TOTAL);
     }
 
@@ -991,12 +1022,30 @@ impl MeruEngine {
             },
         };
 
+        // #30 observability: synchronous read of the pending-deletions
+        // counters — no await, no tokio Mutex access. Stale by at most
+        // one enqueue/sweep transition, which is fine for a stats
+        // snapshot.
+        let pending_count = self
+            .pending_deletions_len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let oldest_age_secs = self
+            .pending_oldest_enqueue
+            .read()
+            .unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+
         crate::stats::EngineStats {
             snapshot_id: version.snapshot_id,
             current_seq: self.global_seq.current().0,
             levels,
             memtable,
             cache,
+            gc: crate::stats::GcStats {
+                pending_count,
+                oldest_pending_age_secs: oldest_age_secs,
+            },
         }
     }
 }
@@ -1053,6 +1102,49 @@ mod tests {
         // Issue #8: a fresh engine has seen no writes → visible frontier is 0.
         assert_eq!(engine.read_seq().0, 0);
         assert_eq!(engine.schema().table_name, "test");
+    }
+
+    /// Issue #30 observability: `stats().gc.pending_count` tracks the
+    /// pending-deletions queue size without blocking on the tokio
+    /// mutex that `gc_pending_deletions` holds across awaited file
+    /// deletes. A synchronous `stats()` caller must never await.
+    #[tokio::test]
+    async fn stats_gc_tracks_pending_deletions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+
+        // Fresh engine: queue empty.
+        let s0 = engine.stats();
+        assert_eq!(s0.gc.pending_count, 0);
+        assert_eq!(s0.gc.oldest_pending_age_secs, 0);
+
+        // Enqueue three fake paths at snapshot=0 so the grace-period
+        // check treats them as unpinned.
+        engine
+            .enqueue_for_deletion(
+                vec![
+                    tmp.path().join("ghost1.parquet"),
+                    tmp.path().join("ghost2.parquet"),
+                    tmp.path().join("ghost3.parquet"),
+                ],
+                /*obsoleted_after_snapshot=*/ 0,
+            )
+            .await;
+        let s1 = engine.stats();
+        assert_eq!(s1.gc.pending_count, 3);
+        // oldest_age may be 0 in the same-tick case; just assert it
+        // doesn't panic or overflow.
+        let _ = s1.gc.oldest_pending_age_secs;
+
+        // Run GC; with default grace period the entries stay pending
+        // (time-based grace not yet elapsed) but the counter invariant
+        // — count == Vec length — must still hold.
+        engine.gc_pending_deletions().await;
+        let s2 = engine.stats();
+        assert_eq!(
+            s2.gc.pending_count, 3,
+            "still within grace, queue length unchanged"
+        );
     }
 
     /// Issue #8 regression: the first put's returned seq must be

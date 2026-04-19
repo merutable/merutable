@@ -42,6 +42,22 @@ pub struct CacheStats {
     pub miss_count: u64,
 }
 
+/// GC-queue statistics. Issue #30 observability hook: under sustained
+/// writes with aggressive compaction, the pending-deletions queue can
+/// grow faster than `gc_grace_period_secs` drains it if external HTAP
+/// readers hold the time-based grace. Operators correlate
+/// `pending_count` growth with RSS spikes.
+#[derive(Debug, Clone)]
+pub struct GcStats {
+    /// Number of files currently awaiting deletion (pinned by
+    /// snapshot or still within `gc_grace_period_secs`).
+    pub pending_count: usize,
+    /// Oldest pending entry's age in seconds. Useful signal: a long
+    /// tail here means GC keeps deferring the same files every sweep
+    /// (likely a long-running snapshot pin).
+    pub oldest_pending_age_secs: u64,
+}
+
 /// Top-level engine statistics snapshot.
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -50,4 +66,5 @@ pub struct EngineStats {
     pub levels: Vec<LevelStats>,
     pub memtable: MemtableStats,
     pub cache: CacheStats,
+    pub gc: GcStats,
 }
