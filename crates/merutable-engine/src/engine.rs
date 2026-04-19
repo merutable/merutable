@@ -164,10 +164,14 @@ impl MeruEngine {
     /// 3. Open Iceberg catalog and load current version.
     /// 4. Initialize global seq to `max(wal_max_seq, iceberg_max_seq) + 1`.
     #[instrument(skip(config), fields(table = %config.schema.table_name))]
-    pub async fn open(config: EngineConfig) -> Result<Arc<Self>> {
+    pub async fn open(mut config: EngineConfig) -> Result<Arc<Self>> {
         // Bug SC2 fix: validate the schema upfront so misconfigured schemas
         // (out-of-bounds PK indices, nullable PKs, empty columns) produce a
         // clear error here instead of panicking deep inside encode/decode.
+        //
+        // Issue #25: validate() takes &mut because it auto-assigns Iceberg
+        // field-ids. The mutation is safe here — the schema is owned by
+        // this open call and the normalized form is what we want to persist.
         config.schema.validate()?;
 
         let schema = Arc::new(config.schema.clone());
@@ -1015,14 +1019,20 @@ mod tests {
                     name: "id".into(),
                     col_type: ColumnType::Int64,
                     nullable: false,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "val".into(),
                     col_type: ColumnType::ByteArray,
                     nullable: true,
+
+                    ..Default::default()
                 },
             ],
             primary_key: vec![0],
+
+            ..Default::default()
         }
     }
 

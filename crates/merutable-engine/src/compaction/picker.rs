@@ -222,8 +222,12 @@ mod tests {
                 name: "id".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         })
     }
 

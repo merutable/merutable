@@ -107,8 +107,12 @@ fn any_schema_and_two_pks() -> impl Strategy<Value = (TableSchema, Vec<FieldValu
                     name: "id".into(),
                     col_type: ColumnType::Int64,
                     nullable: false,
+
+                    ..Default::default()
                 }],
                 primary_key: vec![0],
+
+                ..Default::default()
             };
             (s, vec![FieldValue::Int64(a)], vec![FieldValue::Int64(b)])
         }),
@@ -120,8 +124,12 @@ fn any_schema_and_two_pks() -> impl Strategy<Value = (TableSchema, Vec<FieldValu
                     name: "k".into(),
                     col_type: ColumnType::ByteArray,
                     nullable: false,
+
+                    ..Default::default()
                 }],
                 primary_key: vec![0],
+
+                ..Default::default()
             };
             (s, vec![FieldValue::Bytes(a)], vec![FieldValue::Bytes(b)])
         }),
@@ -134,14 +142,20 @@ fn any_schema_and_two_pks() -> impl Strategy<Value = (TableSchema, Vec<FieldValu
                         name: "a".into(),
                         col_type: ColumnType::Int64,
                         nullable: false,
+
+                        ..Default::default()
                     },
                     ColumnDef {
                         name: "b".into(),
                         col_type: ColumnType::ByteArray,
                         nullable: false,
+
+                        ..Default::default()
                     },
                 ],
                 primary_key: vec![0, 1],
+
+                ..Default::default()
             };
             (
                 s,
@@ -216,8 +230,12 @@ proptest! {
                 name: "k".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         };
         let a_bytes = Bytes::from(prefix.clone());
         let mut b_raw = prefix;

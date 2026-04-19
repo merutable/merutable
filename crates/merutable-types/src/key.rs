@@ -447,8 +447,12 @@ mod tests {
                 name: "id".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         }
     }
 
@@ -459,8 +463,12 @@ mod tests {
                 name: "k".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         }
     }
 
@@ -472,19 +480,27 @@ mod tests {
                     name: "a".into(),
                     col_type: ColumnType::Int32,
                     nullable: false,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "b".into(),
                     col_type: ColumnType::ByteArray,
                     nullable: false,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "v".into(),
                     col_type: ColumnType::ByteArray,
                     nullable: true,
+
+                    ..Default::default()
                 },
             ],
             primary_key: vec![0, 1],
+
+            ..Default::default()
         }
     }
 
@@ -713,8 +729,12 @@ mod tests {
                 name: "f".into(),
                 col_type: ColumnType::Float,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         };
         let neg =
             InternalKey::encode(&[FieldValue::Float(-1.0)], SeqNum(0), OpType::Put, &s).unwrap();

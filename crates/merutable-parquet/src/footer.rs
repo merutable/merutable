@@ -99,19 +99,27 @@ mod tests {
                     name: "id".into(),
                     col_type: ColumnType::Int64,
                     nullable: false,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "val".into(),
                     col_type: ColumnType::ByteArray,
                     nullable: true,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "fb".into(),
                     col_type: ColumnType::FixedLenByteArray(8),
                     nullable: true,
+
+                    ..Default::default()
                 },
             ],
             primary_key: vec![0],
+
+            ..Default::default()
         }
     }
 

@@ -17,14 +17,20 @@ fn test_schema() -> TableSchema {
                 name: "id".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "val".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: true,
+
+                ..Default::default()
             },
         ],
         primary_key: vec![0],
+
+        ..Default::default()
     }
 }
 
@@ -507,19 +513,27 @@ async fn issue12_write_api_rejects_malformed_rows() {
                 name: "id".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "payload".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: true,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "fixed8".into(),
                 col_type: ColumnType::FixedLenByteArray(8),
                 nullable: false,
+
+                ..Default::default()
             },
         ],
         primary_key: vec![0],
+
+        ..Default::default()
     };
     let config = EngineConfig {
         schema: schema.clone(),
@@ -855,14 +869,20 @@ async fn issue7_narrow_diagnostic() {
                 name: "k".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: false,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "v".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             },
         ],
         primary_key: vec![0],
+
+        ..Default::default()
     };
     let config = EngineConfig {
         schema: schema.clone(),
@@ -962,14 +982,20 @@ async fn issue7_bytearray_edge_case_pks_roundtrip_through_parquet() {
                 name: "k".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: false,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "v".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             },
         ],
         primary_key: vec![0],
+
+        ..Default::default()
     };
     let make_config = || EngineConfig {
         schema: schema.clone(),
@@ -1183,14 +1209,20 @@ async fn compaction_output_splits_at_size_threshold() {
                 name: "id".into(),
                 col_type: ColumnType::Int64,
                 nullable: false,
+
+                ..Default::default()
             },
             ColumnDef {
                 name: "payload".into(),
                 col_type: ColumnType::ByteArray,
                 nullable: false,
+
+                ..Default::default()
             },
         ],
         primary_key: vec![0],
+
+        ..Default::default()
     };
     let config = EngineConfig {
         schema,

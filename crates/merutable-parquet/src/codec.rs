@@ -506,19 +506,27 @@ mod tests {
                     name: "id".into(),
                     col_type: ColumnType::Int64,
                     nullable: false,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "flag".into(),
                     col_type: ColumnType::Boolean,
                     nullable: true,
+
+                    ..Default::default()
                 },
                 ColumnDef {
                     name: "score".into(),
                     col_type: ColumnType::Double,
                     nullable: false,
+
+                    ..Default::default()
                 },
             ],
             primary_key: vec![0],
+
+            ..Default::default()
         }
     }
 
@@ -571,8 +579,12 @@ mod tests {
                 name: "n".into(),
                 col_type: ColumnType::Int32,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![0],
+
+            ..Default::default()
         };
         let ikey =
             InternalKey::encode(&[FieldValue::Int32(1)], SeqNum(1), OpType::Put, &schema).unwrap();
@@ -595,8 +607,12 @@ mod tests {
                 name: "flag".into(),
                 col_type: ColumnType::Boolean,
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![],
+
+            ..Default::default()
         };
         let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
         let rows = vec![(
@@ -620,8 +636,12 @@ mod tests {
                 name: "fb".into(),
                 col_type: ColumnType::FixedLenByteArray(4),
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![],
+
+            ..Default::default()
         };
         let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
         let rows = vec![(
@@ -646,8 +666,12 @@ mod tests {
                 name: "fb".into(),
                 col_type: ColumnType::FixedLenByteArray(4),
                 nullable: false,
+
+                ..Default::default()
             }],
             primary_key: vec![],
+
+            ..Default::default()
         };
         let ikey = InternalKey::encode(&[], SeqNum(1), OpType::Put, &schema).unwrap();
         let rows = vec![(

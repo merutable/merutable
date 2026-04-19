@@ -87,11 +87,8 @@ impl EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            schema: TableSchema {
-                table_name: String::new(),
-                columns: vec![],
-                primary_key: vec![],
-            },
+            // Issue #25: TableSchema is #[non_exhaustive] — use builder.
+            schema: TableSchema::builder(String::new()).build(),
             catalog_uri: String::new(),
             object_store_prefix: String::new(),
             wal_dir: PathBuf::from("./meru-wal"),
