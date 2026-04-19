@@ -98,8 +98,10 @@ async fn replica_falls_through_to_base_on_tail_miss() {
         .catalog_uri(primary_dir.path().to_string_lossy().to_string());
     let log = Arc::new(InProcessLogSource::new(primary.clone()));
     let replica = Replica::open(base_opts, log).await.unwrap();
-    // No advance. The tail is empty.
-    assert_eq!(replica.visible_seq().await, 0);
+    // Phase 5: visible_seq is seeded to base_seq on open so
+    // subsequent advances() only replay post-base ops. No tail
+    // entries yet.
+    assert_eq!(replica.visible_seq().await, replica.base_seq());
 
     let r = replica.get(&[FieldValue::Int64(42)]).await.unwrap();
     assert!(r.is_some(), "tail miss falls through to base");
@@ -264,6 +266,63 @@ async fn old_state_arc_persists_across_hotswap() {
         ),
     );
     assert!(hotswap_ok.is_ok(), "hotswap does not error under read load");
+}
+
+/// Phase 5: `Replica::stats()` exposes visible_seq, base_seq,
+/// tail_length, rebase_count, and last_rebase_warmup_millis.
+/// rebase_count advances per hotswap; tail_length grows with
+/// unflushed primary writes.
+#[tokio::test]
+async fn stats_surface_advances_across_advance_and_rebase() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let primary = open_primary(&primary_dir).await;
+    primary.put(row(1, 1)).await.unwrap();
+    primary.flush().await.unwrap();
+
+    let base_opts = merutable::OpenOptions::new(schema())
+        .wal_dir(replica_dir.path().join("wal"))
+        .catalog_uri(primary_dir.path().to_string_lossy().to_string());
+    let log = Arc::new(InProcessLogSource::new(primary.clone()));
+    let replica = Replica::open(base_opts, log).await.unwrap();
+
+    // Initial stats: base mounted, empty tail seeded at base_seq,
+    // no rebases.
+    let s0 = replica.stats().await;
+    assert!(s0.base_seq > 0);
+    assert_eq!(
+        s0.visible_seq, s0.base_seq,
+        "tail seeded at base_seq on open"
+    );
+    assert_eq!(s0.tail_length, 0);
+    assert_eq!(s0.rebase_count, 0);
+    assert_eq!(s0.last_rebase_warmup_millis, 0);
+
+    // Primary writes (unflushed). Advance the tail.
+    primary.put(row(2, 2)).await.unwrap();
+    primary.put(row(3, 3)).await.unwrap();
+    replica.advance().await.unwrap();
+    let s1 = replica.stats().await;
+    assert!(
+        s1.visible_seq >= 3,
+        "visible advanced to >=3: {}",
+        s1.visible_seq
+    );
+    assert_eq!(s1.tail_length, 2, "2 tail ops absorbed");
+
+    // Hotswap — rebase_count bumps, last_warmup recorded,
+    // tail_length drops back to 0 (new state seeded at new
+    // base_seq with empty tail, then advance drained 0 new ops
+    // since primary hasn't written anything post-flush).
+    primary.flush().await.unwrap();
+    let _ = replica.rebase_hotswap().await.unwrap();
+    let s2 = replica.stats().await;
+    assert_eq!(s2.rebase_count, 1);
+    // warmup is small but MAY be 0 on very fast CPUs — the
+    // assertion here is just "we wrote something."
+    let _ = s2.last_rebase_warmup_millis;
+    assert!(s2.base_seq > s0.base_seq, "base advanced through rebase");
+    assert_eq!(s2.tail_length, 0, "fresh tail after rebase is empty");
 }
 
 #[tokio::test]

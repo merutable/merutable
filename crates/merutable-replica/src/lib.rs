@@ -35,14 +35,15 @@
 //! - **Phase 4a (shipped)**: `Replica::rebase()` — manual
 //!   stop-the-world rebase that refreshes the base to the latest
 //!   mirrored snapshot, resets the tail, and catches up.
-//! - **Phase 4b (this commit)**: zero-gap hot-swap via
-//!   parallel warmup + `ArcSwap<ReplicaState>` retarget. The
-//!   old state keeps serving in-flight reads while the new
-//!   state warms up against a freshly-opened base; once warm,
-//!   a single atomic swap retargets new readers. Old state
-//!   drops when no reader holds it.
-//! - **Phase 5 (planned)**: metrics surface, log-gap recovery,
-//!   stress test harness.
+//! - **Phase 4b (shipped)**: zero-gap hot-swap via parallel warmup
+//!   + `ArcSwap<ReplicaState>` retarget.
+//! - **Phase 5 (this commit)**: metrics surface. `Replica::stats()`
+//!   returns a `ReplicaStats` snapshot — `visible_seq`, `base_seq`,
+//!   `tail_length`, `rebase_count`, `last_rebase_warmup_millis` —
+//!   so operators can correlate replica lag against primary write
+//!   rate and size their mirror cadence against the
+//!   rebase-warmup distribution. Log-gap recovery + stress-test
+//!   harness land in Phase 6.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -398,10 +399,41 @@ pub struct ReplicaState {
 /// Phase 4b wraps the (base, tail) pair behind `ArcSwap<State>` so
 /// `rebase_hotswap()` can retarget new readers atomically without
 /// interrupting in-flight ones.
+/// Phase 5: replica observability snapshot. Every field is an
+/// instantaneous value; no running totals that drift across calls.
+/// Cheap to compute — reads two AtomicUsize/u64 fields + one
+/// RwLock::read on the live tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaStats {
+    /// The reader-visible seq (tail's visible_seq). Lag relative
+    /// to the primary is `primary.read_seq - this`.
+    pub visible_seq: u64,
+    /// The base MeruDB's read_seq — the snapshot the current
+    /// state is mounted against. Advances on `rebase*()` calls.
+    pub base_seq: u64,
+    /// Number of ops currently held in the tail index. Grows
+    /// between rebases, drops to ~0 after a rebase (the new
+    /// tail is seeded at base_seq and only holds post-mirror ops).
+    pub tail_length: usize,
+    /// Lifetime count of completed hot-swap rebases. Useful as
+    /// a sanity check: flat → rebase worker stalled; climbing
+    /// linearly → healthy mirror cadence.
+    pub rebase_count: u64,
+    /// Wall-clock milliseconds the most recent `rebase_hotswap`
+    /// took to open the new base + drain the log. Zero before any
+    /// hotswap has run. Callers build histograms off this.
+    pub last_rebase_warmup_millis: u64,
+}
+
 pub struct Replica {
     state: arc_swap::ArcSwap<ReplicaState>,
     log_source: std::sync::Arc<dyn LogSource>,
     schema: std::sync::Arc<merutable_types::schema::TableSchema>,
+    /// Phase 5 counters. Atomic so `stats()` is lock-free at the
+    /// counter layer; the tail snapshot still needs a brief
+    /// `RwLock::read`.
+    rebase_count: std::sync::atomic::AtomicU64,
+    last_rebase_warmup_millis: std::sync::atomic::AtomicU64,
     /// OpenOptions used to spawn the initial base; cloned + used
     /// again by `rebase_hotswap` to open a fresh read-only MeruDB
     /// for the new state. The new MeruDB reads the latest
@@ -427,16 +459,52 @@ impl Replica {
         let schema = std::sync::Arc::new(base_options.schema.clone());
         let base_opts = base_options.clone();
         let base = std::sync::Arc::new(merutable::MeruDB::open(base_options).await?);
+        // Phase 5 refinement: seed the initial tail's visible_seq
+        // to base_seq so an immediate advance() only pulls ops
+        // strictly newer than the base snapshot. Mirrors the
+        // rebase_hotswap path where the new tail is always
+        // anchored at new_base_seq. Before this refinement, a
+        // replica opening against a flushed-primary would replay
+        // every op that was also in the base — correct (LWW
+        // dedups) but burns memory proportional to catalog size.
+        let mut initial_tail = ReplicaTail::new();
+        let base_seq = base.read_seq().0;
+        if base_seq > 0 {
+            initial_tail.seed_visible_seq(base_seq);
+        }
         let state = std::sync::Arc::new(ReplicaState {
             base,
-            tail: tokio::sync::RwLock::new(ReplicaTail::new()),
+            tail: tokio::sync::RwLock::new(initial_tail),
         });
         Ok(Self {
             state: arc_swap::ArcSwap::new(state),
             log_source,
             schema,
             base_opts,
+            rebase_count: std::sync::atomic::AtomicU64::new(0),
+            last_rebase_warmup_millis: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Phase 5: observability snapshot. Cheap — atomic loads +
+    /// one brief RwLock::read on the live tail. No allocations
+    /// beyond the returned struct.
+    pub async fn stats(&self) -> ReplicaStats {
+        let state = self.state.load_full();
+        let base_seq = state.base.read_seq().0;
+        let (visible_seq, tail_length) = {
+            let tail = state.tail.read().await;
+            (tail.visible_seq(), tail.ops_applied() as usize)
+        };
+        ReplicaStats {
+            visible_seq,
+            base_seq,
+            tail_length,
+            rebase_count: self.rebase_count.load(std::sync::atomic::Ordering::Relaxed),
+            last_rebase_warmup_millis: self
+                .last_rebase_warmup_millis
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Drain new ops from the log source into the tail of the
@@ -564,6 +632,7 @@ impl Replica {
     /// Returns the (new_base_seq, new_visible_seq) tuple as a
     /// confirmation signal for caller timers / metrics exporters.
     pub async fn rebase_hotswap(&self) -> Result<(u64, u64)> {
+        let start = std::time::Instant::now();
         // Step 1: open the new base. This is a fresh MeruDB
         // independent from the one the current state uses, so
         // old readers (holding an Arc<ReplicaState>) keep reading
@@ -594,6 +663,14 @@ impl Replica {
         // (typically immediately, since read methods hold the
         // Arc only for the duration of the call).
         self.state.store(new_state);
+
+        // Phase 5 counters. Record BEFORE returning so a caller
+        // that immediately calls `stats()` sees the fresh values.
+        let warmup_millis = start.elapsed().as_millis() as u64;
+        self.last_rebase_warmup_millis
+            .store(warmup_millis, std::sync::atomic::Ordering::Relaxed);
+        self.rebase_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok((new_base_seq, new_visible_seq))
     }
