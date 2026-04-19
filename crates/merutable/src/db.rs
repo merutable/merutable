@@ -167,6 +167,7 @@ impl MeruDB {
             l0_stop_trigger: options.l0_stop_trigger,
             bloom_bits_per_key: options.bloom_bits_per_key,
             max_compaction_bytes: options.max_compaction_bytes,
+            max_compaction_input_rows: options.max_compaction_input_rows,
             flush_parallelism: options.flush_parallelism,
             compaction_parallelism: options.compaction_parallelism,
             gc_grace_period_secs: options.gc_grace_period_secs,

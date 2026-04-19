@@ -120,6 +120,14 @@ pub struct OpenOptions {
     // Compaction I/O cap
     pub max_compaction_bytes: u64,
 
+    /// Issue #30: upper bound on total rows a single compaction
+    /// ingests. `0` = unbounded (back-compat default). Operators
+    /// seeing the RSS-2.6x symptom set this to cap decoded-row
+    /// memory per compaction independent of byte size. See
+    /// `EngineConfig::max_compaction_input_rows` for the full
+    /// contract.
+    pub max_compaction_input_rows: u64,
+
     // Background parallelism
     pub flush_parallelism: usize,
     pub compaction_parallelism: usize,
@@ -169,6 +177,7 @@ impl OpenOptions {
             l0_stop_trigger: ec.l0_stop_trigger,
             bloom_bits_per_key: ec.bloom_bits_per_key,
             max_compaction_bytes: ec.max_compaction_bytes,
+            max_compaction_input_rows: ec.max_compaction_input_rows,
             flush_parallelism: ec.flush_parallelism,
             compaction_parallelism: ec.compaction_parallelism,
             gc_grace_period_secs: ec.gc_grace_period_secs,
@@ -305,6 +314,15 @@ impl OpenOptions {
     /// Upper bound on per-compaction input bytes. Prevents a single
     /// deep-level compaction from pulling multi-GiB into memory.
     /// Default: 256 MiB. See Issue #2.
+    /// Issue #30: cap the total rows a single compaction ingests.
+    /// `0` disables. Set to bound decoded-row memory per
+    /// compaction; good starting point: `max_compaction_bytes /
+    /// avg_row_bytes` for your workload.
+    pub fn max_compaction_input_rows(mut self, rows: u64) -> Self {
+        self.max_compaction_input_rows = rows;
+        self
+    }
+
     pub fn max_compaction_bytes(mut self, bytes: u64) -> Self {
         self.max_compaction_bytes = bytes;
         self

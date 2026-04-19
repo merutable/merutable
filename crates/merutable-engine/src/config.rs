@@ -70,6 +70,20 @@ pub struct EngineConfig {
     /// Max bytes written per compaction run before splitting output files. Default: 256 MiB.
     pub max_compaction_bytes: u64,
 
+    /// Issue #30: upper bound on the total ROW count a single
+    /// compaction may ingest from its inputs. `0` disables the
+    /// cap (back-compat default). Non-zero values bound the
+    /// decoded-row memory footprint per compaction — a Parquet
+    /// file that compresses ~4× expands on decode, so
+    /// `max_compaction_bytes` alone doesn't bound peak memory.
+    /// Operators hitting the #30 RSS-2.6x symptom should set
+    /// this to cap the pathological case; a reasonable starting
+    /// point is `max_compaction_bytes / avg_row_bytes` where
+    /// `avg_row_bytes` is measured from the current workload.
+    /// The picker enforces this alongside `max_compaction_bytes`;
+    /// a compaction that would exceed either cap is skipped.
+    pub max_compaction_input_rows: u64,
+
     // Background parallelism
     pub flush_parallelism: usize,
     pub compaction_parallelism: usize,
@@ -140,6 +154,10 @@ impl Default for EngineConfig {
             l0_stop_trigger: 36,
             bloom_bits_per_key: 10,
             max_compaction_bytes: 256 * 1024 * 1024,
+            // Issue #30: default 0 (unbounded) preserves back-
+            // compat. Operators hitting the RSS-2.6x symptom set
+            // this to cap decoded-row memory per compaction.
+            max_compaction_input_rows: 0,
             flush_parallelism: 1,
             compaction_parallelism: 2,
             read_only: false,

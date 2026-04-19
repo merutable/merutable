@@ -131,6 +131,14 @@ pub fn pick_compaction(
     // level and are drained by the next iteration of the
     // `run_compaction` loop.
     let max_bytes = config.max_compaction_bytes;
+    // Issue #30: row-count cap — see config docs. `0` disables.
+    let max_rows = config.max_compaction_input_rows;
+    // Both caps apply with the same "always take at least one
+    // file" progress guarantee so a single over-sized file still
+    // drains eventually.
+    let would_exceed_row_cap = |total: u64, f_rows: u64| -> bool {
+        max_rows > 0 && total.saturating_add(f_rows) > max_rows
+    };
     let input_files: Vec<String> = if best_level == Level(0) {
         let mut l0: Vec<&merutable_iceberg::version::DataFileMeta> =
             version.files_at(Level(0)).iter().collect();
@@ -139,13 +147,18 @@ pub fn pick_compaction(
         // highest seq numbers) remain live and readable while the
         // older ones are rewritten to L1.
         l0.sort_by_key(|f| f.meta.seq_min);
-        let mut total = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_rows = 0u64;
         let mut picked = Vec::new();
         for f in l0 {
-            if !picked.is_empty() && total.saturating_add(f.meta.file_size) > max_bytes {
+            if !picked.is_empty()
+                && (total_bytes.saturating_add(f.meta.file_size) > max_bytes
+                    || would_exceed_row_cap(total_rows, f.meta.num_rows))
+            {
                 break;
             }
-            total = total.saturating_add(f.meta.file_size);
+            total_bytes = total_bytes.saturating_add(f.meta.file_size);
+            total_rows = total_rows.saturating_add(f.meta.num_rows);
             picked.push(f.path.clone());
         }
         picked
@@ -164,13 +177,18 @@ pub fn pick_compaction(
         // `compact_cursor_`) is the textbook mitigation but is out of
         // scope here — the memory-safety invariant is the priority.
         let files = version.files_at(best_level);
-        let mut total = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_rows = 0u64;
         let mut picked = Vec::new();
         for f in files.iter() {
-            if !picked.is_empty() && total.saturating_add(f.meta.file_size) > max_bytes {
+            if !picked.is_empty()
+                && (total_bytes.saturating_add(f.meta.file_size) > max_bytes
+                    || would_exceed_row_cap(total_rows, f.meta.num_rows))
+            {
                 break;
             }
-            total = total.saturating_add(f.meta.file_size);
+            total_bytes = total_bytes.saturating_add(f.meta.file_size);
+            total_rows = total_rows.saturating_add(f.meta.num_rows);
             picked.push(f.path.clone());
         }
         picked
@@ -464,6 +482,79 @@ mod tests {
         assert!(
             !pick.input_files.is_empty(),
             "L0 pick must always take at least one file to make progress"
+        );
+    }
+
+    /// Issue #30: the picker respects the row-count cap alongside
+    /// the byte cap. A workload where decoded rows expand ~4× past
+    /// their on-disk size can OOM a compaction that technically
+    /// fits `max_compaction_bytes`; row-count capping bounds the
+    /// decoded-memory footprint directly.
+    #[test]
+    fn pick_respects_max_compaction_input_rows() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            // Byte cap would admit all 20 files; the row cap is the
+            // binding constraint here.
+            max_compaction_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB.
+            max_compaction_input_rows: 10_000,
+            ..EngineConfig::default()
+        };
+
+        // 20 L0 files × 4096 rows = 81 920 rows total — 8× the row cap.
+        for i in 0..20 {
+            let mut f = make_file(&format!("l0_{i}.parquet"), 0, 4096, 1024 * 1024);
+            f.meta.seq_min = (i + 1) as u64;
+            f.meta.seq_max = (i + 1) as u64 * 10;
+            v.levels.entry(Level(0)).or_default().push(f);
+        }
+
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        let total_rows: u64 = pick
+            .input_files
+            .iter()
+            .map(|path| {
+                v.files_at(Level(0))
+                    .iter()
+                    .find(|f| f.path == *path)
+                    .map(|f| f.meta.num_rows)
+                    .unwrap_or(0)
+            })
+            .sum();
+        // After the first file, the next would push us over 10 000
+        // rows → picker stops. Exact count depends on the "always
+        // take one" progress guarantee: the first file alone is 4096
+        // rows, the second pushes to 8192 (under cap), the third to
+        // 12288 (over) — so 2 files.
+        assert_eq!(pick.input_files.len(), 2, "row cap bounds L0 pick");
+        assert!(
+            total_rows <= 10_000 || pick.input_files.len() == 1,
+            "row total stays at/under cap (or progress-guaranteed single pick)"
+        );
+    }
+
+    /// Issue #30: row-count cap disabled by default (back-compat).
+    /// With `max_compaction_input_rows = 0`, the byte cap alone
+    /// governs — same behavior as pre-#30.
+    #[test]
+    fn row_cap_of_zero_disables_enforcement() {
+        let mut v = Version::empty(test_schema());
+        let config = EngineConfig {
+            max_compaction_bytes: 8 * 1024 * 1024 * 1024,
+            max_compaction_input_rows: 0, // disabled
+            ..EngineConfig::default()
+        };
+        for i in 0..10 {
+            let mut f = make_file(&format!("l0_{i}.parquet"), 0, 4096, 1024 * 1024);
+            f.meta.seq_min = (i + 1) as u64;
+            f.meta.seq_max = (i + 1) as u64 * 10;
+            v.levels.entry(Level(0)).or_default().push(f);
+        }
+        let pick = pick_compaction(&v, &config, &empty_busy()).unwrap();
+        assert_eq!(
+            pick.input_files.len(),
+            10,
+            "row cap disabled → all L0 files picked (byte cap well above)"
         );
     }
 
