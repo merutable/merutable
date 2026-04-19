@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod deletion_vector;
+pub mod head_discovery;
 pub mod manifest;
 pub mod manifest_pb;
 pub mod snapshot;
