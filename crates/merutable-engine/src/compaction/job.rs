@@ -223,6 +223,12 @@ impl Drop for LevelReservation {
                     for l in &levels {
                         guard.remove(l);
                     }
+                    // #30 observability counter mirror: update
+                    // under the same lock acquisition so stats()
+                    // sees a consistent view.
+                    self.engine
+                        .compacting_levels_len
+                        .store(guard.len(), std::sync::atomic::Ordering::Relaxed);
                     true
                 }
                 Err(_) => false,
@@ -235,6 +241,9 @@ impl Drop for LevelReservation {
                 for l in &levels {
                     guard.remove(l);
                 }
+                engine
+                    .compacting_levels_len
+                    .store(guard.len(), std::sync::atomic::Ordering::Relaxed);
             });
         }
     }
@@ -306,6 +315,12 @@ async fn reserve_next_compaction(
     let output_level = pick.output_level;
     busy.insert(input_level);
     busy.insert(output_level);
+    // #30 observability counter mirror: update before releasing
+    // the lock so stats() can never observe an "inflight" count
+    // less than what the HashSet actually holds.
+    engine
+        .compacting_levels_len
+        .store(busy.len(), std::sync::atomic::Ordering::Relaxed);
     drop(busy);
 
     let reservation = LevelReservation {

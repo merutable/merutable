@@ -58,6 +58,22 @@ pub struct GcStats {
     pub oldest_pending_age_secs: u64,
 }
 
+/// Compaction concurrency statistics. Issue #30 observability:
+/// multiple in-flight compactions each buffer decoded rows for
+/// their input files until the output Parquet writes complete.
+/// `inflight_count` correlates with the ratio of RSS to logical
+/// data written — if it spikes past `compaction_parallelism` for
+/// extended periods, a compaction is stuck and its row buffer
+/// is not being reclaimed.
+#[derive(Debug, Clone)]
+pub struct CompactionStats {
+    /// Number of levels currently reserved by an in-flight
+    /// compaction (matches `|compacting_levels|`, where a single
+    /// compaction reserves both its input and output levels so
+    /// this reaches `2 * compaction_parallelism` at peak).
+    pub inflight_levels: usize,
+}
+
 /// Top-level engine statistics snapshot.
 #[derive(Debug, Clone)]
 pub struct EngineStats {
@@ -67,4 +83,5 @@ pub struct EngineStats {
     pub memtable: MemtableStats,
     pub cache: CacheStats,
     pub gc: GcStats,
+    pub compaction: CompactionStats,
 }

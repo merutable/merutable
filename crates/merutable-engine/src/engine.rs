@@ -63,6 +63,14 @@ pub struct MeruEngine {
     /// the current picker is full-level. Can be refined to file-granular
     /// tracking if/when partial-level picking is introduced.
     pub(crate) compacting_levels: Mutex<std::collections::HashSet<merutable_types::level::Level>>,
+    /// Issue #30 observability: cached size of `compacting_levels`.
+    /// Updated by the call sites that insert / remove entries under
+    /// the tokio Mutex; `stats()` reads this counter synchronously
+    /// so hot-path stats snapshots never block on the compaction
+    /// scheduler. Eventually consistent with the HashSet — a read
+    /// during the window between HashSet mutation and counter
+    /// update sees a value off by one.
+    pub(crate) compacting_levels_len: std::sync::atomic::AtomicUsize,
     /// Serializes just the catalog commit phase — brief (ms), distinct
     /// from the long merge phase. Two parallel compactions that finish
     /// their merges concurrently must linearize through `catalog.commit()`
@@ -313,6 +321,7 @@ impl MeruEngine {
             rotation_lock: Mutex::new(()),
             flush_mutex: Mutex::new(()),
             compacting_levels: Mutex::new(std::collections::HashSet::new()),
+            compacting_levels_len: std::sync::atomic::AtomicUsize::new(0),
             commit_lock: Mutex::new(()),
             row_cache,
             read_only,
@@ -1114,6 +1123,11 @@ impl MeruEngine {
                 pending_count,
                 oldest_pending_age_secs: oldest_age_secs,
             },
+            compaction: crate::stats::CompactionStats {
+                inflight_levels: self
+                    .compacting_levels_len
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
         }
     }
 }
@@ -1176,6 +1190,41 @@ mod tests {
     /// pending-deletions queue size without blocking on the tokio
     /// mutex that `gc_pending_deletions` holds across awaited file
     /// deletes. A synchronous `stats()` caller must never await.
+    /// Issue #30 observability: `stats().compaction.inflight_levels`
+    /// tracks the size of `compacting_levels` without blocking on
+    /// its tokio Mutex. On a quiescent engine the counter is zero;
+    /// after forcing a reservation it reflects the inserted levels.
+    #[tokio::test]
+    async fn stats_compaction_inflight_tracks_reserved_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = MeruEngine::open(test_config(&tmp)).await.unwrap();
+        // Fresh engine: no compactions.
+        assert_eq!(engine.stats().compaction.inflight_levels, 0);
+
+        // Simulate a reservation by inserting levels directly under
+        // the lock + bumping the counter (the real compaction-job
+        // reservation path does exactly this).
+        {
+            let mut busy = engine.compacting_levels.lock().await;
+            busy.insert(merutable_types::level::Level(0));
+            busy.insert(merutable_types::level::Level(1));
+            engine
+                .compacting_levels_len
+                .store(busy.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(engine.stats().compaction.inflight_levels, 2);
+
+        // Simulate release.
+        {
+            let mut busy = engine.compacting_levels.lock().await;
+            busy.clear();
+            engine
+                .compacting_levels_len
+                .store(busy.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(engine.stats().compaction.inflight_levels, 0);
+    }
+
     #[tokio::test]
     async fn stats_gc_tracks_pending_deletions() {
         let tmp = tempfile::tempdir().unwrap();
