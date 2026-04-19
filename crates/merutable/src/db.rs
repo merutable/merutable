@@ -9,13 +9,26 @@
 //! use merutable::value::{FieldValue, Row};
 //!
 //! # async fn example() -> merutable::error::Result<()> {
+//! // Issue #25: ColumnDef/TableSchema carry evolution-ready fields;
+//! // use `..Default::default()` or the builder.
 //! let schema = TableSchema {
 //!     table_name: "events".into(),
 //!     columns: vec![
-//!         ColumnDef { name: "id".into(), col_type: ColumnType::Int64, nullable: false },
-//!         ColumnDef { name: "payload".into(), col_type: ColumnType::ByteArray, nullable: true },
+//!         ColumnDef {
+//!             name: "id".into(),
+//!             col_type: ColumnType::Int64,
+//!             nullable: false,
+//!             ..Default::default()
+//!         },
+//!         ColumnDef {
+//!             name: "payload".into(),
+//!             col_type: ColumnType::ByteArray,
+//!             nullable: true,
+//!             ..Default::default()
+//!         },
 //!     ],
 //!     primary_key: vec![0],
+//!     ..Default::default()
 //! };
 //!
 //! let db = MeruDB::open(

@@ -68,6 +68,7 @@ impl PyMeruDB {
                     name: name.clone(),
                     col_type: convert::parse_column_type(type_str)?,
                     nullable: *nullable,
+                    ..Default::default()
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -90,10 +91,11 @@ impl PyMeruDB {
             None => vec![0],
         };
 
-        let schema = TableSchema {
+        let mut schema = TableSchema {
             table_name: table_name.to_string(),
             columns: col_defs,
             primary_key: pk_indices,
+            ..Default::default()
         };
         // Validate schema upfront — clear Python errors instead of cryptic engine panics.
         schema
