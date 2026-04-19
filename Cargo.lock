@@ -2238,6 +2238,7 @@ dependencies = [
  "hex",
  "iceberg",
  "merutable-parquet",
+ "merutable-store",
  "merutable-types",
  "metrics",
  "object_store",

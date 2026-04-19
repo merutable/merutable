@@ -14,6 +14,7 @@ prost               = { workspace = true }
 metrics             = { workspace = true }
 merutable-types   = { workspace = true }
 merutable-parquet = { workspace = true }
+merutable-store   = { workspace = true }
 iceberg           = { workspace = true }
 roaring           = { workspace = true }
 bytes             = { workspace = true }
