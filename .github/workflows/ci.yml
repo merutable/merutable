@@ -22,6 +22,14 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install protoc
+        # Issue #28: prost-build needs protoc to compile our internal
+        # catalog manifest schema. GitHub's ubuntu-latest image does
+        # not ship protoc by default.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
@@ -53,6 +61,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        # Issue #28: prost-build needs protoc; ubuntu-latest does not
+        # ship it by default.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Run benchmarks
         run: cargo bench --workspace -- --output-format bencher | tee output.txt
