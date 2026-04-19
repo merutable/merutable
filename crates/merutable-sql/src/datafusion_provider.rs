@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{
+    BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType,
+};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::ExecutionPlan;
 use merutable_engine::engine::MeruEngine;
@@ -84,15 +86,52 @@ impl TableProvider for ChangeFeedTableProvider {
         TableType::Base
     }
 
+    /// Issue #29 Phase 2f: seq filter pushdown.
+    /// A `WHERE seq > N` (or `>= N+1`) predicate can be pushed
+    /// into the provider's own `since_seq` watermark — we simply
+    /// bump `since_seq` to `max(since_seq, effective_bound)`
+    /// before draining the cursor. Since the cursor already
+    /// filters at the engine level, this is **exact** pushdown
+    /// (DataFusion doesn't need to re-apply the predicate).
+    /// Filters we can't push are `Inexact` so DataFusion still
+    /// applies them post-scan.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if extract_seq_lower_bound(f).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Phase 2e: drain the cursor synchronously into one batch.
-        let mut cursor = ChangeFeedCursor::from_engine(self.engine.clone(), self.since_seq);
+        // Phase 2f: derive the effective `since_seq` from any
+        // pushed-down seq > N / seq >= N predicates. The watermark
+        // moves FORWARD only — a filter can't ever lower the
+        // provider's own baseline since_seq (set at construction).
+        let mut effective_since = self.since_seq;
+        for f in filters {
+            if let Some(lb) = extract_seq_lower_bound(f) {
+                if lb > effective_since {
+                    effective_since = lb;
+                }
+            }
+        }
+
+        let mut cursor = ChangeFeedCursor::from_engine(self.engine.clone(), effective_since);
         let records = cursor
             .next_batch(usize::MAX)
             .map_err(|e| DataFusionError::Execution(format!("change-feed drain: {e}")))?;
@@ -102,6 +141,56 @@ impl TableProvider for ChangeFeedTableProvider {
         let exec =
             MemoryExec::try_new(&partitions, self.arrow_schema.clone(), projection.cloned())?;
         Ok(Arc::new(exec))
+    }
+}
+
+/// Phase 2f helper. If `expr` is a predicate of the form
+/// `seq > N` / `seq >= N` (or the mirrored `N < seq` / `N <= seq`)
+/// where N is a non-negative integer literal, return the effective
+/// `since_seq` lower bound (exclusive — i.e. the greatest seq that
+/// should be EXCLUDED from the feed). Otherwise return None.
+///
+/// `seq > N` and `N < seq` → exclude N, include N+1+ → since = N.
+/// `seq >= N` and `N <= seq` → exclude N-1 and below → since = N-1.
+/// Anything else (AND/OR trees, non-literal comparisons, other
+/// columns) → None, DataFusion applies post-scan.
+fn extract_seq_lower_bound(expr: &Expr) -> Option<u64> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    let (col_side, lit_side, op) = match (left.as_ref(), right.as_ref(), op) {
+        (Expr::Column(c), Expr::Literal(v), op) => (c, v, *op),
+        (Expr::Literal(v), Expr::Column(c), Operator::Lt) => (c, v, Operator::Gt),
+        (Expr::Literal(v), Expr::Column(c), Operator::LtEq) => (c, v, Operator::GtEq),
+        _ => return None,
+    };
+    if col_side.name != "seq" {
+        return None;
+    }
+    let n: i128 = match lit_side {
+        datafusion::scalar::ScalarValue::UInt64(Some(v)) => *v as i128,
+        datafusion::scalar::ScalarValue::UInt32(Some(v)) => *v as i128,
+        datafusion::scalar::ScalarValue::Int64(Some(v)) => *v as i128,
+        datafusion::scalar::ScalarValue::Int32(Some(v)) => *v as i128,
+        _ => return None,
+    };
+    if n < 0 {
+        return None;
+    }
+    let n_u64 = n as u64;
+    match op {
+        // `seq > N` → exclude ≤ N → since = N.
+        Operator::Gt => Some(n_u64),
+        // `seq >= N` → exclude ≤ N-1 → since = N-1. Guard against
+        // `seq >= 0` collapsing to u64 underflow.
+        Operator::GtEq => {
+            if n_u64 == 0 {
+                Some(0)
+            } else {
+                Some(n_u64 - 1)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -200,6 +289,44 @@ mod tests {
         let batches = df.collect().await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn seq_filter_pushdown_bumps_watermark() {
+        // Phase 2f: a WHERE seq > N predicate pushes into the
+        // provider's own `since_seq`, so the engine scan only
+        // materializes the relevant rows. The outcome is
+        // identical to no-pushdown but cheaper; here we verify
+        // the SQL-level correctness.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = open_engine(&tmp).await;
+        for i in 1..=5i64 {
+            engine
+                .put(vec![FieldValue::Int64(i)], row(i, i))
+                .await
+                .unwrap();
+        }
+        let ctx = SessionContext::new();
+        let provider = Arc::new(ChangeFeedTableProvider::new(engine, test_schema(), 0));
+        ctx.register_table("merutable_changes", provider).unwrap();
+
+        // seq > 2 — rows with seq in (2, read_seq] surface (3, 4, 5).
+        let df = ctx
+            .sql("SELECT seq FROM merutable_changes WHERE seq > 2 ORDER BY seq")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "only 3 ops above seq=2");
+
+        // seq >= 4 — rows with seq >= 4 surface (4, 5).
+        let df = ctx
+            .sql("SELECT seq FROM merutable_changes WHERE seq >= 4 ORDER BY seq")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
     }
 
     #[tokio::test]
