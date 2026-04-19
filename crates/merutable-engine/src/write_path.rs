@@ -96,6 +96,13 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
         }
     }
 
+    // Issue #14 Phase 2: batch-entry counters (Put/Delete distinguished
+    // from single-op counters so operators can see the batch-vs-single
+    // mix). Bumped AFTER validation so schema errors don't inflate.
+    let batch_len = batch.ops.len() as u64;
+    crate::metrics::inc(crate::metrics::PUT_BATCHES_TOTAL);
+    crate::metrics::inc_by(crate::metrics::PUT_BATCH_ROWS_TOTAL, batch_len);
+
     // Flow control #1: L0 file-count stop (Issue #5). Same contract as
     // `write_internal` — batch writes go through the same triggers so
     // a bulk load can't evade the stall by using the batch API.

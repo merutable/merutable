@@ -67,6 +67,33 @@ pub const IO_ERRORS_TOTAL: &str = "merutable.errors.io_total";
 pub const CORRUPTION_DETECTED_TOTAL: &str = "merutable.errors.corruption_total";
 pub const SCHEMA_MISMATCH_TOTAL: &str = "merutable.errors.schema_mismatch_total";
 
+// ── Phase 2: hot-path counters ───────────────────────────────────────
+//
+// These are bumped on every user write / read. They go through the
+// `metrics` crate's TLS-cached static registration, which compiles to
+// a few ns of overhead when a recorder is registered and a single
+// atomic-pointer load + null check when one isn't. The per-op cost is
+// bounded by the macro expansion itself (not by any work in this
+// module) — we deliberately avoid label allocation on the hot path
+// (all labels here are compile-time `&'static str`).
+//
+// Write path.
+pub const PUTS_TOTAL: &str = "merutable.write.puts_total";
+pub const DELETES_TOTAL: &str = "merutable.write.deletes_total";
+pub const PUT_BATCH_ROWS_TOTAL: &str = "merutable.write.put_batch_rows_total";
+pub const PUT_BATCHES_TOTAL: &str = "merutable.write.put_batches_total";
+
+// Read path.
+pub const GETS_TOTAL: &str = "merutable.read.gets_total";
+pub const GET_HITS_TOTAL: &str = "merutable.read.get_hits_total";
+pub const SCANS_TOTAL: &str = "merutable.read.scans_total";
+pub const SCAN_ROWS_TOTAL: &str = "merutable.read.scan_rows_total";
+
+// Row cache (the read path sits over this — counting here lets
+// operators compute hit ratio without guessing cache behavior).
+pub const ROW_CACHE_HITS_TOTAL: &str = "merutable.read.row_cache_hits_total";
+pub const ROW_CACHE_MISSES_TOTAL: &str = "merutable.read.row_cache_misses_total";
+
 // ── Phase-1 helper ──────────────────────────────────────────────────
 
 /// Increment a counter by 1. Cheaper than constructing a `Counter`

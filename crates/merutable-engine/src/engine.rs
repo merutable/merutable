@@ -328,6 +328,10 @@ impl MeruEngine {
             crate::metrics::inc(crate::metrics::SCHEMA_MISMATCH_TOTAL);
             return Err(e);
         }
+        // Issue #14 Phase 2: hot-path counter. Bumped only on the
+        // successful-validation path so schema errors don't inflate
+        // the throughput signal.
+        crate::metrics::inc(crate::metrics::PUTS_TOTAL);
         self.write_internal(pk_values, Some(row), OpType::Put).await
     }
 
@@ -337,6 +341,7 @@ impl MeruEngine {
         if self.read_only {
             return Err(MeruError::ReadOnly);
         }
+        crate::metrics::inc(crate::metrics::DELETES_TOTAL);
         self.write_internal(pk_values, None, OpType::Delete).await
     }
 
@@ -525,7 +530,16 @@ impl MeruEngine {
     /// Point lookup by primary key. Returns the row if found (not deleted).
     #[instrument(skip(self), fields(op = "get"))]
     pub fn get(&self, pk_values: &[FieldValue]) -> Result<Option<Row>> {
-        crate::read_path::point_lookup(self, pk_values)
+        // Issue #14 Phase 2: hot-path counters. When no metrics
+        // recorder is registered, these compile to ~1 ns TLS-cached
+        // null checks. When a recorder IS registered, operators can
+        // compute hit ratio without guessing.
+        crate::metrics::inc(crate::metrics::GETS_TOTAL);
+        let result = crate::read_path::point_lookup(self, pk_values)?;
+        if result.is_some() {
+            crate::metrics::inc(crate::metrics::GET_HITS_TOTAL);
+        }
+        Ok(result)
     }
 
     /// Range scan. Returns rows in PK order where `start_pk <= pk < end_pk`.
@@ -537,7 +551,10 @@ impl MeruEngine {
         start_pk: Option<&[FieldValue]>,
         end_pk: Option<&[FieldValue]>,
     ) -> Result<Vec<(InternalKey, Row)>> {
-        crate::read_path::range_scan(self, start_pk, end_pk)
+        crate::metrics::inc(crate::metrics::SCANS_TOTAL);
+        let result = crate::read_path::range_scan(self, start_pk, end_pk)?;
+        crate::metrics::inc_by(crate::metrics::SCAN_ROWS_TOTAL, result.len() as u64);
+        Ok(result)
     }
 
     // ── Admin ────────────────────────────────────────────────────────────

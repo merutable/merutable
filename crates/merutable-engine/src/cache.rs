@@ -72,10 +72,17 @@ impl RowCache {
         match guard.get(user_key) {
             Some(entry) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                // Issue #14 Phase 2: surface the cache-hit signal
+                // through the metrics facade in addition to the
+                // internal AtomicU64. The AtomicU64 feeds the sync
+                // `stats()` API; the metrics facade feeds operator
+                // dashboards. Both are cheap-relaxed.
+                crate::metrics::inc(crate::metrics::ROW_CACHE_HITS_TOTAL);
                 Some(entry.clone())
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
+                crate::metrics::inc(crate::metrics::ROW_CACHE_MISSES_TOTAL);
                 None
             }
         }
