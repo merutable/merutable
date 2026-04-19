@@ -259,32 +259,51 @@ pub fn to_iceberg_data_file_v2(entry: &ManifestEntry) -> Value {
     to_iceberg_data_file_v2_with_schema(entry, None)
 }
 
-/// Issue #20 Part 2 (partial): schema-aware variant that emits
-/// per-column `value_counts` and `null_value_counts` for every
-/// **non-nullable** user column. Non-nullable columns are guaranteed
-/// to have `num_rows` present values and zero nulls by merutable's
-/// write contract (tombstone rows carry typed defaults per Bug N,
-/// not NULLs). This enables predicate pushdown on the dominant case
-/// (PK columns and other required columns) without requiring the
-/// full Parquet-row-group-stats plumbing that's still open work.
+/// Issue #20 Part 2b: schema-aware variant that projects
+/// `ParquetFileMeta::column_stats` (hoisted from the Parquet writer's
+/// own row-group metadata at write time) onto Iceberg's five
+/// per-column stat maps. When stats are present, emits per field id:
+/// - `column_sizes` = compressed bytes per column
+/// - `value_counts` = non-null row count
+/// - `null_value_counts` = null row count
+/// - `lower_bounds` = min value (hex-encoded Iceberg single-value bytes)
+/// - `upper_bounds` = max value
 ///
-/// `column_sizes`, `lower_bounds`, `upper_bounds`, and null counts for
-/// nullable columns still require hoisting Parquet statistics into
-/// `ParquetFileMeta`. Left as Issue #20 Part 2b.
+/// When the file predates #20 Part 2b (no `column_stats` stamped), the
+/// projection falls back to the Part 2 behavior: `value_counts` /
+/// `null_value_counts` for non-nullable columns only, the other maps
+/// empty. Legacy-safe by design.
 pub fn to_iceberg_data_file_v2_with_schema(
     entry: &ManifestEntry,
     schema: Option<&TableSchema>,
 ) -> Value {
     let meta = &entry.meta;
 
-    // Per-column statistics maps keyed by Iceberg field id (1..=N).
+    let mut column_sizes = serde_json::Map::new();
     let mut value_counts = serde_json::Map::new();
     let mut null_value_counts = serde_json::Map::new();
-    if let Some(schema) = schema {
+    let mut lower_bounds = serde_json::Map::new();
+    let mut upper_bounds = serde_json::Map::new();
+
+    if let Some(stats) = meta.column_stats.as_ref() {
+        // Part 2b path: use real per-column stats from the writer.
+        for cs in stats {
+            let key = cs.field_id.to_string();
+            column_sizes.insert(key.clone(), json!(cs.compressed_bytes));
+            value_counts.insert(key.clone(), json!(cs.value_count));
+            null_value_counts.insert(key.clone(), json!(cs.null_count));
+            if let Some(lb) = &cs.lower_bound {
+                lower_bounds.insert(key.clone(), json!(hex::encode(lb)));
+            }
+            if let Some(ub) = &cs.upper_bound {
+                upper_bounds.insert(key, json!(hex::encode(ub)));
+            }
+        }
+    } else if let Some(schema) = schema {
+        // Legacy / Part 2 path: non-nullable columns are known to be
+        // fully populated by merutable's write contract.
         for (idx, col) in schema.columns.iter().enumerate() {
             if col.nullable {
-                // Without Parquet row-group stats we don't know the
-                // null count. Omit rather than lie. (Part 2b.)
                 continue;
             }
             let field_id = (idx + 1) as i32;
@@ -305,14 +324,11 @@ pub fn to_iceberg_data_file_v2_with_schema(
             "partition": {},
             "record_count": meta.num_rows,
             "file_size_in_bytes": meta.file_size,
-            // column_sizes / lower_bounds / upper_bounds require
-            // hoisting Parquet row-group stats into ParquetFileMeta.
-            // Tracked as Issue #20 Part 2b.
-            "column_sizes": {},
+            "column_sizes": column_sizes,
             "value_counts": value_counts,
             "null_value_counts": null_value_counts,
-            "lower_bounds": {},
-            "upper_bounds": {},
+            "lower_bounds": lower_bounds,
+            "upper_bounds": upper_bounds,
             "split_offsets": [],
             // Every data file written by merutable adheres to the
             // PK-ASC sort order (order-id 1). order-id 0 is Iceberg's
@@ -456,6 +472,7 @@ mod tests {
             dv_offset: None,
             dv_length: None,
             format: None,
+            column_stats: None,
         }
     }
 

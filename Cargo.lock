@@ -2149,6 +2149,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crc32fast",
+ "hex",
  "iceberg",
  "merutable-parquet",
  "merutable-types",

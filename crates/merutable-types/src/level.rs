@@ -51,6 +51,56 @@ pub struct ParquetFileMeta {
     /// pre-Issue-#15 hard-coded behavior (Dual iff L0).
     #[serde(default)]
     pub format: Option<FileFormat>,
+    /// Issue #20 Part 2b: per-column statistics hoisted from the
+    /// Parquet row-group metadata at write time. Indexed by Iceberg
+    /// field id (1..=N, matching `TableSchema::columns`). Projected
+    /// into the exported Iceberg `metadata.json` as `lower_bounds`,
+    /// `upper_bounds`, `column_sizes`, `value_counts`, and
+    /// `null_value_counts`, enabling file pruning and min/max
+    /// predicate pushdown for external readers.
+    ///
+    /// Legacy files (pre-#20 Part 2b) deserialize with `None` —
+    /// the Iceberg projection then falls back to empty stat maps,
+    /// which is spec-valid.
+    #[serde(default)]
+    pub column_stats: Option<Vec<ColumnStats>>,
+}
+
+/// Per-column statistics for one Parquet file, keyed by `field_id`
+/// (1-based Iceberg field id matching `TableSchema::columns[field_id-1]`).
+///
+/// Emitted by the Parquet writer after finishing the file: the
+/// writer reads its own output's row-group metadata and reduces
+/// (sum/min/max) per column across row groups. The reduction is
+/// bounded by the number of row groups per file (a few dozen at
+/// most) so the write-time cost is negligible.
+///
+/// All bounds fields store raw bytes in Iceberg's single-value
+/// serialization format (matching Apache Iceberg v2 spec). Ints are
+/// little-endian; booleans are a single byte; floats/doubles are
+/// IEEE-754 little-endian; binary is the raw bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnStats {
+    /// Iceberg field id. 1-based; matches `TableSchema::columns[id-1]`.
+    pub field_id: i32,
+    /// Sum of compressed byte sizes for this column across every
+    /// row group. Projects to Iceberg `column_sizes[field_id]`.
+    pub compressed_bytes: u64,
+    /// Row count with a non-null value in this column. Projects to
+    /// Iceberg `value_counts[field_id]`.
+    pub value_count: u64,
+    /// Row count with a NULL value in this column. Projects to
+    /// Iceberg `null_value_counts[field_id]`.
+    pub null_count: u64,
+    /// Serialized min value (Iceberg single-value bytes). Absent
+    /// when the Parquet writer did not emit statistics for this
+    /// column (e.g., unsupported type, or all-null column).
+    /// Projects to Iceberg `lower_bounds[field_id]`.
+    #[serde(with = "hex_bytes_opt", default)]
+    pub lower_bound: Option<Vec<u8>>,
+    /// Serialized max value. Projects to `upper_bounds[field_id]`.
+    #[serde(with = "hex_bytes_opt", default)]
+    pub upper_bound: Option<Vec<u8>>,
 }
 
 /// Physical layout stamp for a Parquet SSTable (Issue #15).
@@ -122,5 +172,27 @@ mod hex_bytes {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(de)?;
         hex::decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Issue #20 Part 2b: hex-encoded `Option<Vec<u8>>` for per-column
+/// bound bytes that may be absent (no Parquet statistics emitted for
+/// that column, or all-null column).
+mod hex_bytes_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, ser: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => ser.serialize_str(&hex::encode(b)),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(de)?;
+        match opt {
+            Some(s) => hex::decode(&s).map(Some).map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
     }
 }

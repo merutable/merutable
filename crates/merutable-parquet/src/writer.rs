@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use merutable_types::{
     key::InternalKey,
-    level::{FileFormat, Level, ParquetFileMeta},
+    level::{ColumnStats, FileFormat, Level, ParquetFileMeta},
     schema::{ColumnType, TableSchema},
     value::Row,
     MeruError, Result,
@@ -210,6 +210,7 @@ pub fn write_sorted_rows(
             dv_offset: None,
             dv_length: None,
             format: Some(format),
+            column_stats: None,
         };
         return Ok((Vec::new(), Bytes::new(), meta));
     }
@@ -252,6 +253,7 @@ pub fn write_sorted_rows(
         dv_offset: None,
         dv_length: None,
         format: Some(format),
+        column_stats: None, // filled after extract_column_stats below
     };
 
     let bloom_bytes = bloom.to_bytes();
@@ -285,8 +287,185 @@ pub fn write_sorted_rows(
 
     let mut final_meta = meta;
     final_meta.file_size = pass2_bytes.len() as u64;
+    // Issue #20 Part 2b: hoist per-column stats from the final
+    // file's row-group metadata. We reduce across row groups so the
+    // file-level stats are usable by external readers without having
+    // to walk every row group themselves.
+    final_meta.column_stats = extract_column_stats(&pass2_bytes, &schema).ok();
 
     Ok((pass2_bytes, bloom_bytes, final_meta))
+}
+
+/// Issue #20 Part 2b: reduce Parquet row-group statistics to per-file
+/// per-column stats for every user column. Hidden `_merutable_*`
+/// columns are skipped because they're not part of the Iceberg schema
+/// and external readers should not reference them directly.
+///
+/// Errors here are non-fatal — the caller falls back to `None`, which
+/// projects to empty Iceberg stat maps (spec-valid).
+fn extract_column_stats(bytes: &[u8], schema: &TableSchema) -> Result<Vec<ColumnStats>> {
+    let reader = SerializedFileReader::new(Bytes::copy_from_slice(bytes))
+        .map_err(|e| MeruError::Parquet(e.to_string()))?;
+    let file_meta = reader.metadata();
+    let parquet_schema = file_meta.file_metadata().schema_descr();
+
+    // Map Iceberg field_id → Parquet column index. The Iceberg schema
+    // is `schema.columns` in order; the Parquet schema adds hidden
+    // merutable columns. Look up each user column by name.
+    let mut name_to_col: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for i in 0..parquet_schema.num_columns() {
+        let name = parquet_schema.column(i).name().to_string();
+        name_to_col.insert(name, i);
+    }
+
+    // Per-column accumulators keyed by field_id (1-based).
+    struct Acc {
+        field_id: i32,
+        col_type: ColumnType,
+        compressed_bytes: u64,
+        value_count: u64,
+        null_count: u64,
+        min_bytes: Option<Vec<u8>>,
+        max_bytes: Option<Vec<u8>>,
+    }
+    let mut accs: Vec<(usize, Acc)> = Vec::new();
+    for (idx, col_def) in schema.columns.iter().enumerate() {
+        let field_id = (idx + 1) as i32;
+        if let Some(&parquet_col_idx) = name_to_col.get(&col_def.name) {
+            accs.push((
+                parquet_col_idx,
+                Acc {
+                    field_id,
+                    col_type: col_def.col_type.clone(),
+                    compressed_bytes: 0,
+                    value_count: 0,
+                    null_count: 0,
+                    min_bytes: None,
+                    max_bytes: None,
+                },
+            ));
+        }
+    }
+
+    // Walk every row group and reduce per column.
+    for rg_idx in 0..file_meta.num_row_groups() {
+        let rg = file_meta.row_group(rg_idx);
+        for (parquet_col_idx, acc) in accs.iter_mut() {
+            let chunk = rg.column(*parquet_col_idx);
+            acc.compressed_bytes = acc
+                .compressed_bytes
+                .saturating_add(chunk.compressed_size().max(0) as u64);
+            if let Some(stats) = chunk.statistics() {
+                // Parquet Statistics carries `null_count_opt()` and the
+                // typed min/max. Value count = total rows in row group
+                // minus null count (the chunk reports row-group row
+                // count).
+                let rg_rows = rg.num_rows().max(0) as u64;
+                let null_count = stats.null_count_opt().unwrap_or(0);
+                let values = rg_rows.saturating_sub(null_count);
+                acc.value_count = acc.value_count.saturating_add(values);
+                acc.null_count = acc.null_count.saturating_add(null_count);
+
+                // Reduce min/max using Iceberg single-value byte
+                // encoding. Parquet's numeric statistics already use
+                // the little-endian on-disk form we want.
+                use parquet::file::statistics::Statistics as PqStats;
+                let (min_b, max_b): (Option<Vec<u8>>, Option<Vec<u8>>) = match stats {
+                    PqStats::Boolean(s) => {
+                        let b2b = |b: &bool| vec![if *b { 1u8 } else { 0u8 }];
+                        (s.min_opt().map(b2b), s.max_opt().map(b2b))
+                    }
+                    PqStats::Int32(s) => (
+                        s.min_opt().map(|v| v.to_le_bytes().to_vec()),
+                        s.max_opt().map(|v| v.to_le_bytes().to_vec()),
+                    ),
+                    PqStats::Int64(s) => (
+                        s.min_opt().map(|v| v.to_le_bytes().to_vec()),
+                        s.max_opt().map(|v| v.to_le_bytes().to_vec()),
+                    ),
+                    PqStats::Float(s) => (
+                        s.min_opt().map(|v| v.to_le_bytes().to_vec()),
+                        s.max_opt().map(|v| v.to_le_bytes().to_vec()),
+                    ),
+                    PqStats::Double(s) => (
+                        s.min_opt().map(|v| v.to_le_bytes().to_vec()),
+                        s.max_opt().map(|v| v.to_le_bytes().to_vec()),
+                    ),
+                    PqStats::ByteArray(s) => (
+                        s.min_opt().map(|v| v.data().to_vec()),
+                        s.max_opt().map(|v| v.data().to_vec()),
+                    ),
+                    PqStats::FixedLenByteArray(s) => (
+                        s.min_opt().map(|v| v.data().to_vec()),
+                        s.max_opt().map(|v| v.data().to_vec()),
+                    ),
+                    _ => (None, None),
+                };
+                match (&mut acc.min_bytes, min_b) {
+                    (slot @ None, Some(v)) => *slot = Some(v),
+                    (Some(cur), Some(v)) if bound_is_less(&acc.col_type, &v, cur) => {
+                        *cur = v;
+                    }
+                    _ => {}
+                }
+                match (&mut acc.max_bytes, max_b) {
+                    (slot @ None, Some(v)) => *slot = Some(v),
+                    (Some(cur), Some(v)) if bound_is_less(&acc.col_type, cur, &v) => {
+                        *cur = v;
+                    }
+                    _ => {}
+                }
+            } else {
+                // No statistics on this row group → we can still
+                // count values (chunk row count minus whatever we
+                // know; absent stats means we don't know null count
+                // either, so leave the counters alone).
+            }
+        }
+    }
+
+    Ok(accs
+        .into_iter()
+        .map(|(_, a)| ColumnStats {
+            field_id: a.field_id,
+            compressed_bytes: a.compressed_bytes,
+            value_count: a.value_count,
+            null_count: a.null_count,
+            lower_bound: a.min_bytes,
+            upper_bound: a.max_bytes,
+        })
+        .collect())
+}
+
+/// Iceberg single-value byte comparison for reducing min/max across
+/// row groups. Numeric bounds are LE-encoded; raw byte comparison
+/// would give wrong answers for signed ints. Booleans and raw bytes
+/// compare lexicographically, which coincides with value order.
+fn bound_is_less(col_type: &ColumnType, a: &[u8], b: &[u8]) -> bool {
+    match col_type {
+        ColumnType::Int32 => {
+            let a = i32::from_le_bytes(a.try_into().unwrap_or([0u8; 4]));
+            let b = i32::from_le_bytes(b.try_into().unwrap_or([0u8; 4]));
+            a < b
+        }
+        ColumnType::Int64 => {
+            let a = i64::from_le_bytes(a.try_into().unwrap_or([0u8; 8]));
+            let b = i64::from_le_bytes(b.try_into().unwrap_or([0u8; 8]));
+            a < b
+        }
+        ColumnType::Float => {
+            let a = f32::from_le_bytes(a.try_into().unwrap_or([0u8; 4]));
+            let b = f32::from_le_bytes(b.try_into().unwrap_or([0u8; 4]));
+            a < b
+        }
+        ColumnType::Double => {
+            let a = f64::from_le_bytes(a.try_into().unwrap_or([0u8; 8]));
+            let b = f64::from_le_bytes(b.try_into().unwrap_or([0u8; 8]));
+            a < b
+        }
+        ColumnType::Boolean | ColumnType::ByteArray | ColumnType::FixedLenByteArray(_) => a < b,
+    }
 }
 
 /// Single Parquet write of `rows` with the given footer KV. Used twice by

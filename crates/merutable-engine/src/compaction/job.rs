@@ -513,7 +513,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
         // Dual-at-L0 to Columnar-at-L1 drops the `_merutable_value`
         // blob; moving Dual-deeper retains it.
         let format = engine.config.file_format_for(pick.output_level);
-        let (parquet_bytes, _, _) = merutable_parquet::writer::write_sorted_rows(
+        let (parquet_bytes, _, writer_meta) = merutable_parquet::writer::write_sorted_rows(
             chunk.rows,
             engine.schema.clone(),
             pick.output_level,
@@ -566,6 +566,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
             dv_offset: None,
             dv_length: None,
             format: Some(format),
+            column_stats: writer_meta.column_stats,
         };
 
         txn.add_file(IcebergDataFile {

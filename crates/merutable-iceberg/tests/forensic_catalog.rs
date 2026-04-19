@@ -53,6 +53,7 @@ fn sample_meta(level: u8) -> ParquetFileMeta {
         dv_offset: None,
         dv_length: None,
         format: None,
+        column_stats: None,
     }
 }
 

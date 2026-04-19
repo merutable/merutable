@@ -134,6 +134,7 @@ mod tests {
                 dv_offset: None,
                 dv_length: None,
                 format: None,
+                column_stats: None,
             },
         }
     }

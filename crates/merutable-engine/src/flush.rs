@@ -137,7 +137,7 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     // format L0 uses. Default config keeps this Dual for
     // zero-migration parity with pre-#15 behavior.
     let format = engine.config.file_format_for(Level(0));
-    let (parquet_bytes, _bloom_bytes, _meta) = merutable_parquet::writer::write_sorted_rows(
+    let (parquet_bytes, _bloom_bytes, writer_meta) = merutable_parquet::writer::write_sorted_rows(
         rows,
         engine.schema.clone(),
         Level(0),
@@ -190,7 +190,11 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         parquet_bytes.len() as u64
     };
 
-    // Build snapshot transaction.
+    // Build snapshot transaction. Most fields come from the flush's
+    // own bookkeeping (seq/key bounds from the input memtable entries,
+    // not from the Parquet footer), but Issue #20 Part 2b's
+    // per-column stats come from the writer — the Parquet writer
+    // reads back its own output's row-group metadata.
     let meta = ParquetFileMeta {
         level: Level(0),
         seq_min: if seq_min == u64::MAX { 0 } else { seq_min },
@@ -203,6 +207,7 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         dv_offset: None,
         dv_length: None,
         format: Some(format),
+        column_stats: writer_meta.column_stats,
     };
 
     let mut txn = SnapshotTransaction::new();
