@@ -458,9 +458,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        worker
-            .last_upload_unix_secs
-            .store(now, Ordering::Relaxed);
+        worker.last_upload_unix_secs.store(now, Ordering::Relaxed);
 
         let lag = worker.mirror_lag_secs().expect("lag is Some after upload");
         assert!(lag < 10, "lag should be near-zero on fresh upload: {lag}");
