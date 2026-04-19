@@ -8,9 +8,10 @@ license     = "Apache-2.0"
 
 [dependencies]
 metrics  = { workspace = true }
-merutable-types  = { workspace = true }
-merutable-engine = { workspace = true }
-merutable-store  = { workspace = true }
+merutable-types   = { workspace = true }
+merutable-engine  = { workspace = true }
+merutable-iceberg = { workspace = true }
+merutable-store   = { workspace = true }
 tokio            = { workspace = true }
 futures          = { workspace = true }
 tracing          = { workspace = true }

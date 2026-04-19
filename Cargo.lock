@@ -2187,6 +2187,7 @@ dependencies = [
  "futures",
  "iceberg",
  "merutable-engine",
+ "merutable-iceberg",
  "merutable-store",
  "merutable-types",
  "metrics",

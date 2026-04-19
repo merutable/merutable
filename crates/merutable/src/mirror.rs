@@ -1,18 +1,37 @@
-//! Issue #31 Phase 2a: mirror worker scaffold.
+//! Issue #31 Phase 2b: mirror worker with commit-order-preserving uploads.
 //!
 //! Spawns a long-lived tokio task that polls the primary's version
-//! set and, on observing a new snapshot_id, logs its intent to
-//! mirror. Phase 2a does NOT yet upload bytes — that's Phase 2b. The
-//! scaffold lands first so:
+//! set; on observing a new snapshot, it:
 //!
-//! - The worker's shutdown protocol is exercised ahead of the
-//!   upload logic.
-//! - Operators can verify (via `tracing::info!`) that their mirror
-//!   is wired up and seeing snapshot advances, before any real
-//!   traffic touches the destination.
-//! - Phase 2b can be a pure delta: same shutdown, same polling
-//!   loop, just replace the `observed_new_snapshot` log with an
-//!   actual `upload_snapshot` call.
+//! 1. Enumerates the live data files (and DV puffins) referenced by
+//!    the current manifest.
+//! 2. `put_if_absent` each file to the mirror target. Shared files
+//!    across snapshots are no-ops after the first upload, so catch-up
+//!    is amortized over the steady-state tick cadence.
+//! 3. Serializes the current manifest as protobuf (#28) and writes it
+//!    at `metadata/v{N}.manifest.bin` via `put_if_absent`. The
+//!    conditional PUT on the manifest is the single race-safety boundary.
+//! 4. Writes/advances `metadata/low_water.txt = N` so readers
+//!    mounting the mirror with `discover_head_from(low_water, ..)`
+//!    find the uploaded manifest as HEAD.
+//!
+//! The order matters: data files BEFORE the manifest, always. A reader
+//! opening the mirror must never observe a manifest pointing at files
+//! that don't exist yet.
+//!
+//! # Scope (Phase 2b)
+//!
+//! - **Only the most recent observed snapshot is uploaded.** Operators
+//!   running a hot primary against a cold mirror will see gaps in the
+//!   mirror's backward-pointer chain — `v{N}.parent_snapshot_id` may
+//!   reference a version that isn't present on the mirror. This is
+//!   safe for HEAD-only reads (the dominant remote-reader case)
+//!   because `discover_head_from(low_water)` probes version numbers,
+//!   not the parent chain. Time-travel on the mirror below `low_water`
+//!   is not available until Phase 2c fills in the historical chain.
+//! - **Single-writer.** Two primaries mirroring to the same destination
+//!   would race on `put_if_absent(manifest)`; one wins, the other
+//!   logs a warning and skips that snapshot. Don't do this on purpose.
 //!
 //! # Shutdown
 //!
@@ -21,16 +40,35 @@
 //! flag at the top of every loop iteration, so a shutdown signal
 //! arriving between `notified().await` registrations is not lost.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use merutable_engine::engine::MeruEngine;
+use merutable_iceberg::Manifest;
+use merutable_store::traits::MeruStore;
+use merutable_types::MeruError;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::options::MirrorConfig;
+
+/// The mirror destination's low-water marker path — matches what
+/// `ObjectStoreCatalog::reclaim_old_manifests` and its HEAD discovery
+/// both use. Keeping the exact same path means a remote reader
+/// opening the mirror with `CommitMode::ObjectStore` probes from the
+/// right position without any special coordination.
+const LOW_WATER_PATH: &str = "metadata/low_water.txt";
+
+fn manifest_path(v: i64) -> String {
+    // Mirror the naming used by ObjectStoreCatalog so remote readers
+    // opening the mirror via CommitMode::ObjectStore find HEAD in
+    // the expected location.
+    format!("metadata/v{v}.manifest.bin")
+}
 
 /// The mirror worker's cadence. Not exposed as a knob yet — 5
 /// seconds is short enough to keep mirror_lag bounded to single-
@@ -100,30 +138,43 @@ impl MirrorWorker {
 
 async fn mirror_loop(
     engine: Arc<MeruEngine>,
-    _config: MirrorConfig,
+    config: MirrorConfig,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     mirror_seq: Arc<AtomicI64>,
 ) {
-    info!("mirror worker started (Issue #31 Phase 2a — observe-only)");
-    let mut last_logged: i64 = 0;
+    info!("mirror worker started (Issue #31 Phase 2b — observe + upload)");
+    let catalog_path = PathBuf::from(engine.catalog_path());
+    let mut last_uploaded: i64 = 0;
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
         }
         let current = engine.current_snapshot_id();
-        if current > last_logged {
-            // Phase 2a: log the intent to mirror. Phase 2b will
-            // replace this with the actual upload call
-            // (enumerate new files, put_if_absent them, then
-            // put_if_absent the manifest in seq order).
-            info!(
-                snapshot_id = current,
-                previous_mirror_seq = last_logged,
-                "mirror worker observed new snapshot (Phase 2a: not yet uploaded)"
-            );
-            last_logged = current;
-            mirror_seq.store(current, Ordering::Relaxed);
+        if current > last_uploaded && current > 0 {
+            match mirror_snapshot(&engine, &catalog_path, &config, current).await {
+                Ok(()) => {
+                    info!(
+                        snapshot_id = current,
+                        previous_mirror_seq = last_uploaded,
+                        "mirror worker uploaded snapshot"
+                    );
+                    last_uploaded = current;
+                    mirror_seq.store(current, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // Don't update last_uploaded so the next tick
+                    // retries. Orphans from a partial upload are
+                    // reconciled by subsequent successful attempts
+                    // (put_if_absent on already-uploaded files is a
+                    // clean no-op).
+                    warn!(
+                        snapshot_id = current,
+                        error = %e,
+                        "mirror worker failed to upload snapshot — will retry next tick"
+                    );
+                }
+            }
         } else {
             debug!(
                 snapshot_id = current,
@@ -141,7 +192,114 @@ async fn mirror_loop(
             _ = shutdown_notify.notified() => {}
         }
     }
-    info!(last_observed_seq = last_logged, "mirror worker shut down");
+    info!(last_uploaded_seq = last_uploaded, "mirror worker shut down");
+}
+
+/// Upload everything the mirror needs to serve snapshot `version`:
+///
+/// 1. Every live data file (and attached DV puffin) referenced by
+///    the manifest — via `put_if_absent`, so repeated attempts and
+///    shared-file catch-up are idempotent.
+/// 2. The manifest itself at `metadata/v{version}.manifest.bin`.
+/// 3. `metadata/low_water.txt` advanced to `version` (always
+///    overwritten — low-water on the mirror tracks the latest
+///    uploaded snapshot, not the earliest).
+///
+/// Order: files BEFORE manifest. A reader who observes the manifest
+/// must find every file it references already present.
+async fn mirror_snapshot(
+    engine: &MeruEngine,
+    catalog_path: &std::path::Path,
+    config: &MirrorConfig,
+    version: i64,
+) -> Result<(), MeruError> {
+    let manifest: Manifest = engine.current_manifest().await;
+
+    // Step 1: upload data files + DV puffins. Parallelism bounded
+    // by `mirror_parallelism`; each worker does its own put_if_absent.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.mirror_parallelism.max(1),
+    ));
+    let mut join = tokio::task::JoinSet::new();
+    for entry in &manifest.entries {
+        if entry.status == "deleted" {
+            continue;
+        }
+        spawn_upload(
+            &mut join,
+            semaphore.clone(),
+            config.target.clone(),
+            catalog_path.to_path_buf(),
+            entry.path.clone(),
+        );
+        if let Some(dv_path) = entry.dv_path.clone() {
+            spawn_upload(
+                &mut join,
+                semaphore.clone(),
+                config.target.clone(),
+                catalog_path.to_path_buf(),
+                dv_path,
+            );
+        }
+    }
+    while let Some(res) = join.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => {
+                return Err(MeruError::ObjectStore(format!(
+                    "mirror upload task panicked: {join_err}"
+                )));
+            }
+        }
+    }
+
+    // Step 2: serialize + upload manifest. `put_if_absent` because
+    // two primary processes mirroring to the same target would race
+    // here; conditional PUT is the single serialization boundary.
+    // `AlreadyExists` means the version was already mirrored —
+    // idempotent no-op.
+    let pb_bytes = manifest.to_protobuf()?;
+    match config
+        .target
+        .put_if_absent(&manifest_path(version), Bytes::from(pb_bytes))
+        .await
+    {
+        Ok(()) | Err(MeruError::AlreadyExists(_)) => {}
+        Err(e) => return Err(e),
+    }
+
+    // Step 3: advance the low-water pointer. Always overwritten
+    // (via `put`, not `put_if_absent`) so re-runs of
+    // `mirror_snapshot` at a higher version correctly bump the
+    // pointer forward.
+    config
+        .target
+        .put(LOW_WATER_PATH, Bytes::from(version.to_string()))
+        .await?;
+
+    Ok(())
+}
+
+fn spawn_upload(
+    join: &mut tokio::task::JoinSet<Result<(), MeruError>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    target: Arc<dyn MeruStore>,
+    catalog_path: PathBuf,
+    rel_path: String,
+) {
+    join.spawn(async move {
+        let _permit = semaphore
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
+        let abs = catalog_path.join(&rel_path);
+        let bytes = tokio::fs::read(&abs).await.map_err(MeruError::Io)?;
+        match target.put_if_absent(&rel_path, Bytes::from(bytes)).await {
+            Ok(()) | Err(MeruError::AlreadyExists(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -204,5 +362,90 @@ mod tests {
         let mut worker = MirrorWorker::spawn(engine, MirrorConfig::new(store));
         worker.shutdown().await;
         worker.shutdown().await; // must not panic
+    }
+
+    /// Phase 2b: `mirror_snapshot` uploads data files AND the
+    /// protobuf manifest AND advances low_water.txt. Contract
+    /// pinned at the function level so the integration test below
+    /// doesn't need to race the worker's polling tick.
+    #[tokio::test]
+    async fn mirror_snapshot_uploads_files_manifest_and_low_water() {
+        use merutable_iceberg::{
+            snapshot::{IcebergDataFile, SnapshotTransaction},
+            IcebergCatalog,
+        };
+        use merutable_types::level::{Level, ParquetFileMeta};
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+
+        // Build a POSIX catalog at tmp with two data files.
+        let schema = std::sync::Arc::new(schema());
+        let catalog = IcebergCatalog::open(tmp.path(), schema.as_ref().clone())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("data/L0"))
+            .await
+            .unwrap();
+        let mut txn = SnapshotTransaction::new();
+        for i in 0..2 {
+            let path = format!("data/L0/f{i}.parquet");
+            tokio::fs::write(tmp.path().join(&path), format!("pq-body-{i}"))
+                .await
+                .unwrap();
+            txn.add_file(IcebergDataFile {
+                path,
+                file_size: 9,
+                num_rows: 100,
+                meta: ParquetFileMeta {
+                    level: Level(0),
+                    seq_min: 1,
+                    seq_max: 10,
+                    key_min: vec![0x01],
+                    key_max: vec![0xFF],
+                    num_rows: 100,
+                    file_size: 9,
+                    dv_path: None,
+                    dv_offset: None,
+                    dv_length: None,
+                    format: None,
+                    column_stats: None,
+                },
+            });
+        }
+        catalog.commit(&txn, schema.clone()).await.unwrap();
+
+        // Open the engine against the same catalog path. Engine
+        // sees the committed v=1 manifest.
+        let engine = MeruEngine::open(engine_config(&tmp)).await.unwrap();
+        assert_eq!(engine.current_snapshot_id(), 1);
+
+        // Set up the mirror target.
+        let store = Arc::new(LocalFileStore::new(mirror_dir.path()).unwrap());
+        let cfg = MirrorConfig::new(store.clone());
+        let catalog_path = PathBuf::from(engine.catalog_path());
+
+        // Directly invoke the upload path (bypassing the worker
+        // tick) so the test is deterministic.
+        super::mirror_snapshot(&engine, &catalog_path, &cfg, 1)
+            .await
+            .unwrap();
+
+        // Data files are present at the mirror with matching bytes.
+        for i in 0..2 {
+            let path = format!("data/L0/f{i}.parquet");
+            let got = store.get(&path).await.unwrap();
+            assert_eq!(got.as_ref(), format!("pq-body-{i}").as_bytes());
+        }
+        // Manifest is present at the canonical ObjectStore path.
+        assert!(store.exists("metadata/v1.manifest.bin").await.unwrap());
+        // Low-water points at v=1.
+        let lw = store.get("metadata/low_water.txt").await.unwrap();
+        assert_eq!(lw.as_ref(), b"1");
+
+        // Re-running the upload against the same destination is
+        // idempotent — no errors, data bytes unchanged.
+        super::mirror_snapshot(&engine, &catalog_path, &cfg, 1)
+            .await
+            .unwrap();
     }
 }

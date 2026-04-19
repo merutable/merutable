@@ -646,6 +646,14 @@ impl MeruEngine {
         self.version_set.snapshot_id()
     }
 
+    /// Issue #31 Phase 2b: a clone of the currently-committed
+    /// manifest. Used by the mirror worker to enumerate live data
+    /// files + serialize the manifest for upload. Takes a brief
+    /// async lock on the catalog's current-manifest mutex.
+    pub async fn current_manifest(&self) -> merutable_iceberg::Manifest {
+        self.catalog.current_manifest().await
+    }
+
     /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()
