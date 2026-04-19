@@ -301,7 +301,14 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
         // Start from cached HEAD + cached manifest; fall through to a
         // store-reload on race-loss. Bounded retries and exponential
         // backoff mirror `commit_with_retry`.
-        const MAX_RETRIES: usize = 8;
+        // 16 retries buys ~30s of exponential-backoff time under
+        // pathological contention (backoff caps at 200ms). 8 was
+        // occasionally insufficient in multi-threaded tests with
+        // unrelated disk I/O running on shared tmpfs — two writers
+        // doing 5 commits each could wedge both through 4
+        // consecutive race-losses, leaving only 4 retries of real
+        // progress before the budget hit.
+        const MAX_RETRIES: usize = 16;
         let mut head = *self.head.lock().await;
         let mut base: Manifest = self.current.lock().await.clone();
 
