@@ -256,7 +256,43 @@ fn column_type_to_iceberg(ct: &ColumnType) -> Value {
 /// stamp), but it contains all per-file information in Iceberg-shaped
 /// keys. A downstream Avro emitter can consume it directly.
 pub fn to_iceberg_data_file_v2(entry: &ManifestEntry) -> Value {
+    to_iceberg_data_file_v2_with_schema(entry, None)
+}
+
+/// Issue #20 Part 2 (partial): schema-aware variant that emits
+/// per-column `value_counts` and `null_value_counts` for every
+/// **non-nullable** user column. Non-nullable columns are guaranteed
+/// to have `num_rows` present values and zero nulls by merutable's
+/// write contract (tombstone rows carry typed defaults per Bug N,
+/// not NULLs). This enables predicate pushdown on the dominant case
+/// (PK columns and other required columns) without requiring the
+/// full Parquet-row-group-stats plumbing that's still open work.
+///
+/// `column_sizes`, `lower_bounds`, `upper_bounds`, and null counts for
+/// nullable columns still require hoisting Parquet statistics into
+/// `ParquetFileMeta`. Left as Issue #20 Part 2b.
+pub fn to_iceberg_data_file_v2_with_schema(
+    entry: &ManifestEntry,
+    schema: Option<&TableSchema>,
+) -> Value {
     let meta = &entry.meta;
+
+    // Per-column statistics maps keyed by Iceberg field id (1..=N).
+    let mut value_counts = serde_json::Map::new();
+    let mut null_value_counts = serde_json::Map::new();
+    if let Some(schema) = schema {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if col.nullable {
+                // Without Parquet row-group stats we don't know the
+                // null count. Omit rather than lie. (Part 2b.)
+                continue;
+            }
+            let field_id = (idx + 1) as i32;
+            value_counts.insert(field_id.to_string(), json!(meta.num_rows));
+            null_value_counts.insert(field_id.to_string(), json!(0));
+        }
+    }
+
     // Iceberg `content`: 0=data, 1=position deletes, 2=equality deletes.
     // merutable Parquet files are always data. DVs are carried separately
     // as a Puffin pointer under properties.
@@ -269,16 +305,12 @@ pub fn to_iceberg_data_file_v2(entry: &ManifestEntry) -> Value {
             "partition": {},
             "record_count": meta.num_rows,
             "file_size_in_bytes": meta.file_size,
-            // Per-column statistics (column_sizes, value_counts,
-            // null_value_counts, lower_bounds, upper_bounds) require
-            // hoisting the Parquet row-group stats into ParquetFileMeta.
-            // That plumbing is Issue #20 Part 2 (separable PR). Unset
-            // is spec-valid; engines fall back to per-file filtering
-            // using the file-level key range indirectly via the sort
-            // order (Part 1, this PR).
+            // column_sizes / lower_bounds / upper_bounds require
+            // hoisting Parquet row-group stats into ParquetFileMeta.
+            // Tracked as Issue #20 Part 2b.
             "column_sizes": {},
-            "value_counts": {},
-            "null_value_counts": {},
+            "value_counts": value_counts,
+            "null_value_counts": null_value_counts,
             "lower_bounds": {},
             "upper_bounds": {},
             "split_offsets": [],
@@ -589,6 +621,67 @@ mod tests {
         assert_eq!(fields[0]["transform"], "identity");
         // Table-level default-sort-order-id points at our real order.
         assert_eq!(v["default-sort-order-id"], 1);
+    }
+
+    /// Issue #20 Part 2 (partial): schema-aware projection emits
+    /// `value_counts` and `null_value_counts` for every non-nullable
+    /// user column, keyed by Iceberg field id (1..=N). Nullable
+    /// columns are omitted pending Part 2b (Parquet row-group stat
+    /// plumbing). Hidden merutable columns (`_merutable_ikey`,
+    /// `_merutable_seq`, `_merutable_op`, `_merutable_value`) never
+    /// appear in Iceberg stats because they're not in the Iceberg
+    /// schema.
+    #[test]
+    fn data_file_projection_emits_value_counts_for_non_nullable_columns() {
+        let entry = ManifestEntry {
+            path: "data/L1/foo.parquet".into(),
+            meta: file_meta(1, 777, 1000),
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+            status: "added".into(),
+        };
+        // schema() defines:
+        //   col 0 "id"     Int64    required (non-nullable)
+        //   col 1 "name"   Binary   nullable
+        //   col 2 "score"  Double   nullable
+        //   col 3 "active" Boolean  nullable
+        // Only "id" (field id 1) should appear in the per-column maps.
+        let s = schema();
+        let v = to_iceberg_data_file_v2_with_schema(&entry, Some(&s));
+        let vc = v["data_file"]["value_counts"].as_object().unwrap();
+        let nc = v["data_file"]["null_value_counts"].as_object().unwrap();
+        assert_eq!(vc.len(), 1, "only non-nullable columns emit stats");
+        assert_eq!(vc["1"], 777, "non-nullable column count = num_rows");
+        assert_eq!(nc.len(), 1);
+        assert_eq!(nc["1"], 0, "non-nullable column null count = 0");
+        // Nullable columns (field ids 2..4) omitted — pending Part 2b.
+        assert!(vc.get("2").is_none());
+        assert!(vc.get("3").is_none());
+        assert!(vc.get("4").is_none());
+    }
+
+    /// The schema-less overload remains available for pre-#20 callers;
+    /// it emits empty stat maps.
+    #[test]
+    fn data_file_projection_without_schema_emits_empty_stats() {
+        let entry = ManifestEntry {
+            path: "data/L1/foo.parquet".into(),
+            meta: file_meta(1, 100, 1000),
+            dv_path: None,
+            dv_offset: None,
+            dv_length: None,
+            status: "added".into(),
+        };
+        let v = to_iceberg_data_file_v2(&entry);
+        assert_eq!(v["data_file"]["value_counts"].as_object().unwrap().len(), 0);
+        assert_eq!(
+            v["data_file"]["null_value_counts"]
+                .as_object()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// Per-file manifest entries must declare adherence to the real
