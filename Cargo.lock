@@ -2347,6 +2347,9 @@ dependencies = [
 name = "merutable-sql"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "bytes",
  "merutable",
  "merutable-engine",
  "merutable-types",

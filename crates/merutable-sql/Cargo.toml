@@ -9,6 +9,9 @@ publish = false  # internal; the 0.1-preview blocker. Stable surface follows Dat
 merutable          = { path = "../merutable" }
 merutable-types    = { path = "../merutable-types" }
 merutable-engine   = { path = "../merutable-engine" }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+bytes              = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 thiserror          = { workspace = true }

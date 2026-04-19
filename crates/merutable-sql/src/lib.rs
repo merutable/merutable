@@ -27,7 +27,17 @@
 //! across memtable + L0. Subscribers can fall multiple snapshots
 //! behind without escalating.
 //!
-//! # Phase 2c (this commit): pre-image reconstruction + INSERT vs UPDATE
+//! # Phase 2d (this commit): Arrow RecordBatch adapter
+//!
+//! New `crate::arrow` module converts `Vec<ChangeRecord>` into the
+//! Arrow columnar form DataFusion expects. Schema shape:
+//! `seq UInt64, op Utf8, pk_bytes Binary, <user columns>`. Phase
+//! 2e wires a `TableProvider` that produces these batches on
+//! demand from a `ChangeFeedCursor`; landing the adapter
+//! separately keeps the dep graph free of DataFusion until the
+//! TableProvider actually ships.
+//!
+//! # Phase 2c (shipped): pre-image reconstruction + INSERT vs UPDATE
 //!
 //! The cursor now calls `scan_tail_changes_with_pre_image`, which
 //! resolves each Delete op's pre-image via a point lookup at
@@ -73,6 +83,8 @@ use merutable_types::{
     value::Row,
     MeruError, Result,
 };
+
+pub mod arrow;
 
 /// The kind of mutation a change-feed row represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
