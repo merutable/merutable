@@ -106,6 +106,67 @@ impl MeruStore for LocalFileStore {
         }
         Ok(results)
     }
+
+    /// Issue #26: race-free create-only write via `O_CREAT | O_EXCL`.
+    ///
+    /// The default `MeruStore::put_if_absent` does an `exists` +
+    /// `put` two-step that's a TOCTOU race — two writers can both
+    /// observe "doesn't exist" and both write. On POSIX, the kernel
+    /// gives us a single atomic system call (`open(O_CREAT|O_EXCL)`)
+    /// that either creates the file or fails with `EEXIST`. Map
+    /// `EEXIST` → `MeruError::AlreadyExists`, everything else →
+    /// `MeruError::Io`.
+    ///
+    /// The fsync chain matches `put`: write the body to the newly-
+    /// created file, fsync the file, fsync the parent directory.
+    /// Without the parent fsync, the directory entry itself is not
+    /// durable under ext4/btrfs and a crash can resurrect the path
+    /// as "does not exist" — which would let a subsequent
+    /// `put_if_absent` succeed AGAIN on the same path. That's a
+    /// silent-commit-duplication hazard we refuse by fsync'ing the
+    /// directory entry on the create path.
+    async fn put_if_absent(&self, path: &str, data: Bytes) -> Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let full = self.full_path(path);
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // Do the O_CREAT|O_EXCL on the blocking pool — tokio::fs
+        // wraps std::fs which opens in blocking mode; using OpenOptions
+        // keeps the atomicity contract explicit.
+        let full_cloned = full.clone();
+        let data_cloned = data.clone();
+        let res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut f = match OpenOptions::new()
+                .write(true)
+                .create_new(true) // == O_CREAT | O_EXCL
+                .open(&full_cloned)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(MeruError::AlreadyExists(
+                        full_cloned.to_string_lossy().into_owned(),
+                    ));
+                }
+                Err(e) => return Err(MeruError::Io(e)),
+            };
+            f.write_all(&data_cloned).map_err(MeruError::Io)?;
+            f.sync_all().map_err(MeruError::Io)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MeruError::ObjectStore(format!("spawn_blocking join: {e}")))?;
+        res?;
+        // fsync the parent directory so the new directory entry is
+        // durable.
+        if let Some(parent) = full.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -146,5 +207,78 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalFileStore::new(tmp.path()).unwrap();
         store.delete("does-not-exist").await.unwrap();
+    }
+
+    /// Issue #26: `put_if_absent` is atomic via O_CREAT|O_EXCL. A
+    /// second call against the same path returns `AlreadyExists`
+    /// and does NOT clobber the first call's bytes.
+    #[tokio::test]
+    async fn put_if_absent_rejects_second_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalFileStore::new(tmp.path()).unwrap();
+
+        // First writer wins.
+        store
+            .put_if_absent("ver/v1.bin", Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+
+        // Second writer loses with AlreadyExists — the bytes must
+        // stay the first writer's.
+        let err = store
+            .put_if_absent("ver/v1.bin", Bytes::from_static(b"second"))
+            .await
+            .unwrap_err();
+        match err {
+            MeruError::AlreadyExists(p) => assert!(p.contains("ver/v1.bin"), "path: {p}"),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+
+        let got = store.get("ver/v1.bin").await.unwrap();
+        assert_eq!(got.as_ref(), b"first", "losing writer must not overwrite");
+    }
+
+    /// Concurrent-contention variant: N workers race on the same
+    /// path; exactly one wins, all others see AlreadyExists. Runs
+    /// in a Tokio multi-thread runtime so the race is real, not
+    /// task-scheduled-serial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_if_absent_concurrent_contention_single_winner() {
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+
+        const N: usize = 16;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .put_if_absent("race/commit.bin", Bytes::from(format!("w{i}")))
+                    .await
+            }));
+        }
+
+        let mut wins = 0;
+        let mut loses = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(()) => wins += 1,
+                Err(MeruError::AlreadyExists(_)) => loses += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(wins, 1, "exactly one writer must win the race");
+        assert_eq!(loses, N - 1, "all others must see AlreadyExists");
+
+        // Body must match the winner's content. We don't know
+        // *which* worker won, but the content must be a valid "w{i}"
+        // — not a torn mix.
+        let body = store.get("race/commit.bin").await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.starts_with('w') && s[1..].parse::<usize>().is_ok() && body.len() >= 2,
+            "body must be a complete w{{i}} payload, got: {s:?}"
+        );
     }
 }
