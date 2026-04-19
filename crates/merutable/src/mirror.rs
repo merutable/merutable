@@ -430,74 +430,40 @@ mod tests {
     /// then Some(0..N) afterwards.
     #[tokio::test]
     async fn mirror_lag_transitions_from_none_to_some() {
-        use merutable_iceberg::{
-            snapshot::{IcebergDataFile, SnapshotTransaction},
-            IcebergCatalog,
-        };
-        use merutable_types::level::{Level, ParquetFileMeta};
+        // Exercise the accessor math in isolation — no live
+        // background tick, no catalog. The worker's real
+        // upload+write path is covered by
+        // `mirror_snapshot_uploads_files_manifest_and_low_water`
+        // below. Driving both an engine-coupled worker AND a direct
+        // upload in the same test flakes on CI: the worker's first
+        // tick fires ~immediately, opens files in the source
+        // tempdir, and races tempdir drop as the test exits.
         let tmp = tempfile::tempdir().unwrap();
         let mirror_dir = tempfile::tempdir().unwrap();
-
-        let schema_arc = std::sync::Arc::new(schema());
-        let catalog = IcebergCatalog::open(tmp.path(), schema_arc.as_ref().clone())
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("data/L0"))
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("data/L0/a.parquet"), b"body")
-            .await
-            .unwrap();
-        let mut txn = SnapshotTransaction::new();
-        txn.add_file(IcebergDataFile {
-            path: "data/L0/a.parquet".into(),
-            file_size: 4,
-            num_rows: 1,
-            meta: ParquetFileMeta {
-                level: Level(0),
-                seq_min: 1,
-                seq_max: 1,
-                key_min: vec![0],
-                key_max: vec![0],
-                num_rows: 1,
-                file_size: 4,
-                dv_path: None,
-                dv_offset: None,
-                dv_length: None,
-                format: None,
-                column_stats: None,
-            },
-        });
-        catalog.commit(&txn, schema_arc).await.unwrap();
-
         let engine = MeruEngine::open(engine_config(&tmp)).await.unwrap();
         let store = Arc::new(LocalFileStore::new(mirror_dir.path()).unwrap());
-        let cfg = MirrorConfig::new(store);
-        let mut worker = MirrorWorker::spawn(engine.clone(), cfg.clone());
+        let mut worker = MirrorWorker::spawn(engine, MirrorConfig::new(store));
+        // Shutdown IMMEDIATELY so the worker's loop sees the flag
+        // and exits before calling current_snapshot_id on a dropped
+        // engine. We're only testing the accessor math below.
+        worker.shutdown().await;
 
-        // Before any upload: lag is None.
+        // No upload recorded yet — accessor returns None.
         assert_eq!(worker.mirror_lag_secs(), None);
 
-        // Drive a synchronous upload via the public mirror_snapshot
-        // helper, then poke last_upload_unix_secs by hand — the test
-        // proves the accessor math, not the worker's tick timing.
-        super::mirror_snapshot(&engine, &PathBuf::from(engine.catalog_path()), &cfg, 1)
-            .await
-            .unwrap();
-        worker.last_upload_unix_secs.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-            Ordering::Relaxed,
-        );
+        // Simulate a just-completed upload by writing the current
+        // UNIX second directly into the atomic. Phase 4's loop does
+        // exactly this on every successful tick.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        worker
+            .last_upload_unix_secs
+            .store(now, Ordering::Relaxed);
+
         let lag = worker.mirror_lag_secs().expect("lag is Some after upload");
         assert!(lag < 10, "lag should be near-zero on fresh upload: {lag}");
-        // Shut the worker down before the tempdirs drop so a
-        // mid-flight tick doesn't try to read files that have
-        // already been removed, which under parallel test pressure
-        // flakes as an Io NotFound.
-        worker.shutdown().await;
     }
 
     /// Phase 2b: `mirror_snapshot` uploads data files AND the

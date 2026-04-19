@@ -340,6 +340,17 @@ impl MeruDB {
         self.engine.refresh().await
     }
 
+    /// Issue #32 Phase 2 escape hatch: hand out the inner
+    /// `Arc<MeruEngine>` so the replica crate's `InProcessLogSource`
+    /// can call `scan_memtable_changes` without forcing every
+    /// change-feed-ish client through a public-facing engine facade.
+    /// The name signals the narrow intent; stable callers should
+    /// prefer the forthcoming `merutable_changes(table, since_seq)`
+    /// Flight SQL endpoint once it lands.
+    pub fn engine_for_replica(&self) -> Arc<MeruEngine> {
+        self.engine.clone()
+    }
+
     /// Graceful shutdown: flush all in-memory data to durable storage and
     /// fsync. After `close()` returns, every write that completed before
     /// this call is durable on disk. Subsequent write/flush/compact calls

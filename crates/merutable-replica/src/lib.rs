@@ -21,13 +21,15 @@
 //!
 //! # Phases
 //!
-//! - **Phase 1 (this crate, today)**: `LogSource` trait, `OpRecord`
-//!   type shape, `LogGap` error, placeholder `ChangeFeedLogSource`
-//!   stub that returns `LogGap` unconditionally so the v1 impl
-//!   contract is pinned ahead of #29 Phase 2 landing. No
-//!   `ReplicaState` or rebase worker yet.
-//! - **Phase 2 (planned)**: `ChangeFeedLogSource` real impl over a
-//!   `merutable_changes` Flight SQL endpoint (requires #29 Phase 2).
+//! - **Phase 1 (shipped)**: `LogSource` trait, `OpRecord` type shape,
+//!   `LogGap` error, placeholder `ChangeFeedLogSource` stub.
+//! - **Phase 2 (this commit)**: `InProcessLogSource` — a `LogSource`
+//!   implementation that pulls from a co-located `Arc<MeruDB>` via
+//!   #29 Phase 2a's `ChangeFeedCursor`. Usable immediately for
+//!   single-machine replica experiments + integration tests without
+//!   waiting for the Flight SQL endpoint (#29 Phase 2d).
+//! - **Phase 2b (planned)**: `ChangeFeedLogSource` real impl over
+//!   the Flight SQL endpoint once #29 Phase 2d lands.
 //! - **Phase 3 (planned)**: `ReplicaState` + append-only tail
 //!   advance. No rebase; growing tail OK for this phase.
 //! - **Phase 4 (planned)**: hot-swap rebase worker + drain TTL.
@@ -138,6 +140,77 @@ impl LogSource for ChangeFeedLogSource {
              Flight SQL endpoint)"
                 .into(),
         ))
+    }
+}
+
+/// Issue #32 Phase 2: co-located log source for single-process
+/// replica setups (tests, benchmarks, single-host HTAP demos).
+///
+/// Pulls ops directly from an `Arc<MeruDB>` via the change-feed
+/// cursor (#29 Phase 2a). No network, no serialization, no
+/// retention handshake — stream just ends when the cursor returns
+/// an empty batch.
+///
+/// Limitations (by design — Phase 2 scope, lifted in Phase 2b/3):
+/// - Memtable-only visibility inherited from #29 Phase 2a. Flushed
+///   ops don't surface until #29 Phase 2b adds L0 scan.
+/// - `latest_seq()` returns the primary's current read_seq; under
+///   contention it can race ahead of what a subsequent `stream()`
+///   call actually yields (an op could be committed between the
+///   two calls). Callers use it as a wake-up hint, not a pinned
+///   upper bound.
+pub struct InProcessLogSource {
+    db: std::sync::Arc<merutable::MeruDB>,
+    /// Batch size passed to `ChangeFeedCursor::next_batch`. Default
+    /// 4096 — large enough that a single stream() call amortizes
+    /// lock-acquisition overhead, small enough to keep memory
+    /// bounded.
+    batch_size: usize,
+}
+
+impl InProcessLogSource {
+    pub fn new(db: std::sync::Arc<merutable::MeruDB>) -> Self {
+        Self {
+            db,
+            batch_size: 4096,
+        }
+    }
+
+    pub fn with_batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n.max(1);
+        self
+    }
+}
+
+#[async_trait]
+impl LogSource for InProcessLogSource {
+    async fn stream(&self, since: u64) -> Result<BoxStream<'static, Result<OpRecord>>> {
+        use futures::stream::StreamExt;
+        // Drain the cursor eagerly into a Vec and hand back a
+        // once-through stream. Phase 2a's cursor is sync under the
+        // hood (memtable scan); streaming primarily gives us
+        // back-pressure on the replica side as it applies ops.
+        let engine = self.db.engine_for_replica();
+        let mut cursor = merutable_sql::ChangeFeedCursor::from_engine(engine, since);
+        let mut records: Vec<Result<OpRecord>> = Vec::new();
+        loop {
+            let batch = cursor.next_batch(self.batch_size)?;
+            if batch.is_empty() {
+                break;
+            }
+            for r in batch {
+                records.push(Ok(OpRecord {
+                    seq: r.seq,
+                    op: r.op,
+                    row: r.row,
+                }));
+            }
+        }
+        Ok(futures::stream::iter(records).boxed())
+    }
+
+    async fn latest_seq(&self) -> Result<u64> {
+        Ok(self.db.read_seq().0)
     }
 }
 

@@ -7,6 +7,7 @@ publish = false  # internal; stable surface follows the full rebase + hot-swap i
 
 [dependencies]
 merutable          = { path = "../merutable" }
+merutable-engine   = { path = "../merutable-engine" }
 merutable-types    = { path = "../merutable-types" }
 merutable-sql      = { path = "../merutable-sql" }
 async-trait        = { workspace = true }

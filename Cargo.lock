@@ -2333,6 +2333,7 @@ dependencies = [
  "async-trait",
  "futures",
  "merutable",
+ "merutable-engine",
  "merutable-sql",
  "merutable-types",
  "tempfile",
