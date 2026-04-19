@@ -29,14 +29,18 @@
 //! - **Phase 3a (shipped)**: `ReplicaTail` — in-memory tail state +
 //!   `advance()` that replays ops from any `LogSource`. PK-indexed
 //!   `get()` resolves last-writer-wins.
-//! - **Phase 3b (this commit)**: `Replica` — composite type that
-//!   pairs a read-only base `MeruDB` with a `ReplicaTail`. Reads
-//!   go tail-first, then fall through to the base on miss. Base
-//!   opens as POSIX today; once #26 Phase 4 lands the
-//!   engine-integrated `CommitMode::ObjectStore` open path, the
-//!   same Replica shape serves remote readers against a #31
-//!   mirror destination unchanged.
-//! - **Phase 4 (planned)**: hot-swap rebase worker + drain TTL.
+//! - **Phase 3b (shipped)**: `Replica` — composite type pairing a
+//!   read-only base `MeruDB` with a `ReplicaTail`. Reads go
+//!   tail-first, fall through to the base on miss.
+//! - **Phase 4a (this commit)**: `Replica::rebase()` — manual
+//!   rebase that refreshes the base to the latest mirrored
+//!   snapshot, resets the tail, and catches up from the new
+//!   base_seq. Not yet zero-gap (the tail is briefly empty
+//!   during rebase); Phase 4b adds the parallel-warmup
+//!   `ArcSwap<State>` handoff that makes rebase invisible to
+//!   in-flight readers.
+//! - **Phase 4b (planned)**: zero-gap hot-swap via parallel
+//!   warmup + ArcSwap retarget.
 //! - **Phase 5 (planned)**: metrics surface, log-gap recovery,
 //!   stress test harness.
 
@@ -282,6 +286,17 @@ impl ReplicaTail {
         self.visible_seq
     }
 
+    /// Issue #32 Phase 4a: seed the tail's `visible_seq` to a
+    /// starting floor. Used by `Replica::rebase` to anchor a
+    /// freshly-reset tail at the new base's seq so the next
+    /// `advance()` only streams ops strictly newer than the base.
+    /// No-op if `seq <= self.visible_seq`.
+    pub fn seed_visible_seq(&mut self, seq: u64) {
+        if seq > self.visible_seq {
+            self.visible_seq = seq;
+        }
+    }
+
     /// Lifetime count of ops absorbed. Useful for metrics +
     /// regression tests that want to see work actually happened.
     pub fn ops_applied(&self) -> u64 {
@@ -456,6 +471,57 @@ impl Replica {
     /// `MeruDB::read_seq`.
     pub fn base_seq(&self) -> u64 {
         self.base.read_seq().0
+    }
+
+    /// Issue #32 Phase 4a: rebase the replica onto a newer base
+    /// snapshot. Calls `MeruDB::refresh()` to pick up commits that
+    /// have landed on the mirror since open, then resets the tail
+    /// and advances it from the new `base_seq` forward.
+    ///
+    /// This is a stop-the-world rebase: the tail is briefly empty
+    /// between the reset and the advance, during which point
+    /// lookups that would have hit the tail cache miss and fall
+    /// through to the base. The gap is bounded by the drain time
+    /// of the log source's `stream` call; for an in-process
+    /// source that's microseconds.
+    ///
+    /// Phase 4b will make this zero-gap via `ArcSwap<State>`:
+    /// warm a new state in parallel, swap on completion, drain
+    /// old state on a TTL.
+    ///
+    /// Callers typically poll `LogSource::latest_seq` on a timer
+    /// and compare against `visible_seq` / the mirror's published
+    /// `mirror_seq` to decide when to invoke this.
+    pub async fn rebase(&self) -> Result<()> {
+        // Advance the base MeruDB to the newest manifest on its
+        // underlying catalog. For a POSIX-mounted base this
+        // re-reads version-hint.text and reloads the current
+        // manifest; for CommitMode::ObjectStore (once wired) it
+        // re-discovers HEAD and reloads.
+        self.base.refresh().await?;
+
+        let new_base_seq = self.base.read_seq().0;
+        {
+            let mut tail = self.tail.write().await;
+            // Reset the tail to an empty state anchored at the
+            // new base_seq. The tail's internal visible_seq
+            // becomes the new starting point for log-source
+            // streaming.
+            *tail = ReplicaTail::new();
+            // We could load a starting visible_seq by taking the
+            // max of (old visible_seq, new base_seq) to avoid
+            // re-replaying ops the old tail already absorbed. Use
+            // new_base_seq as the floor instead: ops <= base_seq
+            // are guaranteed to be in the base by construction
+            // (mirror uploaded the snapshot before advancing
+            // low_water), so starting there is always correct.
+            // The log source's range filter prunes anyway.
+            if new_base_seq > 0 {
+                tail.seed_visible_seq(new_base_seq);
+            }
+            tail.advance(self.log_source.as_ref()).await?;
+        }
+        Ok(())
     }
 }
 

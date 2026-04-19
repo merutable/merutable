@@ -137,6 +137,64 @@ async fn tail_delete_is_authoritative_over_base_row() {
     );
 }
 
+/// Phase 4a: `Replica::rebase()` advances the base to a newer
+/// snapshot and resets the tail to anchor at the new base_seq.
+/// After rebase, reads that previously required the tail can be
+/// served straight from the refreshed base.
+#[tokio::test]
+async fn rebase_advances_base_and_resets_tail() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let primary = open_primary(&primary_dir).await;
+
+    // Commit one row, flush — this lands in the primary's v=1
+    // snapshot.
+    primary.put(row(1, 10)).await.unwrap();
+    primary.flush().await.unwrap();
+
+    // Open the replica. Its base mounts v=1.
+    let base_opts = merutable::OpenOptions::new(schema())
+        .wal_dir(replica_dir.path().join("wal"))
+        .catalog_uri(primary_dir.path().to_string_lossy().to_string());
+    let log = Arc::new(InProcessLogSource::new(primary.clone()));
+    let replica = Replica::open(base_opts, log).await.unwrap();
+    let base_seq_v1 = replica.base_seq();
+
+    // Primary writes + flushes again — a new snapshot lands
+    // that the replica's base hasn't seen yet.
+    primary.put(row(2, 20)).await.unwrap();
+    primary.flush().await.unwrap();
+
+    // Before rebase: the replica's base_seq is still pinned at
+    // v=1. Reading key=2 from the replica fails because:
+    // - tail is empty (we never advanced),
+    // - base is at v=1 and doesn't have key=2.
+    assert_eq!(replica.base_seq(), base_seq_v1);
+    let pre_rebase = replica.get(&[FieldValue::Int64(2)]).await.unwrap();
+    assert!(pre_rebase.is_none(), "key=2 not yet visible before rebase");
+
+    // Rebase. base_seq should advance; tail is empty + anchored
+    // at the new base_seq.
+    replica.rebase().await.unwrap();
+    assert!(
+        replica.base_seq() > base_seq_v1,
+        "rebase advances base_seq: {} -> {}",
+        base_seq_v1,
+        replica.base_seq()
+    );
+    // Now key=2 is readable — from the base, not the tail.
+    let post_rebase = replica.get(&[FieldValue::Int64(2)]).await.unwrap();
+    assert!(post_rebase.is_some(), "key=2 visible after rebase");
+    assert!(
+        replica
+            .get(&[FieldValue::Int64(1)])
+            .await
+            .unwrap()
+            .is_some(),
+        "pre-existing key stays visible"
+    );
+}
+
 #[tokio::test]
 async fn replica_base_seq_and_visible_seq_track_independently() {
     let primary_dir = tempfile::tempdir().unwrap();
