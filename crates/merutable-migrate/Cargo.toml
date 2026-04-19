@@ -12,8 +12,12 @@ path = "src/main.rs"
 [dependencies]
 merutable             = { path = "../merutable" }
 merutable-engine      = { path = "../merutable-engine" }
+merutable-iceberg     = { path = "../merutable-iceberg" }
 merutable-types       = { path = "../merutable-types" }
 clap                  = { version = "4", features = ["derive"] }
 tokio                 = { workspace = true, features = ["full"] }
 tracing               = { workspace = true }
 tracing-subscriber    = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
