@@ -27,7 +27,21 @@
 //! across memtable + L0. Subscribers can fall multiple snapshots
 //! behind without escalating.
 //!
-//! # Phase 2d (this commit): Arrow RecordBatch adapter
+//! # Phase 2e (this commit): DataFusion TableProvider
+//!
+//! `datafusion_provider::ChangeFeedTableProvider` wraps a running
+//! `MeruEngine` + a `since_seq` watermark behind DataFusion's
+//! `TableProvider` trait. Register it on a `SessionContext` and
+//! the 0.1-preview headline query works:
+//!
+//! ```sql
+//! SELECT * FROM merutable_changes WHERE op = 'DELETE'
+//! ```
+//!
+//! Phase 2e scope is one-shot scan (drain cursor → `MemoryExec`).
+//! Streaming exec + seq-range filter pushdown are follow-on.
+//!
+//! # Phase 2d (shipped): Arrow RecordBatch adapter
 //!
 //! New `crate::arrow` module converts `Vec<ChangeRecord>` into the
 //! Arrow columnar form DataFusion expects. Schema shape:
@@ -85,6 +99,7 @@ use merutable_types::{
 };
 
 pub mod arrow;
+pub mod datafusion_provider;
 
 /// The kind of mutation a change-feed row represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

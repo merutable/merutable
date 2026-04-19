@@ -11,7 +11,10 @@ merutable-types    = { path = "../merutable-types" }
 merutable-engine   = { path = "../merutable-engine" }
 arrow-array        = { workspace = true }
 arrow-schema       = { workspace = true }
+async-trait        = { workspace = true }
 bytes              = { workspace = true }
+datafusion         = { version = "43", default-features = false }
+futures            = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 thiserror          = { workspace = true }
