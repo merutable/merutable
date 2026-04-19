@@ -3,6 +3,36 @@ use merutable_types::schema::TableSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Issue #26: how the catalog commits a new metadata version.
+///
+/// - `Posix` (default, today's behavior): atomic `rename(2)` against a
+///   filesystem. Correct on a local FS. Structurally unsafe on S3,
+///   GCS, or Azure Blob — those object stores have no atomic rename,
+///   and a POSIX-emulated layer can silently lose a commit when two
+///   writers race.
+/// - `ObjectStore`: single-file conditional-PUT commits against a
+///   `MeruStore`-backed object store. Maps to S3 `If-None-Match: *`,
+///   GCS `x-goog-if-generation-match: 0`, Azure `If-None-Match: *`.
+///   Protobuf-encoded manifests with a backward-pointer chain;
+///   HEAD discovered via exponential probe + binary search; no LIST
+///   on the commit or refresh path.
+///
+/// Default is `Posix` — zero behavior change for existing users.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommitMode {
+    /// POSIX atomic rename. Correct on a local filesystem.
+    #[default]
+    Posix,
+    /// Single-file conditional PUT. Correct on S3 / GCS / Azure Blob.
+    ///
+    /// Implementation is landing incrementally (Issue #26). Today the
+    /// selection is a type-shape freeze pre-0.1-preview: constructing
+    /// an engine with `ObjectStore` mode errors with `Unsupported`
+    /// until Phase 2 (protobuf manifest + conditional PUT plumbing)
+    /// lands.
+    ObjectStore,
+}
+
 /// All tuning parameters for a `MeruEngine` instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -52,6 +82,10 @@ pub struct EngineConfig {
     /// older snapshot may still be mid-read of the old files; deleting them
     /// causes read failures. Default: 300 (5 minutes). Set to 0 for tests.
     pub gc_grace_period_secs: u64,
+
+    /// Issue #26: selects the catalog commit strategy. See
+    /// [`CommitMode`] for semantics. Default `Posix`.
+    pub commit_mode: CommitMode,
 
     /// Issue #15: highest LSM level (inclusive) whose SSTables carry
     /// the row-blob fast-path (`_merutable_value`) alongside typed
@@ -110,6 +144,9 @@ impl Default for EngineConfig {
             compaction_parallelism: 2,
             read_only: false,
             gc_grace_period_secs: 300,
+            // Issue #26: Posix (today's rename-based commit) is the
+            // default; ObjectStore mode opts into conditional-PUT.
+            commit_mode: CommitMode::Posix,
             // Default matches the pre-Issue-#15 hard-coded behavior.
             dual_format_max_level: Some(0),
         }

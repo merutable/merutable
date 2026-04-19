@@ -9,6 +9,7 @@
 //! you override individually. Unset knobs pass `EngineConfig::default()`
 //! through.
 
+pub use merutable_engine::config::CommitMode;
 use merutable_types::schema::TableSchema;
 use std::path::PathBuf;
 
@@ -59,6 +60,11 @@ pub struct OpenOptions {
     /// everywhere; `Some(N)` pushes fast-path deeper for OLTP-heavy
     /// workloads.
     pub dual_format_max_level: Option<u8>,
+
+    /// Issue #26: catalog commit strategy. `Posix` (default) uses
+    /// atomic rename; `ObjectStore` uses conditional-PUT for
+    /// S3/GCS/Azure correctness.
+    pub commit_mode: CommitMode,
 }
 
 impl OpenOptions {
@@ -89,7 +95,24 @@ impl OpenOptions {
             gc_grace_period_secs: ec.gc_grace_period_secs,
             read_only: ec.read_only,
             dual_format_max_level: ec.dual_format_max_level,
+            commit_mode: ec.commit_mode,
         }
+    }
+
+    /// Issue #26: select the catalog commit mode.
+    ///
+    /// - [`CommitMode::Posix`] (default): atomic rename-based commits.
+    ///   Correct on a local filesystem. Do NOT use on S3 / GCS / Azure
+    ///   Blob — a POSIX-emulated layer over those object stores has no
+    ///   atomic rename and can silently lose commits when writers race.
+    /// - [`CommitMode::ObjectStore`]: single-file conditional-PUT
+    ///   commits. Required for S3 / GCS / Azure. The implementation
+    ///   lands in phases; selecting this mode currently errors at
+    ///   `open` with `Unsupported` until the phase-2 protobuf-manifest
+    ///   + put-if-absent plumbing ships.
+    pub fn commit_mode(mut self, mode: CommitMode) -> Self {
+        self.commit_mode = mode;
+        self
     }
 
     /// Issue #15: highest LSM level whose SSTables carry the

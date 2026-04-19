@@ -37,6 +37,15 @@ pub enum MeruError {
 
     #[error("database is closed")]
     Closed,
+
+    /// Issue #26: create-only PUT lost a race.
+    ///
+    /// Returned by `MeruStore::put_if_absent` when the target path
+    /// already exists. Callers handle this by refetching HEAD,
+    /// rebuilding their manifest on top, and retrying. Not an error
+    /// condition — the *expected* non-error outcome of losing a race.
+    #[error("object already exists: {0}")]
+    AlreadyExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, MeruError>;

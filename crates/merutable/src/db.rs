@@ -115,6 +115,20 @@ impl MeruDB {
     }
 
     pub async fn open(options: OpenOptions) -> Result<Self> {
+        // Issue #26 Phase 1: reject ObjectStore commit mode until the
+        // protobuf-manifest + conditional-PUT implementation lands.
+        // The type shape is stable; the behavior is phased.
+        if matches!(
+            options.commit_mode,
+            merutable_engine::config::CommitMode::ObjectStore
+        ) {
+            return Err(merutable_types::MeruError::InvalidArgument(
+                "CommitMode::ObjectStore is not yet implemented \
+                 (Issue #26 Phase 2 pending). Use CommitMode::Posix \
+                 on local filesystems for now."
+                    .into(),
+            ));
+        }
         // Issue #9: surface the full tuning matrix through
         // `OpenOptions`. Previously only 7/14 EngineConfig fields
         // were reachable from the public API — users who wanted to
@@ -142,6 +156,7 @@ impl MeruDB {
             gc_grace_period_secs: options.gc_grace_period_secs,
             read_only: options.read_only,
             dual_format_max_level: options.dual_format_max_level,
+            commit_mode: options.commit_mode,
         };
 
         let engine = MeruEngine::open(config).await?;
