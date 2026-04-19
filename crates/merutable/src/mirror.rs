@@ -473,7 +473,7 @@ mod tests {
         let engine = MeruEngine::open(engine_config(&tmp)).await.unwrap();
         let store = Arc::new(LocalFileStore::new(mirror_dir.path()).unwrap());
         let cfg = MirrorConfig::new(store);
-        let worker = MirrorWorker::spawn(engine.clone(), cfg.clone());
+        let mut worker = MirrorWorker::spawn(engine.clone(), cfg.clone());
 
         // Before any upload: lag is None.
         assert_eq!(worker.mirror_lag_secs(), None);
@@ -493,6 +493,11 @@ mod tests {
         );
         let lag = worker.mirror_lag_secs().expect("lag is Some after upload");
         assert!(lag < 10, "lag should be near-zero on fresh upload: {lag}");
+        // Shut the worker down before the tempdirs drop so a
+        // mid-flight tick doesn't try to read files that have
+        // already been removed, which under parallel test pressure
+        // flakes as an Io NotFound.
+        worker.shutdown().await;
     }
 
     /// Phase 2b: `mirror_snapshot` uploads data files AND the

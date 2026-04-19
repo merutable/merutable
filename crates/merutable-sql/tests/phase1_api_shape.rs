@@ -19,7 +19,9 @@ fn change_op_sql_labels_are_stable() {
 
 #[test]
 fn phase1_cursor_returns_retention_error() {
-    let mut cur = ChangeFeedCursor::new(100, 500);
+    // Phase 2a renamed `new` → `new_below_retention` to make the
+    // intent explicit now that an engine-backed constructor exists.
+    let mut cur = ChangeFeedCursor::new_below_retention(100, 500);
     let err = match cur.next_batch(10) {
         Ok(_) => panic!("Phase 1 must return retention error, not rows"),
         Err(e) => e,

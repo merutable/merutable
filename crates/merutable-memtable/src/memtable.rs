@@ -136,6 +136,36 @@ impl Memtable {
     pub fn iter(&self, read_seq: SeqNum) -> MemtableIterator<'_> {
         MemtableIterator::new(self.skiplist.iter(), read_seq)
     }
+
+    /// Issue #29 Phase 2a: change-feed iteration. Yields EVERY
+    /// version in the skip list whose seq is in `(0, read_seq]`,
+    /// including superseded versions that `iter()` would dedup away.
+    /// Necessary for a change feed — a put+delete pair on the same
+    /// key must surface both ops, not just the last.
+    ///
+    /// Output order is skip-list order: ascending user-key, then
+    /// descending seq. Callers that need seq-ascending order (the
+    /// change-feed contract) must sort after collecting.
+    pub fn iter_all_versions(&self, read_seq: SeqNum) -> Vec<crate::iterator::MemEntry> {
+        use crate::iterator::MemEntry;
+        use crate::skiplist::{decode_seq_from_key, user_key_of};
+        use bytes::Bytes;
+        self.skiplist
+            .iter()
+            .filter_map(move |(ikey_bytes, entry)| {
+                let seq = decode_seq_from_key(&ikey_bytes);
+                if seq > read_seq {
+                    return None;
+                }
+                let uk = Bytes::copy_from_slice(user_key_of(&ikey_bytes));
+                Some(MemEntry {
+                    user_key: uk,
+                    seq,
+                    entry,
+                })
+            })
+            .collect()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

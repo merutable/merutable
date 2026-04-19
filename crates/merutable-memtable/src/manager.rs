@@ -165,6 +165,20 @@ impl MemtableManager {
         }
         snapshots
     }
+
+    /// Issue #29 Phase 2a: change-feed snapshot. Yields EVERY
+    /// version (not just the latest per key) across every memtable,
+    /// for callers that need put+delete pairs to surface separately.
+    /// Returned in a single flat vec — callers sort by seq to get
+    /// the change-feed order.
+    pub fn snapshot_all_versions(&self, read_seq: SeqNum) -> Vec<MemEntry> {
+        let set = self.inner.read().unwrap();
+        let mut out: Vec<MemEntry> = set.active.iter_all_versions(read_seq);
+        for mem in set.immutable.iter().rev() {
+            out.extend(mem.iter_all_versions(read_seq));
+        }
+        out
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

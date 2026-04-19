@@ -654,6 +654,58 @@ impl MeruEngine {
         self.catalog.current_manifest().await
     }
 
+    /// Issue #29 Phase 2a: scan the memtable for ops with seq in
+    /// `(since_seq, read_seq]` and return them in seq-ascending
+    /// order as `(seq, op_type, decoded_row)` tuples. Phase 2a
+    /// covers the un-flushed tail only; L0 and deeper levels are
+    /// Phase 2b (needs a Parquet scan that filters by seq column).
+    ///
+    /// Pre-image reconstruction for `Delete` ops is NOT performed
+    /// here — the tuple carries an empty `Row` on delete. The
+    /// Phase 2c point-lookup-at-seq-minus-1 step will populate
+    /// pre-images; callers assembling a `ChangeRecord` can treat
+    /// an empty Row on a Delete as "pre-image pending".
+    ///
+    /// `read_seq` is typically `self.read_seq().0`; callers pass it
+    /// explicitly so they can pin a consistent snapshot across
+    /// multiple calls.
+    pub fn scan_memtable_changes(
+        &self,
+        since_seq: u64,
+        read_seq: merutable_types::sequence::SeqNum,
+    ) -> Result<
+        Vec<(
+            u64,
+            merutable_types::sequence::OpType,
+            merutable_types::value::Row,
+        )>,
+    > {
+        // Use `snapshot_all_versions` (not `snapshot_entries`) so
+        // put+delete pairs on the same key both surface — the
+        // point-lookup iterator dedups superseded versions, which
+        // is wrong for a change feed.
+        let entries = self.memtable.snapshot_all_versions(read_seq);
+        let mut out: Vec<(
+            u64,
+            merutable_types::sequence::OpType,
+            merutable_types::value::Row,
+        )> = Vec::new();
+        for entry in entries {
+            if entry.seq.0 <= since_seq {
+                continue;
+            }
+            let row = match entry.entry.op_type {
+                merutable_types::sequence::OpType::Put => {
+                    crate::codec::decode_row(&entry.entry.value)?
+                }
+                merutable_types::sequence::OpType::Delete => merutable_types::value::Row::default(),
+            };
+            out.push((entry.seq.0, entry.entry.op_type, row));
+        }
+        out.sort_by_key(|(seq, _, _)| *seq);
+        Ok(out)
+    }
+
     /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()

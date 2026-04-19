@@ -14,22 +14,33 @@
 //!   reader contract. Returns `MeruError::ChangeFeedBelowRetention`
 //!   today; real iteration plumbing lands in Phase 2.
 //!
-//! # Phase 2 (planned)
+//! # Phase 2a (this commit): memtable-only change scan
 //!
-//! - Engine-side merge iterator spanning memtable + L0 + L1..LN with
-//!   seq-based filtering + DELETE pre-image reconstruction via LSM
-//!   point lookup at `seq - 1`.
+//! The [`ChangeFeedCursor`] in-retention path now pulls real
+//! records from `MeruEngine::scan_memtable_changes`. This makes the
+//! feed usable for the un-flushed tail — sufficient for low-latency
+//! subscribers (RO replicas, audit log tailers) as long as they
+//! keep up with the flush cadence.
+//!
+//! DELETE records carry an empty pre-image `Row` in Phase 2a; the
+//! `seq - 1` point-lookup reconstruction arrives in Phase 2c.
+//!
+//! # Phase 2b (planned)
+//!
+//! - Extend the scan to L0 SSTables: open the Parquet files that
+//!   overlap with `(since_seq, read_seq]`, filter by seq column,
+//!   merge into the memtable-sourced result in seq order.
+//!
+//! # Phase 2c (planned)
+//!
+//! - L1..LN scan (seq-range-filtered) + DELETE pre-image
+//!   reconstruction via LSM point lookup at `seq - 1`.
+//!
+//! # Phase 2d (planned)
+//!
 //! - DataFusion `TableProvider` wrapper exposing the iterator as
-//!   `merutable_changes(table, since_seq)` with:
-//!   * tight `statistics()` (rows ≤ `visible_seq - since_seq`)
-//!   * `output_ordering` = seq ASC so `ORDER BY seq` elides a sort
-//!   * seq-range filter pushdown (`Exact`)
-//!   * projection pushdown through row decode
-//! - Retention-bound escalation: callers below `low_water` get a
-//!   structured error with both the requested seq and current
-//!   low-water, so they can escalate to an Iceberg snapshot scan.
-//! - Integration tests covering the full mixed-op contract +
-//!   DELETE pre-image correctness.
+//!   `merutable_changes(table, since_seq)` with tight statistics,
+//!   seq-ordered output, and filter-pushdown (`Exact`).
 //!
 //! # Phase 3 (0.5-beta)
 //!
@@ -39,7 +50,14 @@
 //!   change feed and resolves last-writer-wins per PK.
 //! - Streaming subscription API (pushes new ops vs. polling).
 
-use merutable_types::{value::Row, MeruError, Result};
+use std::sync::Arc;
+
+use merutable_engine::engine::MeruEngine;
+use merutable_types::{
+    sequence::{OpType, SeqNum},
+    value::Row,
+    MeruError, Result,
+};
 
 /// The kind of mutation a change-feed row represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,36 +97,100 @@ pub struct ChangeRecord {
 
 /// Polling cursor over the change feed.
 ///
-/// Issue #29 Phase 2 will implement `next_batch` against a real LSM
-/// iterator. Phase 1 returns the retention-bound error for every
-/// call so callers see the stable error shape ahead of time and can
-/// wire their escalation logic now.
+/// Phase 2a: `next_batch` scans the memtable for ops in
+/// `(since_seq, read_seq]` and returns them. Phase 1's retention-
+/// bound stub is preserved — constructing a cursor with
+/// [`ChangeFeedCursor::new_below_retention`] still returns the
+/// stable error shape on every call.
 pub struct ChangeFeedCursor {
-    since_seq: u64,
-    low_water: u64,
+    inner: CursorInner,
+}
+
+enum CursorInner {
+    Engine {
+        engine: Arc<MeruEngine>,
+        since_seq: u64,
+    },
+    BelowRetention {
+        requested: u64,
+        low_water: u64,
+    },
 }
 
 impl ChangeFeedCursor {
-    /// Open a cursor at `since_seq`. Real impl (Phase 2) takes an
-    /// `Arc<MeruDB>` in read-only mode; this placeholder takes just
-    /// the low-water so the error is meaningful.
-    pub fn new(since_seq: u64, low_water: u64) -> Self {
+    /// Open a cursor that pulls from the running engine's memtable.
+    /// Phase 2a scope: memtable only. Rows with seq in
+    /// `(since_seq, engine.read_seq()]` are returned.
+    pub fn from_engine(engine: Arc<MeruEngine>, since_seq: u64) -> Self {
         Self {
-            since_seq,
-            low_water,
+            inner: CursorInner::Engine { engine, since_seq },
         }
     }
 
-    /// Pull up to `max_rows` records from the feed. Phase 1 returns
-    /// `ChangeFeedBelowRetention` unconditionally — callers can wire
-    /// their escalation path today.
-    pub fn next_batch(&mut self, _max_rows: usize) -> Result<Vec<ChangeRecord>> {
-        // Phase 2 will split into: (a) in-retention case that walks
-        // memtable+SSTables in seq order, (b) below-retention case
-        // that returns this error.
-        Err(MeruError::ChangeFeedBelowRetention {
-            requested: self.since_seq,
-            low_water: self.low_water,
-        })
+    /// Legacy Phase 1 shape — returns `ChangeFeedBelowRetention` on
+    /// every `next_batch` so callers wiring escalation paths can
+    /// keep exercising them.
+    pub fn new_below_retention(requested: u64, low_water: u64) -> Self {
+        Self {
+            inner: CursorInner::BelowRetention {
+                requested,
+                low_water,
+            },
+        }
+    }
+
+    /// Pull up to `max_rows` records from the feed.
+    ///
+    /// Phase 2a scope:
+    /// - Engine-backed cursor walks `scan_memtable_changes`, takes
+    ///   the first `max_rows` ops by seq, and advances `since_seq`
+    ///   past the highest returned seq so the next call continues
+    ///   from there.
+    /// - Below-retention cursor returns the stable error on every
+    ///   call until the caller resets.
+    pub fn next_batch(&mut self, max_rows: usize) -> Result<Vec<ChangeRecord>> {
+        match &mut self.inner {
+            CursorInner::BelowRetention {
+                requested,
+                low_water,
+            } => Err(MeruError::ChangeFeedBelowRetention {
+                requested: *requested,
+                low_water: *low_water,
+            }),
+            CursorInner::Engine { engine, since_seq } => {
+                let read_seq = engine.read_seq();
+                if SeqNum(*since_seq) >= read_seq {
+                    return Ok(Vec::new());
+                }
+                let raw = engine.scan_memtable_changes(*since_seq, read_seq)?;
+                let mut out = Vec::with_capacity(raw.len().min(max_rows));
+                for (seq, op_type, row) in raw.into_iter().take(max_rows) {
+                    let op = match op_type {
+                        OpType::Put => {
+                            // An Update vs. Insert discrimination requires
+                            // knowing whether a prior key existed — that's a
+                            // Phase 2c task (pre-image reconstruction). For
+                            // Phase 2a we tag every Put as Insert. Callers
+                            // tracking write-pattern details are expected to
+                            // opt into the Phase 2c upgrade when it lands.
+                            ChangeOp::Insert
+                        }
+                        OpType::Delete => ChangeOp::Delete,
+                    };
+                    *since_seq = seq;
+                    out.push(ChangeRecord { seq, op, row });
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Current `since_seq` — advances past each batch. Readers
+    /// persisting a resume point read this after `next_batch`.
+    pub fn since_seq(&self) -> u64 {
+        match &self.inner {
+            CursorInner::Engine { since_seq, .. } => *since_seq,
+            CursorInner::BelowRetention { requested, .. } => *requested,
+        }
     }
 }
