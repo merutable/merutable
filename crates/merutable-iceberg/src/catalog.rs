@@ -315,26 +315,13 @@ impl IcebergCatalog {
             let new_manifest = current.apply(txn, new_snapshot_id, &dv_locations)?;
             let metadata_dir = self.base_path.join("metadata");
 
-            // Write manifest JSON (legacy canonical format). Still
-            // written for now so pre-#28 tooling and older merutable
-            // binaries keep reading. Phase 5 will drop this.
-            let meta_path_json = metadata_dir.join(format!("v{new_snapshot_id}.metadata.json"));
-            let json = new_manifest.to_json()?;
-            tokio::fs::write(&meta_path_json, &json)
-                .await
-                .map_err(MeruError::Io)?;
-            tokio::fs::File::open(&meta_path_json)
-                .await
-                .map_err(MeruError::Io)?
-                .sync_all()
-                .await
-                .map_err(MeruError::Io)?;
-
-            // Issue #28 Phase 4: also write the protobuf-encoded
-            // manifest. `read_manifest_payload` (Phase 3) prefers
-            // `.pb` when present — so starting now, every new commit
-            // becomes visible via the protobuf path. The JSON
-            // coexists as a safety net during the dual-read window.
+            // Issue #28 Phase 5: protobuf is the only canonical
+            // write format. JSON reads remain supported in
+            // `read_manifest_payload` for back-compat with
+            // catalogs committed before #28 Phase 4 (when JSON
+            // was the only format) or with Phase 4 dual-write
+            // catalogs that are still in transition. New commits
+            // never write JSON.
             let meta_path_pb = metadata_dir.join(format!("v{new_snapshot_id}.metadata.pb"));
             let pb_bytes = new_manifest.to_protobuf()?;
             tokio::fs::write(&meta_path_pb, &pb_bytes)
@@ -413,8 +400,10 @@ impl IcebergCatalog {
     /// Re-read the current manifest from disk. Used by read-only replicas
     /// to pick up new snapshots written by the primary.
     ///
-    /// Reads `version-hint.text` -> loads the corresponding `v{N}.metadata.json`
-    /// -> updates the in-memory manifest. Returns the new `Version`.
+    /// Reads `version-hint.text` → loads the corresponding manifest via
+    /// `read_manifest_payload` (prefers `.pb`, falls back to legacy
+    /// `.json`) → updates the in-memory manifest. Returns the new
+    /// `Version`.
     pub async fn refresh(&self, schema: Arc<TableSchema>) -> Result<Version> {
         let hint_path = self.base_path.join("version-hint.text");
         let hint = tokio::fs::read_to_string(&hint_path)
@@ -425,12 +414,13 @@ impl IcebergCatalog {
             .parse()
             .map_err(|_| MeruError::Corruption("bad version-hint on refresh".into()))?;
 
-        let meta_path = self
-            .base_path
-            .join("metadata")
-            .join(format!("v{ver}.metadata.json"));
-        let data = tokio::fs::read(&meta_path).await.map_err(MeruError::Io)?;
-        let manifest = Manifest::from_json(&data)?;
+        // Issue #28 Phase 5: prefer the protobuf payload, fall back
+        // to JSON for legacy catalogs. Matches the open-path
+        // dual-read behavior; before Phase 5 this path would
+        // hard-code `.json` and miss pb-only commits.
+        let metadata_dir = self.base_path.join("metadata");
+        let data = read_manifest_payload(&metadata_dir, ver).await?;
+        let manifest = decode_manifest(&data)?;
         let version = manifest.to_version(schema);
 
         let mut current = self.current.lock().await;
@@ -1056,11 +1046,12 @@ mod tests {
         assert_eq!(catalog.current_manifest().await.snapshot_id, 7);
     }
 
-    /// Issue #28 Phase 4: every commit emits BOTH v{N}.metadata.json
-    /// (legacy) AND v{N}.metadata.pb (canonical). Both files must
-    /// exist, must be valid, and must encode the same manifest.
+    /// Issue #28 Phase 5: every commit writes ONLY protobuf.
+    /// JSON is no longer written on commit; reads still accept
+    /// legacy JSON-only catalogs for back-compat (see
+    /// `back_compat_json_only_catalog_still_reads`).
     #[tokio::test]
-    async fn commit_writes_both_json_and_protobuf_manifests() {
+    async fn commit_writes_protobuf_only_phase5() {
         let tmp = tempfile::tempdir().unwrap();
         let schema_arc = Arc::new(test_schema());
         let catalog = IcebergCatalog::open(tmp.path(), test_schema())
@@ -1079,21 +1070,24 @@ mod tests {
         let metadata = tmp.path().join("metadata");
         let json_path = metadata.join("v1.metadata.json");
         let pb_path = metadata.join("v1.metadata.pb");
-        assert!(json_path.exists(), "JSON manifest missing after commit");
-        assert!(pb_path.exists(), "protobuf manifest missing after commit");
+        assert!(
+            !json_path.exists(),
+            "Phase 5: JSON manifest must NOT be written on commit"
+        );
+        assert!(
+            pb_path.exists(),
+            "protobuf manifest is the canonical write path"
+        );
 
-        let json_m = Manifest::from_json(&std::fs::read(&json_path).unwrap()).unwrap();
         let pb_m = Manifest::from_protobuf(&std::fs::read(&pb_path).unwrap()).unwrap();
-        assert_eq!(json_m.snapshot_id, pb_m.snapshot_id);
-        assert_eq!(json_m.entries.len(), pb_m.entries.len());
-        assert_eq!(json_m.entries[0].path, pb_m.entries[0].path);
-        assert_eq!(json_m.table_uuid, pb_m.table_uuid);
+        assert_eq!(pb_m.snapshot_id, 1);
+        assert_eq!(pb_m.entries.len(), 1);
+        assert_eq!(pb_m.entries[0].path, "data/L0/a.parquet");
     }
 
-    /// Reopening after a dual-write commit goes through the
-    /// protobuf path (Phase 3 tiebreak). This is the end-to-end
-    /// proof that write → read via protobuf works without anyone
-    /// manually touching files.
+    /// Reopening after a protobuf-only commit goes through the
+    /// protobuf path unchanged — this is the steady-state path
+    /// post-Phase-5.
     #[tokio::test]
     async fn commit_roundtrip_reopen_through_protobuf() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1111,9 +1105,10 @@ mod tests {
             });
             catalog.commit(&txn, schema_arc.clone()).await.unwrap();
         }
-        // Sanity: remove the JSON so we KNOW the reopen came via
-        // protobuf. If protobuf is missing or busted, open fails.
-        std::fs::remove_file(tmp.path().join("metadata/v1.metadata.json")).unwrap();
+        // Phase 5: JSON is no longer written; this assertion
+        // replaces the Phase-4 "remove JSON to prove pb works"
+        // gate with "assert JSON absent from the start."
+        assert!(!tmp.path().join("metadata/v1.metadata.json").exists());
 
         let catalog = IcebergCatalog::open(tmp.path(), test_schema())
             .await
@@ -1122,6 +1117,47 @@ mod tests {
         assert_eq!(m.snapshot_id, 1);
         assert_eq!(m.entries.len(), 1);
         assert_eq!(m.entries[0].path, "data/L0/x.parquet");
+    }
+
+    /// Issue #28 Phase 5: back-compat read. A catalog committed
+    /// before #28 Phase 4 (JSON-only) still opens cleanly. We
+    /// simulate by writing a JSON manifest manually and checking
+    /// that open + current_manifest surface it.
+    #[tokio::test]
+    async fn back_compat_json_only_catalog_still_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_arc = Arc::new(test_schema());
+        // Open creates v0 (genesis) — then commit writes v1 via pb.
+        // To simulate a pre-Phase-4 catalog, do the commit, then
+        // REPLACE the .pb with a .json file on disk.
+        {
+            let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+                .await
+                .unwrap();
+            let mut txn = SnapshotTransaction::new();
+            txn.add_file(IcebergDataFile {
+                path: "data/L0/legacy.parquet".into(),
+                file_size: 512,
+                num_rows: 50,
+                meta: test_meta(0),
+            });
+            catalog.commit(&txn, schema_arc.clone()).await.unwrap();
+        }
+        // Convert pb → json on disk.
+        let pb_bytes = std::fs::read(tmp.path().join("metadata/v1.metadata.pb")).unwrap();
+        let manifest = Manifest::from_protobuf(&pb_bytes).unwrap();
+        std::fs::remove_file(tmp.path().join("metadata/v1.metadata.pb")).unwrap();
+        let json_bytes = manifest.to_json().unwrap();
+        std::fs::write(tmp.path().join("metadata/v1.metadata.json"), json_bytes).unwrap();
+
+        // Reopen — must surface the JSON manifest unchanged.
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+        let m = catalog.current_manifest().await;
+        assert_eq!(m.snapshot_id, 1);
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].path, "data/L0/legacy.parquet");
     }
 
     /// Orphan-metadata detection recognises both .pb and .json.

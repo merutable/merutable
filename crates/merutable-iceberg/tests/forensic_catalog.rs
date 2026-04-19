@@ -84,9 +84,9 @@ async fn open_creates_dirs_without_manifest() {
     assert!(files.is_empty(), "no metadata files expected: {files:?}");
 }
 
-/// After a single flush commit, exactly one `v1.metadata.json` file
-/// must exist, `version-hint.text` must contain `"1"`, and the JSON
-/// must decode back to a manifest with the right snapshot_id + entry.
+/// Issue #28 Phase 5: after a single flush commit, exactly one
+/// `v1.metadata.pb` file exists (JSON writes were dropped), and
+/// the protobuf decodes to a manifest with the right shape.
 #[tokio::test]
 async fn single_flush_commit_writes_v1_metadata_and_hint() {
     let tmp = tempfile::tempdir().unwrap();
@@ -109,23 +109,22 @@ async fn single_flush_commit_writes_v1_metadata_and_hint() {
     let hint = fs::read_to_string(tmp.path().join("version-hint.text")).unwrap();
     assert_eq!(hint.trim(), "1");
 
-    // Issue #28 Phase 4: commit emits BOTH v1.metadata.json (legacy)
-    // AND v1.metadata.pb (canonical). Assert the set, not the order
-    // (readdir order is FS-dependent).
+    // Issue #28 Phase 5: commit emits ONLY v1.metadata.pb. JSON
+    // is no longer written. Legacy JSON-only catalogs still read
+    // correctly (covered by catalog::tests), but the canonical
+    // write path is protobuf-only.
     let mut names: Vec<_> = fs::read_dir(tmp.path().join("metadata"))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(
-        names,
-        vec!["v1.metadata.json".to_string(), "v1.metadata.pb".to_string(),]
-    );
+    assert_eq!(names, vec!["v1.metadata.pb".to_string()]);
 
-    // The JSON must parse cleanly with the catalog's own decoder.
-    let json = fs::read(tmp.path().join("metadata").join("v1.metadata.json")).unwrap();
-    let m = Manifest::from_json(&json).unwrap();
+    // Decode the protobuf manifest and verify the fields flushed
+    // into the commit round-tripped.
+    let pb = fs::read(tmp.path().join("metadata").join("v1.metadata.pb")).unwrap();
+    let m = Manifest::from_protobuf(&pb).unwrap();
     assert_eq!(m.snapshot_id, 1);
     assert_eq!(m.entries.len(), 1);
     assert_eq!(m.entries[0].path, "data/L0/abc.parquet");
@@ -134,19 +133,11 @@ async fn single_flush_commit_writes_v1_metadata_and_hint() {
     assert_eq!(m.entries[0].dv_offset, None);
     assert_eq!(m.entries[0].dv_length, None);
     assert_eq!(m.properties.get("merutable.job").unwrap(), "flush");
-
-    // Every v*.metadata.json must be valid UTF-8 JSON readable by a
-    // generic parser (external Iceberg readers don't ship merutable
-    // types).
-    let raw: serde_json::Value = serde_json::from_slice(&json).unwrap();
-    assert_eq!(raw["snapshot_id"], serde_json::json!(1));
-    assert!(raw["entries"].is_array());
-    assert!(raw["schema"].is_object());
 }
 
-/// Every commit must produce a new `v{N}.metadata.json` file; older
-/// ones must be preserved so snapshot isolation / time travel works.
-/// The hint must always point at the newest version.
+/// Issue #28 Phase 5: every commit produces a new `v{N}.metadata.pb`
+/// file; older ones must be preserved so snapshot isolation / time
+/// travel works. The hint must always point at the newest version.
 #[tokio::test]
 async fn sequential_commits_preserve_every_metadata_version() {
     let tmp = tempfile::tempdir().unwrap();
@@ -166,14 +157,14 @@ async fn sequential_commits_preserve_every_metadata_version() {
         catalog.commit(&txn, schema.clone()).await.unwrap();
     }
 
-    // All 5 metadata files must exist.
+    // All 5 protobuf metadata files must exist.
     for i in 1..=5 {
         let p = tmp
             .path()
             .join("metadata")
-            .join(format!("v{i}.metadata.json"));
+            .join(format!("v{i}.metadata.pb"));
         assert!(p.exists(), "missing {p:?}");
-        let m = Manifest::from_json(&fs::read(&p).unwrap()).unwrap();
+        let m = Manifest::from_protobuf(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(m.snapshot_id, i as i64);
         assert_eq!(m.entries.len(), i);
     }
@@ -220,9 +211,10 @@ async fn commit_with_dv_writes_real_offset_and_length_to_manifest() {
     txn2.add_dv("data/L0/abc.parquet".into(), dv.clone());
     catalog.commit(&txn2, schema.clone()).await.unwrap();
 
-    // Open the v2.metadata.json as raw bytes (no catalog involvement).
-    let v2 = fs::read(tmp.path().join("metadata").join("v2.metadata.json")).unwrap();
-    let m = Manifest::from_json(&v2).unwrap();
+    // Open v2.metadata.pb as raw bytes (Phase 5: pb is the only
+    // write format). Previously this test read the JSON variant.
+    let v2 = fs::read(tmp.path().join("metadata").join("v2.metadata.pb")).unwrap();
+    let m = Manifest::from_protobuf(&v2).unwrap();
     let l0_entry = m
         .entries
         .iter()
