@@ -430,6 +430,53 @@ max_seq; a single `mark_flushed_seq` after the first post-recovery
 flush then sweeps them off disk, returning the engine to the clean
 steady-state file count.
 
+## 21. Metrics cost is a reviewable ratio, not an absolute
+
+**Seen in**: Issue #14 — the design pressure was "don't regress the
+hot path." The instinct is to make counters configurable and add
+branches. That's worse: the branch is real; the atomic isn't.
+
+**Symptom**: Premature optimization of instrumentation surface.
+Operators can't see what the engine is doing because the engineers
+who built it were too worried about a theoretical 2 ns regression.
+
+**Anti-pattern**: Guarding every metric emission with
+`if metrics_enabled { ... }`. The branch costs as much as the atomic
+it's trying to skip, and the metric is dead code when disabled, so
+nobody learns whether the instrumentation point is well-placed.
+
+**Discipline**: Use a facade (`metrics` crate) that compiles to a
+TLS-cached static-ptr + null check when no recorder is registered.
+No branches, no config flag, no allocations on the hot path. When a
+recorder IS registered, pay the few ns knowingly — operator
+observability is worth it. Histograms stay sampled (once per
+flush/compaction, never per row) so the expensive primitive never
+reaches the per-op budget. merutable Phase 2/3 instrumentation
+landed at zero measurable regression on the memtable insert bench.
+
+## 22. Absence of a repro is a real answer, not an excuse
+
+**Seen in**: Issue #23 — ghost rows under aggressive compaction.
+Symbolic code review across picker, iterator, job commit, catalog
+serialization, flush path, memtable, read path, and cache did not
+identify a specific defect. Write-only stress test ran 60s+ without
+triggering the assertion. Concurrent reader/writer stress test
+fired false-positive ghosts attributable to shadow-update lag, not
+engine state. A reliable repro requires the original 2 GB workload
+plus the specific concurrency shape from the report.
+
+**Anti-pattern**: Committing a speculative "fix" for a bug you can't
+reproduce. Two outcomes, both bad: (a) the fix masks the real bug
+without addressing it, making the eventual repro harder to debug;
+(b) the fix introduces a new regression that IS reproducible, and
+now you own two bugs.
+
+**Discipline**: Ship the investigation scaffolding (ignored repro
+tests, documented hypotheses) and leave the bug open. The next
+person with a repro has a test to bisect against. If the bug is
+real, they'll land the fix; if it was a test-harness artifact, the
+scaffold clarifies that too.
+
 ## Process lessons
 
 - **Audit the whole signal, not just the hot path**. The user-visible
