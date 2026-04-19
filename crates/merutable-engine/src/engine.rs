@@ -715,6 +715,108 @@ impl MeruEngine {
         Ok(out)
     }
 
+    /// Issue #29 Phase 2b: extend the change-feed scan to include
+    /// L0 Parquet files. Every file whose `seq_max > since_seq`
+    /// AND `seq_min <= read_seq` is opened + scanned; rows whose
+    /// internal seq falls in `(since_seq, read_seq]` are decoded
+    /// and returned alongside the memtable ops.
+    ///
+    /// Result is seq-ascending across memtable + L0. Callers treat
+    /// this as the "live-tail" view of the change feed; L1..LN scan
+    /// + DELETE pre-image reconstruction are Phase 2c.
+    pub fn scan_tail_changes(
+        &self,
+        since_seq: u64,
+        read_seq: merutable_types::sequence::SeqNum,
+    ) -> Result<
+        Vec<(
+            u64,
+            merutable_types::sequence::OpType,
+            merutable_types::value::Row,
+        )>,
+    > {
+        use bytes::Bytes;
+        use merutable_iceberg::DeletionVector;
+        use merutable_parquet::reader::ParquetReader;
+        use merutable_types::level::Level;
+
+        // Memtable first so the L0 rows append after the memtable
+        // rows before the final sort. Either order is correct
+        // (sort is the invariant), ordering this way just keeps
+        // memory contiguous on the happy path where the memtable
+        // dominates.
+        let mut out = self.scan_memtable_changes(since_seq, read_seq)?;
+
+        let version = self.version_set.current();
+        let files = version.files_at(Level(0));
+        let base = self.catalog.base_path();
+        for file in files {
+            // Prune files that can't possibly contribute rows in
+            // the requested range. `seq_min/seq_max` are the tight
+            // bounds the compaction iterator + HTAP readers already
+            // rely on.
+            if file.meta.seq_max <= since_seq || file.meta.seq_min > read_seq.0 {
+                continue;
+            }
+
+            let abs_parquet = base.join(&file.path);
+            let parquet_bytes = std::fs::read(&abs_parquet).map_err(MeruError::Io)?;
+            let reader = ParquetReader::open(Bytes::from(parquet_bytes), self.schema.clone())?;
+
+            // DV: skip logically-deleted rows. A row in the file's
+            // DV means a later partial compaction removed it; the
+            // feed aligns with what point lookups / range scans
+            // actually observe.
+            let dv_bitmap = match (&file.dv_path, file.dv_offset, file.dv_length) {
+                (Some(dv_path), Some(offset), Some(length)) => {
+                    let abs_dv = base.join(dv_path);
+                    let puffin_bytes = std::fs::read(&abs_dv).map_err(MeruError::Io)?;
+                    let start = offset as usize;
+                    let end = start
+                        .checked_add(length as usize)
+                        .ok_or_else(|| MeruError::Corruption("DV offset+length overflow".into()))?;
+                    if end > puffin_bytes.len() {
+                        return Err(MeruError::Corruption(format!(
+                            "DV blob out of range: path={dv_path} offset={offset} \
+                             length={length} puffin_len={}",
+                            puffin_bytes.len()
+                        )));
+                    }
+                    Some(
+                        DeletionVector::from_puffin_blob(&puffin_bytes[start..end])?
+                            .bitmap()
+                            .clone(),
+                    )
+                }
+                (None, None, None) => None,
+                _ => {
+                    return Err(MeruError::Corruption(format!(
+                        "inconsistent DV coords on file {}: dv_path={:?} dv_offset={:?} \
+                         dv_length={:?}",
+                        file.path, file.dv_path, file.dv_offset, file.dv_length
+                    )));
+                }
+            };
+
+            let rows = reader.read_physical_rows_with_positions(dv_bitmap.as_ref())?;
+            for (ikey, row, _pos) in rows {
+                let seq = ikey.seq.0;
+                if seq <= since_seq || seq > read_seq.0 {
+                    continue;
+                }
+                let op_row = match ikey.op_type {
+                    merutable_types::sequence::OpType::Put => row,
+                    merutable_types::sequence::OpType::Delete => {
+                        merutable_types::value::Row::default()
+                    }
+                };
+                out.push((seq, ikey.op_type, op_row));
+            }
+        }
+        out.sort_by_key(|(seq, _, _)| *seq);
+        Ok(out)
+    }
+
     /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()

@@ -14,22 +14,25 @@
 //!   reader contract. Returns `MeruError::ChangeFeedBelowRetention`
 //!   today; real iteration plumbing lands in Phase 2.
 //!
-//! # Phase 2a (this commit): memtable-only change scan
+//! # Phase 2a (shipped): memtable-only change scan
 //!
-//! The [`ChangeFeedCursor`] in-retention path now pulls real
-//! records from `MeruEngine::scan_memtable_changes`. This makes the
-//! feed usable for the un-flushed tail — sufficient for low-latency
-//! subscribers (RO replicas, audit log tailers) as long as they
-//! keep up with the flush cadence.
+//! The [`ChangeFeedCursor`] in-retention path pulls real records
+//! from `MeruEngine::scan_memtable_changes`. Sufficient for
+//! low-latency subscribers (RO replicas, audit log tailers) as
+//! long as they keep up with the flush cadence.
 //!
-//! DELETE records carry an empty pre-image `Row` in Phase 2a; the
-//! `seq - 1` point-lookup reconstruction arrives in Phase 2c.
+//! # Phase 2b (this commit): memtable + L0 scan
 //!
-//! # Phase 2b (planned)
+//! The cursor now calls `MeruEngine::scan_tail_changes`, which
+//! extends the scan across L0 Parquet files. Ops that flushed out
+//! of the memtable into L0 stay visible as long as the file lives
+//! in L0 (i.e., until compacted into L1). This lifts the "must
+//! keep up with flush cadence" constraint — subscribers can fall
+//! multiple snapshots behind and still recover without escalating.
 //!
-//! - Extend the scan to L0 SSTables: open the Parquet files that
-//!   overlap with `(since_seq, read_seq]`, filter by seq column,
-//!   merge into the memtable-sourced result in seq order.
+//! DELETE records carry an empty pre-image `Row` in both 2a and
+//! 2b; the `seq - 1` point-lookup reconstruction arrives in
+//! Phase 2c.
 //!
 //! # Phase 2c (planned)
 //!
@@ -162,7 +165,8 @@ impl ChangeFeedCursor {
                 if SeqNum(*since_seq) >= read_seq {
                     return Ok(Vec::new());
                 }
-                let raw = engine.scan_memtable_changes(*since_seq, read_seq)?;
+                // Phase 2b: include L0 as well as the memtable.
+                let raw = engine.scan_tail_changes(*since_seq, read_seq)?;
                 let mut out = Vec::with_capacity(raw.len().min(max_rows));
                 for (seq, op_type, row) in raw.into_iter().take(max_rows) {
                     let op = match op_type {
