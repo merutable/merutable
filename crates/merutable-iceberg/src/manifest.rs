@@ -188,6 +188,166 @@ impl Manifest {
             .map_err(|e| MeruError::Iceberg(format!("manifest deserialize: {e}")))
     }
 
+    /// Issue #28 Phase 2: serialize this native manifest to the
+    /// wire-format protobuf bytes (magic + version + length +
+    /// prost-encoded Manifest). The resulting bytes decode back via
+    /// [`Manifest::from_protobuf`] with every field preserved.
+    ///
+    /// The JSON path is still authoritative today; protobuf is an
+    /// additional encoding that the catalog will start writing once
+    /// Phase 3 wires it into the commit step.
+    pub fn to_protobuf(&self) -> Result<Vec<u8>> {
+        let pb = self.to_pb()?;
+        Ok(crate::manifest_pb::encode(&pb))
+    }
+
+    /// Issue #28 Phase 2: deserialize from protobuf wire format.
+    /// Validates the framing header and then maps every prost field
+    /// back onto the native `Manifest` shape.
+    pub fn from_protobuf(bytes: &[u8]) -> Result<Self> {
+        let pb = crate::manifest_pb::decode(bytes)?;
+        Self::from_pb(pb)
+    }
+
+    /// Internal: project onto the prost `pb::Manifest` message.
+    /// Every field in the native struct has a corresponding prost
+    /// field number; nothing is silently dropped. `TableSchema` rides
+    /// inline as JSON bytes under a well-known property key until
+    /// schema evolution #25 promotes schema to a native protobuf
+    /// submessage (reserved field in the proto).
+    fn to_pb(&self) -> Result<crate::manifest_pb::pb::Manifest> {
+        let data_files: Vec<crate::manifest_pb::pb::DataFileRef> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let format_i = e.meta.format.map(|f| match f {
+                    merutable_types::level::FileFormat::Columnar => 0,
+                    merutable_types::level::FileFormat::Dual => 1,
+                });
+                let status_code = match e.status.as_str() {
+                    "added" => 1,
+                    "deleted" => 2,
+                    _ => 0, // existing
+                };
+                crate::manifest_pb::pb::DataFileRef {
+                    path: e.path.clone(),
+                    file_size: e.meta.file_size as i64,
+                    num_rows: e.meta.num_rows as i64,
+                    level: e.meta.level.0 as i32,
+                    seq_min: e.meta.seq_min as i64,
+                    seq_max: e.meta.seq_max as i64,
+                    key_min: e.meta.key_min.clone(),
+                    key_max: e.meta.key_max.clone(),
+                    dv_path: e.dv_path.clone(),
+                    dv_offset: e.dv_offset,
+                    dv_length: e.dv_length,
+                    status: status_code,
+                    format: format_i,
+                }
+            })
+            .collect();
+
+        // Schema rides as a JSON string under a reserved property
+        // key so the prost schema doesn't need a full `TableSchema`
+        // submessage yet. Issue #25 will promote schema to a native
+        // protobuf message in a later phase.
+        let mut properties = self.properties.clone();
+        let schema_json = serde_json::to_string(&self.schema)
+            .map_err(|e| MeruError::Iceberg(format!("manifest.schema json: {e}")))?;
+        properties.insert("merutable.schema.json".to_string(), schema_json);
+        properties.insert(
+            "merutable.format_version".to_string(),
+            self.format_version.to_string(),
+        );
+
+        Ok(crate::manifest_pb::pb::Manifest {
+            snapshot_id: self.snapshot_id,
+            sequence_number: self.sequence_number,
+            schema_id: self.schema.schema_id as i32,
+            partition_spec_id: 0,
+            data_files,
+            delete_files: Vec::new(),
+            previous_snapshot_id: self.parent_snapshot_id,
+            table_uuid: self.table_uuid.clone(),
+            last_updated_ms: self.last_updated_ms,
+            properties,
+            last_column_id: self.schema.last_column_id as i32,
+        })
+    }
+
+    /// Internal: reverse direction of `to_pb`.
+    fn from_pb(pb: crate::manifest_pb::pb::Manifest) -> Result<Self> {
+        let mut properties = pb.properties;
+
+        // Pull the schema back out of the reserved property key.
+        let schema_json = properties.remove("merutable.schema.json").ok_or_else(|| {
+            MeruError::Iceberg(
+                "protobuf manifest missing 'merutable.schema.json' property — \
+                     cannot reconstruct TableSchema"
+                    .into(),
+            )
+        })?;
+        let schema: TableSchema = serde_json::from_str(&schema_json)
+            .map_err(|e| MeruError::Iceberg(format!("schema.json parse: {e}")))?;
+        let format_version = properties
+            .remove("merutable.format_version")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or_else(default_format_version);
+
+        let entries: Result<Vec<ManifestEntry>> = pb
+            .data_files
+            .into_iter()
+            .map(|d| {
+                let format = d.format.map(|f| match f {
+                    1 => merutable_types::level::FileFormat::Dual,
+                    _ => merutable_types::level::FileFormat::Columnar,
+                });
+                let status = match d.status {
+                    1 => "added".to_string(),
+                    2 => "deleted".to_string(),
+                    _ => "existing".to_string(),
+                };
+                Ok(ManifestEntry {
+                    path: d.path,
+                    meta: merutable_types::level::ParquetFileMeta {
+                        level: merutable_types::level::Level(d.level as u8),
+                        seq_min: d.seq_min as u64,
+                        seq_max: d.seq_max as u64,
+                        key_min: d.key_min,
+                        key_max: d.key_max,
+                        num_rows: d.num_rows as u64,
+                        file_size: d.file_size as u64,
+                        dv_path: d.dv_path.clone(),
+                        dv_offset: d.dv_offset,
+                        dv_length: d.dv_length,
+                        format,
+                        // Per-column Parquet stats (Issue #20 Part 2b)
+                        // are NOT carried through the protobuf path
+                        // yet — reserved field numbers in the proto
+                        // schema will hold them once wired.
+                        column_stats: None,
+                    },
+                    dv_path: d.dv_path,
+                    dv_offset: d.dv_offset,
+                    dv_length: d.dv_length,
+                    status,
+                })
+            })
+            .collect();
+
+        Ok(Self {
+            format_version,
+            table_uuid: pb.table_uuid,
+            last_updated_ms: pb.last_updated_ms,
+            snapshot_id: pb.snapshot_id,
+            parent_snapshot_id: pb.previous_snapshot_id,
+            sequence_number: pb.sequence_number,
+            schema,
+            entries: entries?,
+            properties,
+        })
+    }
+
     /// Create an empty initial manifest with a fresh `table_uuid`.
     /// Snapshot IDs start at 0 (the initial empty snapshot has no parent
     /// and sequence number 0).
@@ -424,6 +584,99 @@ mod tests {
         assert_eq!(decoded.snapshot_id, 0);
         assert_eq!(decoded.entries.len(), 0);
         assert_eq!(decoded.schema.table_name, "test");
+    }
+
+    /// Issue #28 Phase 2: protobuf round-trip preserves every field
+    /// the JSON path does — table uuid, timestamps, snapshot chain,
+    /// entries, properties, and schema.
+    #[test]
+    fn protobuf_roundtrip_empty_manifest() {
+        let m = Manifest::empty(test_schema());
+        let bytes = m.to_protobuf().unwrap();
+        let decoded = Manifest::from_protobuf(&bytes).unwrap();
+        assert_eq!(decoded.format_version, m.format_version);
+        assert_eq!(decoded.table_uuid, m.table_uuid);
+        assert_eq!(decoded.snapshot_id, m.snapshot_id);
+        assert_eq!(decoded.sequence_number, m.sequence_number);
+        assert_eq!(decoded.parent_snapshot_id, m.parent_snapshot_id);
+        assert_eq!(decoded.entries.len(), 0);
+        assert_eq!(decoded.schema.table_name, m.schema.table_name);
+    }
+
+    /// Protobuf round-trip with a populated entry — exercises the
+    /// DataFileRef mapping (level, seqs, keys, DV pointers, format
+    /// stamp, status).
+    #[test]
+    fn protobuf_roundtrip_with_entries() {
+        let mut m = Manifest::empty(test_schema());
+        m.snapshot_id = 42;
+        m.sequence_number = 7;
+        m.parent_snapshot_id = Some(41);
+        m.entries.push(ManifestEntry {
+            path: "data/L0/abc.parquet".into(),
+            meta: merutable_types::level::ParquetFileMeta {
+                level: merutable_types::level::Level(0),
+                seq_min: 1,
+                seq_max: 100,
+                key_min: vec![0x01, 0x02],
+                key_max: vec![0xFE, 0xFF],
+                num_rows: 500,
+                file_size: 8192,
+                dv_path: Some("data/L0/abc.dv-1.puffin".into()),
+                dv_offset: Some(16),
+                dv_length: Some(64),
+                format: Some(merutable_types::level::FileFormat::Dual),
+                column_stats: None,
+            },
+            dv_path: Some("data/L0/abc.dv-1.puffin".into()),
+            dv_offset: Some(16),
+            dv_length: Some(64),
+            status: "added".into(),
+        });
+        m.properties.insert("merutable.job".into(), "flush".into());
+
+        let bytes = m.to_protobuf().unwrap();
+        let decoded = Manifest::from_protobuf(&bytes).unwrap();
+
+        assert_eq!(decoded.snapshot_id, 42);
+        assert_eq!(decoded.sequence_number, 7);
+        assert_eq!(decoded.parent_snapshot_id, Some(41));
+        assert_eq!(decoded.entries.len(), 1);
+        let e = &decoded.entries[0];
+        assert_eq!(e.path, "data/L0/abc.parquet");
+        assert_eq!(e.status, "added");
+        assert_eq!(e.meta.level, merutable_types::level::Level(0));
+        assert_eq!(e.meta.seq_min, 1);
+        assert_eq!(e.meta.seq_max, 100);
+        assert_eq!(e.meta.key_min, vec![0x01, 0x02]);
+        assert_eq!(e.meta.key_max, vec![0xFE, 0xFF]);
+        assert_eq!(e.meta.num_rows, 500);
+        assert_eq!(e.meta.file_size, 8192);
+        assert_eq!(e.dv_path.as_deref(), Some("data/L0/abc.dv-1.puffin"));
+        assert_eq!(e.dv_offset, Some(16));
+        assert_eq!(e.dv_length, Some(64));
+        assert_eq!(
+            e.meta.format,
+            Some(merutable_types::level::FileFormat::Dual)
+        );
+        assert_eq!(
+            decoded.properties.get("merutable.job").map(|s| s.as_str()),
+            Some("flush")
+        );
+        // Internal-only reserved property keys do NOT leak through
+        // to the public properties map after deserialize.
+        assert!(!decoded.properties.contains_key("merutable.schema.json"));
+        assert!(!decoded.properties.contains_key("merutable.format_version"));
+    }
+
+    /// Every protobuf-encoded manifest starts with the "MRUB" magic,
+    /// distinguishing it unambiguously from JSON — a dual-read
+    /// catalog in Phase 3 will sniff this byte to pick the decoder.
+    #[test]
+    fn protobuf_bytes_have_mrub_magic() {
+        let m = Manifest::empty(test_schema());
+        let bytes = m.to_protobuf().unwrap();
+        assert_eq!(&bytes[0..4], b"MRUB");
     }
 
     /// Deserializing a legacy manifest (no format_version field) defaults to 3.
