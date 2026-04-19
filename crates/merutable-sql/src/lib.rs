@@ -94,8 +94,17 @@ pub struct ChangeRecord {
     pub op: ChangeOp,
     /// Full row payload. For `Insert`/`Update` this is the post-state;
     /// for `Delete` this is the pre-image at `seq - 1` reconstructed
-    /// via a point lookup on the LSM.
+    /// via a point lookup on the LSM. Phase 2a/2b still return an
+    /// empty `Row` for deletes — the pre-image reconstruction is
+    /// Phase 2c. Consumers that need only the PK (e.g. replica
+    /// tails applying tombstones) should use `pk_bytes`.
     pub row: Row,
+    /// PK-encoded bytes of the affected key. Populated for every
+    /// op (Insert, Update, Delete) — this is the canonical way to
+    /// address the mutation across the memtable + SSTable scan
+    /// boundary. Replicas key their tail index on these bytes;
+    /// tombstones without a pre-image still carry the PK.
+    pub pk_bytes: Vec<u8>,
 }
 
 /// Polling cursor over the change feed.
@@ -168,21 +177,26 @@ impl ChangeFeedCursor {
                 // Phase 2b: include L0 as well as the memtable.
                 let raw = engine.scan_tail_changes(*since_seq, read_seq)?;
                 let mut out = Vec::with_capacity(raw.len().min(max_rows));
-                for (seq, op_type, row) in raw.into_iter().take(max_rows) {
-                    let op = match op_type {
+                for tuple in raw.into_iter().take(max_rows) {
+                    let op = match tuple.op_type {
                         OpType::Put => {
                             // An Update vs. Insert discrimination requires
                             // knowing whether a prior key existed — that's a
                             // Phase 2c task (pre-image reconstruction). For
-                            // Phase 2a we tag every Put as Insert. Callers
+                            // Phase 2a/b we tag every Put as Insert. Callers
                             // tracking write-pattern details are expected to
                             // opt into the Phase 2c upgrade when it lands.
                             ChangeOp::Insert
                         }
                         OpType::Delete => ChangeOp::Delete,
                     };
-                    *since_seq = seq;
-                    out.push(ChangeRecord { seq, op, row });
+                    *since_seq = tuple.seq;
+                    out.push(ChangeRecord {
+                        seq: tuple.seq,
+                        op,
+                        row: tuple.row,
+                        pk_bytes: tuple.pk_bytes,
+                    });
                 }
                 Ok(out)
             }

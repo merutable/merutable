@@ -19,6 +19,21 @@ use tracing::{info, instrument, warn};
 
 use crate::config::EngineConfig;
 
+/// Issue #29 Phase 2b: one tuple from the change-feed scan. Bundles
+/// the seq + op-type + decoded row + PK bytes for a single op.
+/// Kept as a struct (not a 4-tuple) so callers that only need the
+/// PK — e.g. replica tails applying tombstones — access it by name.
+#[derive(Clone, Debug)]
+pub struct ChangeTuple {
+    pub seq: u64,
+    pub op_type: OpType,
+    /// Post-state row for Put; `Row::default()` for Delete until
+    /// Phase 2c reconstructs the pre-image.
+    pub row: Row,
+    /// PK-encoded bytes — the canonical way to address the mutation.
+    pub pk_bytes: Vec<u8>,
+}
+
 /// The engine. Thread-safe via `Arc<MeruEngine>` — pass it across async tasks.
 pub struct MeruEngine {
     pub(crate) config: EngineConfig,
@@ -681,37 +696,30 @@ impl MeruEngine {
     pub fn scan_memtable_changes(
         &self,
         since_seq: u64,
-        read_seq: merutable_types::sequence::SeqNum,
-    ) -> Result<
-        Vec<(
-            u64,
-            merutable_types::sequence::OpType,
-            merutable_types::value::Row,
-        )>,
-    > {
+        read_seq: SeqNum,
+    ) -> Result<Vec<ChangeTuple>> {
         // Use `snapshot_all_versions` (not `snapshot_entries`) so
         // put+delete pairs on the same key both surface — the
         // point-lookup iterator dedups superseded versions, which
         // is wrong for a change feed.
         let entries = self.memtable.snapshot_all_versions(read_seq);
-        let mut out: Vec<(
-            u64,
-            merutable_types::sequence::OpType,
-            merutable_types::value::Row,
-        )> = Vec::new();
+        let mut out: Vec<ChangeTuple> = Vec::new();
         for entry in entries {
             if entry.seq.0 <= since_seq {
                 continue;
             }
             let row = match entry.entry.op_type {
-                merutable_types::sequence::OpType::Put => {
-                    crate::codec::decode_row(&entry.entry.value)?
-                }
-                merutable_types::sequence::OpType::Delete => merutable_types::value::Row::default(),
+                OpType::Put => crate::codec::decode_row(&entry.entry.value)?,
+                OpType::Delete => merutable_types::value::Row::default(),
             };
-            out.push((entry.seq.0, entry.entry.op_type, row));
+            out.push(ChangeTuple {
+                seq: entry.seq.0,
+                op_type: entry.entry.op_type,
+                row,
+                pk_bytes: entry.user_key.to_vec(),
+            });
         }
-        out.sort_by_key(|(seq, _, _)| *seq);
+        out.sort_by_key(|t| t.seq);
         Ok(out)
     }
 
@@ -724,17 +732,7 @@ impl MeruEngine {
     /// Result is seq-ascending across memtable + L0. Callers treat
     /// this as the "live-tail" view of the change feed; L1..LN scan
     /// + DELETE pre-image reconstruction are Phase 2c.
-    pub fn scan_tail_changes(
-        &self,
-        since_seq: u64,
-        read_seq: merutable_types::sequence::SeqNum,
-    ) -> Result<
-        Vec<(
-            u64,
-            merutable_types::sequence::OpType,
-            merutable_types::value::Row,
-        )>,
-    > {
+    pub fn scan_tail_changes(&self, since_seq: u64, read_seq: SeqNum) -> Result<Vec<ChangeTuple>> {
         use bytes::Bytes;
         use merutable_iceberg::DeletionVector;
         use merutable_parquet::reader::ParquetReader;
@@ -805,15 +803,26 @@ impl MeruEngine {
                     continue;
                 }
                 let op_row = match ikey.op_type {
-                    merutable_types::sequence::OpType::Put => row,
-                    merutable_types::sequence::OpType::Delete => {
-                        merutable_types::value::Row::default()
-                    }
+                    OpType::Put => row,
+                    OpType::Delete => merutable_types::value::Row::default(),
                 };
-                out.push((seq, ikey.op_type, op_row));
+                // Encode pk_bytes from the InternalKey's decoded
+                // pk_values so the tuple carries the same key
+                // encoding the memtable path uses (both go through
+                // `encode_pk_fields` internally).
+                let pk_bytes = merutable_types::key::InternalKey::encode_user_key(
+                    ikey.pk_values(),
+                    &self.schema,
+                )?;
+                out.push(ChangeTuple {
+                    seq,
+                    op_type: ikey.op_type,
+                    row: op_row,
+                    pk_bytes,
+                });
             }
         }
-        out.sort_by_key(|(seq, _, _)| *seq);
+        out.sort_by_key(|t| t.seq);
         Ok(out)
     }
 

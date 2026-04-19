@@ -47,18 +47,15 @@ async fn open_db(tmp: &tempfile::TempDir) -> Arc<MeruDB> {
     )
 }
 
-/// PK extractor used by every test — id column is a plain i64,
-/// encoded as 8-byte big-endian bytes for the hash-map key.
-fn pk_extractor(row: &Row) -> Vec<u8> {
-    match row.fields.first().and_then(|f| f.as_ref()) {
-        Some(FieldValue::Int64(n)) => n.to_be_bytes().to_vec(),
-        // Delete ops in Phase 2a carry empty rows (pre-image
-        // reconstruction is Phase 2c). For the test harness we
-        // can't pick a PK out of an empty row; the real replica
-        // will derive PK from the change-feed record's key
-        // alongside the value once Phase 2c lands.
-        _ => Vec::new(),
-    }
+/// Phase 2b change records carry pk_bytes produced via
+/// `InternalKey::encode_user_key`. Test lookups must use the same
+/// encoding so the hash-map keys match.
+fn pk_bytes(id: i64) -> Vec<u8> {
+    merutable_types::key::InternalKey::encode_user_key(
+        &[merutable_types::value::FieldValue::Int64(id)],
+        &schema(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -76,13 +73,13 @@ async fn advance_absorbs_puts_and_resolves_get() {
 
     let src = InProcessLogSource::new(db.clone());
     let mut tail = ReplicaTail::new();
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
 
     assert_eq!(tail.ops_applied(), 5);
     assert!(tail.visible_seq() >= 5);
 
     for i in 1..=5i64 {
-        let pk = i.to_be_bytes().to_vec();
+        let pk = pk_bytes(i);
         let row = tail.get(&pk).expect("key present");
         match row.fields.get(1).and_then(|f| f.as_ref()) {
             Some(FieldValue::Int64(n)) => assert_eq!(*n, i * 10),
@@ -90,7 +87,7 @@ async fn advance_absorbs_puts_and_resolves_get() {
         }
     }
     // A never-written key is None.
-    assert!(tail.get(&99i64.to_be_bytes()).is_none());
+    assert!(tail.get(&pk_bytes(99)).is_none());
 }
 
 #[tokio::test]
@@ -106,14 +103,14 @@ async fn advance_is_idempotent_across_repeated_calls() {
 
     let src = InProcessLogSource::new(db);
     let mut tail = ReplicaTail::new();
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
     let seq_after_first = tail.visible_seq();
     let ops_after_first = tail.ops_applied();
 
     // Second advance sees nothing new (since_seq = visible_seq
     // already > boundary). ops_applied unchanged, visible_seq
     // unchanged.
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
     assert_eq!(tail.ops_applied(), ops_after_first);
     assert_eq!(tail.visible_seq(), seq_after_first);
 }
@@ -131,7 +128,7 @@ async fn advance_picks_up_new_writes_incrementally() {
 
     let src = InProcessLogSource::new(db.clone());
     let mut tail = ReplicaTail::new();
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
     assert_eq!(tail.ops_applied(), 1);
 
     // Primary writes more; replica advances and picks up only
@@ -149,12 +146,12 @@ async fn advance_picks_up_new_writes_incrementally() {
     .await
     .unwrap();
 
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
     assert_eq!(tail.ops_applied(), 3, "two new ops absorbed");
     assert!(tail.visible_seq() >= 3);
 
     for i in 1..=3i64 {
-        assert!(tail.get(&i.to_be_bytes()).is_some());
+        assert!(tail.get(&pk_bytes(i)).is_some());
     }
 }
 
@@ -177,9 +174,9 @@ async fn put_then_update_resolves_to_latest() {
 
     let src = InProcessLogSource::new(db);
     let mut tail = ReplicaTail::new();
-    tail.advance(&src, pk_extractor).await.unwrap();
+    tail.advance(&src).await.unwrap();
 
-    let row = tail.get(&1i64.to_be_bytes()).unwrap();
+    let row = tail.get(&pk_bytes(1)).unwrap();
     match row.fields.get(1).and_then(|f| f.as_ref()) {
         Some(FieldValue::Int64(n)) => assert_eq!(*n, 999, "latest seq wins"),
         other => panic!("unexpected v: {other:?}"),

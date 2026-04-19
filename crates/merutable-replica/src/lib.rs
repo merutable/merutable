@@ -26,13 +26,16 @@
 //! - **Phase 2 (shipped)**: `InProcessLogSource` — a `LogSource`
 //!   implementation that pulls from a co-located `Arc<MeruDB>` via
 //!   #29 Phase 2a's `ChangeFeedCursor`.
-//! - **Phase 3a (this commit)**: `ReplicaTail` — in-memory tail
-//!   state + `advance()` that replays ops from any `LogSource`.
-//!   PK-indexed `get()` resolves last-writer-wins. No object-store
-//!   base yet; the replica's view is tail-only.
-//! - **Phase 3b (planned)**: fold in an object-store base mount —
-//!   `MeruDB::open_read_only(CommitMode::ObjectStore)` — so reads
-//!   fall through to the mirror when a PK isn't in the tail.
+//! - **Phase 3a (shipped)**: `ReplicaTail` — in-memory tail state +
+//!   `advance()` that replays ops from any `LogSource`. PK-indexed
+//!   `get()` resolves last-writer-wins.
+//! - **Phase 3b (this commit)**: `Replica` — composite type that
+//!   pairs a read-only base `MeruDB` with a `ReplicaTail`. Reads
+//!   go tail-first, then fall through to the base on miss. Base
+//!   opens as POSIX today; once #26 Phase 4 lands the
+//!   engine-integrated `CommitMode::ObjectStore` open path, the
+//!   same Replica shape serves remote readers against a #31
+//!   mirror destination unchanged.
 //! - **Phase 4 (planned)**: hot-swap rebase worker + drain TTL.
 //! - **Phase 5 (planned)**: metrics surface, log-gap recovery,
 //!   stress test harness.
@@ -55,6 +58,10 @@ pub struct OpRecord {
     pub seq: u64,
     pub op: ChangeOp,
     pub row: Row,
+    /// PK-encoded bytes of the affected key. Populated for every
+    /// op, including deletes where `row` is empty. Replicas key
+    /// their tail index on these bytes.
+    pub pk_bytes: Vec<u8>,
 }
 
 /// A log source's view of the replica's starting point was below
@@ -204,6 +211,7 @@ impl LogSource for InProcessLogSource {
                     seq: r.seq,
                     op: r.op,
                     row: r.row,
+                    pk_bytes: r.pk_bytes,
                 }));
             }
         }
@@ -331,24 +339,123 @@ impl ReplicaTail {
         self.ops_applied += 1;
     }
 
-    /// Drain a log-source stream into the tail. The caller supplies
-    /// `pk_extractor` because the replica doesn't know the schema
-    /// until Phase 3b; Phase 3a's tests pass a closure that
-    /// encodes the PK from the Row.
-    pub async fn advance<S, F>(&mut self, source: &S, mut pk_extractor: F) -> Result<()>
+    /// Drain a log-source stream into the tail. Each `OpRecord`
+    /// now carries its `pk_bytes` directly (#29 Phase 2b), so the
+    /// tail no longer needs a caller-supplied extractor — it
+    /// simply uses `rec.pk_bytes`.
+    pub async fn advance<S>(&mut self, source: &S) -> Result<()>
     where
         S: LogSource + ?Sized,
-        F: FnMut(&merutable_types::value::Row) -> Vec<u8>,
     {
         use futures::stream::StreamExt;
         let since = self.visible_seq;
         let mut stream = source.stream(since).await?;
         while let Some(rec) = stream.next().await {
             let rec = rec?;
-            let pk = pk_extractor(&rec.row);
+            let pk = rec.pk_bytes.clone();
             self.apply(pk, rec);
         }
         Ok(())
+    }
+}
+
+/// Issue #32 Phase 3b: composite replica — base `MeruDB` + tail.
+///
+/// Reads go tail-first: if the tail has a live entry for the PK,
+/// return it. If the tail has a tombstone, return None (the tail
+/// records the delete). If the tail has nothing for the PK, fall
+/// through to the base `MeruDB::get` (which reads the object-store
+/// snapshot the replica is mounted against).
+///
+/// `advance()` drains the `LogSource` into the tail using the
+/// schema-derived PK extractor. Callers typically run this on a
+/// timer or driven by `LogSource::latest_seq` polls.
+///
+/// Scope (Phase 3b):
+/// - Base is opened read-only against a POSIX catalog today. Once
+///   `MeruDB::open` accepts `CommitMode::ObjectStore` end-to-end
+///   (#26 Phase 4), the same shape serves a remote reader against
+///   a #31 mirror destination.
+/// - No rebase. The tail grows unbounded until Phase 4 adds hot-
+///   swap rebase on mirror advance.
+/// - Pre-image reconstruction for delete ops depends on #29 Phase
+///   2c; until then, a tail delete simply hides the base row.
+pub struct Replica {
+    base: std::sync::Arc<merutable::MeruDB>,
+    tail: tokio::sync::RwLock<ReplicaTail>,
+    log_source: std::sync::Arc<dyn LogSource>,
+    schema: std::sync::Arc<merutable_types::schema::TableSchema>,
+}
+
+impl Replica {
+    /// Open a replica. `base_options` must set `read_only(true)` —
+    /// the replica never originates writes. The `log_source` supplies
+    /// the tail stream; construction does NOT drain it, so the caller
+    /// chooses when to catch up.
+    pub async fn open(
+        mut base_options: merutable::OpenOptions,
+        log_source: std::sync::Arc<dyn LogSource>,
+    ) -> Result<Self> {
+        base_options = base_options.read_only(true);
+        let schema = std::sync::Arc::new(base_options.schema.clone());
+        let base = std::sync::Arc::new(merutable::MeruDB::open(base_options).await?);
+        Ok(Self {
+            base,
+            tail: tokio::sync::RwLock::new(ReplicaTail::new()),
+            log_source,
+            schema,
+        })
+    }
+
+    /// Drain new ops from the log source into the tail. Idempotent
+    /// across repeated calls — the tail's `visible_seq` is passed as
+    /// `since` so already-absorbed ops are silently skipped by the
+    /// source's range filter.
+    pub async fn advance(&self) -> Result<()> {
+        let mut tail = self.tail.write().await;
+        tail.advance(self.log_source.as_ref()).await
+    }
+
+    /// Point lookup. Tail-first, base-fallback.
+    ///
+    /// Semantics for the tail-first walk:
+    /// - Tail has a Put/Update for the key → return the row.
+    /// - Tail has a Delete for the key → return `None` (delete is
+    ///   authoritative; tail is newer than the base's snapshot).
+    /// - Tail has no entry → fall through to `base.get()`.
+    ///
+    /// The second bullet is the crucial distinction from a naïve
+    /// `tail.get().or_else(base.get)`. A Delete in the tail means
+    /// "the primary observed a delete at seq > base_seq"; the base
+    /// may still have the row because its snapshot predates the
+    /// delete. Returning `None` here matches the semantics a reader
+    /// on the primary would observe.
+    pub async fn get(
+        &self,
+        pk_values: &[merutable_types::value::FieldValue],
+    ) -> Result<Option<merutable_types::value::Row>> {
+        let encoded = merutable_types::key::InternalKey::encode_user_key(pk_values, &self.schema)?;
+        {
+            let tail = self.tail.read().await;
+            if tail.index.contains_key(&encoded) {
+                // Authoritative: Put returns the row, Delete returns None.
+                return Ok(tail.get(&encoded).cloned());
+            }
+        }
+        self.base.get(pk_values)
+    }
+
+    /// Reader-visible seq. Equals the tail's visible_seq — the
+    /// base's snapshot id is tracked separately via `base_seq()`
+    /// because the two advance at different rates.
+    pub async fn visible_seq(&self) -> u64 {
+        self.tail.read().await.visible_seq()
+    }
+
+    /// Base snapshot's current seq. Same as the underlying
+    /// `MeruDB::read_seq`.
+    pub fn base_seq(&self) -> u64 {
+        self.base.read_seq().0
     }
 }
 
