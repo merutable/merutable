@@ -89,6 +89,14 @@ pub struct MirrorWorker {
     /// integration tests + future Phase 3 `stats()` plumbing can
     /// read it without reaching into the worker's internals.
     mirror_seq: Arc<AtomicI64>,
+    /// Issue #31 Phase 4: wall-clock seconds-since-UNIX-epoch at
+    /// the last successful upload. Zero means "never uploaded"; any
+    /// positive value means "last upload finished at t=value".
+    /// `mirror_lag_secs()` subtracts from `now` to produce the lag.
+    /// Stored as i64 in seconds (not Instant) so reading it from a
+    /// non-async context — a metrics exporter thread — doesn't need
+    /// access to the tokio runtime.
+    last_upload_unix_secs: Arc<AtomicI64>,
 }
 
 impl MirrorWorker {
@@ -99,17 +107,20 @@ impl MirrorWorker {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(Notify::new());
         let mirror_seq = Arc::new(AtomicI64::new(0));
+        let last_upload = Arc::new(AtomicI64::new(0));
         let flag = shutdown_flag.clone();
         let notify = shutdown_notify.clone();
         let seq = mirror_seq.clone();
+        let last = last_upload.clone();
         let handle = tokio::spawn(async move {
-            mirror_loop(engine, config, flag, notify, seq).await;
+            mirror_loop(engine, config, flag, notify, seq, last).await;
         });
         Self {
             shutdown_flag,
             shutdown_notify,
             handle: Some(handle),
             mirror_seq,
+            last_upload_unix_secs: last_upload,
         }
     }
 
@@ -119,6 +130,23 @@ impl MirrorWorker {
     /// tick.
     pub fn mirror_seq(&self) -> i64 {
         self.mirror_seq.load(Ordering::Relaxed)
+    }
+
+    /// Issue #31 Phase 4: seconds since the last successful upload.
+    /// `None` when the worker has never successfully uploaded;
+    /// `Some(n)` with n >= 0 otherwise. Computed from the current
+    /// wall clock, so repeated calls without a new upload return
+    /// monotonically-increasing values.
+    pub fn mirror_lag_secs(&self) -> Option<u64> {
+        let last = self.last_upload_unix_secs.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(last);
+        Some((now - last).max(0) as u64)
     }
 
     /// Signal the worker to shut down and await its exit.
@@ -142,10 +170,15 @@ async fn mirror_loop(
     shutdown_flag: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     mirror_seq: Arc<AtomicI64>,
+    last_upload_unix_secs: Arc<AtomicI64>,
 ) {
     info!("mirror worker started (Issue #31 Phase 2b — observe + upload)");
     let catalog_path = PathBuf::from(engine.catalog_path());
     let mut last_uploaded: i64 = 0;
+    // Phase 4: alert when lag exceeds `max_lag_alert_secs` AND at
+    // least one upload has happened. Without the "at least one"
+    // guard a never-written catalog would fire false alerts forever.
+    let alert_threshold = config.max_lag_alert_secs;
     loop {
         if shutdown_flag.load(Ordering::SeqCst) {
             break;
@@ -161,6 +194,11 @@ async fn mirror_loop(
                     );
                     last_uploaded = current;
                     mirror_seq.store(current, Ordering::Relaxed);
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    last_upload_unix_secs.store(now_secs, Ordering::Relaxed);
                 }
                 Err(e) => {
                     // Don't update last_uploaded so the next tick
@@ -180,6 +218,30 @@ async fn mirror_loop(
                 snapshot_id = current,
                 "mirror worker tick — no new snapshot"
             );
+        }
+
+        // Phase 4: lag-alert check runs every tick, independent of
+        // whether an upload just happened. Surfaces the common bad
+        // case — primary committing, mirror lagging because the
+        // destination is slow — without spamming on each tick by
+        // only warning once per alert_threshold window.
+        let last = last_upload_unix_secs.load(Ordering::Relaxed);
+        if last > 0 && alert_threshold > 0 {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(last);
+            let lag = (now_secs - last).max(0) as u64;
+            if lag >= alert_threshold {
+                warn!(
+                    mirror_lag_secs = lag,
+                    max_lag_alert_secs = alert_threshold,
+                    mirror_seq = last_uploaded,
+                    primary_snapshot_id = current,
+                    "mirror worker: upload lag exceeded alert threshold — no backpressure, \
+                     destination may be slow or unreachable"
+                );
+            }
         }
 
         // Wait for either the poll interval or an explicit shutdown
@@ -362,6 +424,75 @@ mod tests {
         let mut worker = MirrorWorker::spawn(engine, MirrorConfig::new(store));
         worker.shutdown().await;
         worker.shutdown().await; // must not panic
+    }
+
+    /// Phase 4: `mirror_lag_secs()` is None until the first upload,
+    /// then Some(0..N) afterwards.
+    #[tokio::test]
+    async fn mirror_lag_transitions_from_none_to_some() {
+        use merutable_iceberg::{
+            snapshot::{IcebergDataFile, SnapshotTransaction},
+            IcebergCatalog,
+        };
+        use merutable_types::level::{Level, ParquetFileMeta};
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+
+        let schema_arc = std::sync::Arc::new(schema());
+        let catalog = IcebergCatalog::open(tmp.path(), schema_arc.as_ref().clone())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("data/L0"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("data/L0/a.parquet"), b"body")
+            .await
+            .unwrap();
+        let mut txn = SnapshotTransaction::new();
+        txn.add_file(IcebergDataFile {
+            path: "data/L0/a.parquet".into(),
+            file_size: 4,
+            num_rows: 1,
+            meta: ParquetFileMeta {
+                level: Level(0),
+                seq_min: 1,
+                seq_max: 1,
+                key_min: vec![0],
+                key_max: vec![0],
+                num_rows: 1,
+                file_size: 4,
+                dv_path: None,
+                dv_offset: None,
+                dv_length: None,
+                format: None,
+                column_stats: None,
+            },
+        });
+        catalog.commit(&txn, schema_arc).await.unwrap();
+
+        let engine = MeruEngine::open(engine_config(&tmp)).await.unwrap();
+        let store = Arc::new(LocalFileStore::new(mirror_dir.path()).unwrap());
+        let cfg = MirrorConfig::new(store);
+        let worker = MirrorWorker::spawn(engine.clone(), cfg.clone());
+
+        // Before any upload: lag is None.
+        assert_eq!(worker.mirror_lag_secs(), None);
+
+        // Drive a synchronous upload via the public mirror_snapshot
+        // helper, then poke last_upload_unix_secs by hand — the test
+        // proves the accessor math, not the worker's tick timing.
+        super::mirror_snapshot(&engine, &PathBuf::from(engine.catalog_path()), &cfg, 1)
+            .await
+            .unwrap();
+        worker.last_upload_unix_secs.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            Ordering::Relaxed,
+        );
+        let lag = worker.mirror_lag_secs().expect("lag is Some after upload");
+        assert!(lag < 10, "lag should be near-zero on fresh upload: {lag}");
     }
 
     /// Phase 2b: `mirror_snapshot` uploads data files AND the

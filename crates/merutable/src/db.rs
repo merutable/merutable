@@ -293,6 +293,19 @@ impl MeruDB {
         guard.as_ref().map(|w| w.mirror_seq())
     }
 
+    /// Issue #31 Phase 4: seconds since the last successful mirror
+    /// upload. `None` when no mirror is attached OR the worker
+    /// hasn't completed an upload yet. `Some(n)` with n monotonically
+    /// growing between uploads, reset on each successful tick.
+    ///
+    /// Exceeds `max_lag_alert_secs` → the worker also emits a
+    /// `tracing::warn!` with the lag value; this accessor lets
+    /// metrics exporters plot the same value as a gauge.
+    pub async fn mirror_lag_secs(&self) -> Option<u64> {
+        let guard = self.mirror_worker.lock().await;
+        guard.as_ref().and_then(|w| w.mirror_lag_secs())
+    }
+
     /// Catalog base directory path (for HTAP file access).
     pub fn catalog_path(&self) -> String {
         self.engine.catalog_path()
