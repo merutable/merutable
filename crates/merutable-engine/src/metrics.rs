@@ -94,6 +94,42 @@ pub const SCAN_ROWS_TOTAL: &str = "merutable.read.scan_rows_total";
 pub const ROW_CACHE_HITS_TOTAL: &str = "merutable.read.row_cache_hits_total";
 pub const ROW_CACHE_MISSES_TOTAL: &str = "merutable.read.row_cache_misses_total";
 
+// ── Phase 3: histograms (sampled, not per-op) ────────────────────────
+//
+// Histograms are the expensive primitive. These are bumped ONCE per
+// flush / compaction / commit — never per row. The issue explicitly
+// forbids per-op histograms for cost reasons.
+//
+// All durations are in seconds (SI-friendly, matches Prometheus
+// convention). Operator dashboards can convert to ms/µs as needed.
+pub const FLUSH_DURATION_SECONDS: &str = "merutable.flush.duration_seconds";
+pub const FLUSH_OUTPUT_BYTES: &str = "merutable.flush.output_bytes";
+pub const COMPACTION_DURATION_SECONDS: &str = "merutable.compaction.duration_seconds";
+pub const COMPACTION_OUTPUT_BYTES: &str = "merutable.compaction.output_bytes";
+pub const COMMIT_DURATION_SECONDS: &str = "merutable.catalog.commit_duration_seconds";
+
+/// Phase 3: record a histogram sample. `value` is the observation
+/// (typically seconds for durations, bytes for sizes). Cheap when no
+/// recorder is registered — same TLS-cached null-check path as
+/// counters.
+#[inline]
+pub fn record(name: &'static str, value: f64) {
+    metrics::histogram!(name).record(value);
+}
+
+/// Phase 3: record a histogram sample with a single static label.
+/// Used for per-output-level compaction histograms — bounded
+/// cardinality (levels 1..5) so no label explosion risk.
+#[inline]
+pub fn record_labeled(
+    name: &'static str,
+    label_key: &'static str,
+    label_value: String,
+    value: f64,
+) {
+    metrics::histogram!(name, label_key => label_value).record(value);
+}
+
 // ── Phase-1 helper ──────────────────────────────────────────────────
 
 /// Increment a counter by 1. Cheaper than constructing a `Counter`

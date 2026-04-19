@@ -326,6 +326,12 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
             return Ok(false);
         }
     };
+    // Issue #14 Phase 3: compaction-job wall-clock duration. Includes
+    // source-file read, merge, output write, and commit. Sampled once
+    // per job — never per row. Labeled by output level so operators
+    // see which tier is slow without per-file cardinality.
+    let job_started_at = std::time::Instant::now();
+    let output_level_str = format!("L{}", pick.output_level.0);
 
     info!(
         input_level = pick.input_level.0,
@@ -593,7 +599,13 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     // merge work.
     let new_version = {
         let _commit_guard = engine.commit_lock.lock().await;
-        engine.catalog.commit(&txn, engine.schema.clone()).await?
+        let commit_started = std::time::Instant::now();
+        let v = engine.catalog.commit(&txn, engine.schema.clone()).await?;
+        crate::metrics::record(
+            crate::metrics::COMMIT_DURATION_SECONDS,
+            commit_started.elapsed().as_secs_f64(),
+        );
+        v
     };
     engine.version_set.install(new_version);
 
@@ -618,6 +630,21 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
             overlap_output_metas.len() as u64,
         );
     }
+
+    // Issue #14 Phase 3: compaction duration + output bytes, labeled
+    // by output level. Sampled once per job (not per row) so per-op
+    // overhead is zero.
+    let output_bytes_total: u64 = txn.adds.iter().map(|f| f.file_size).sum();
+    crate::metrics::record_labeled(
+        crate::metrics::COMPACTION_DURATION_SECONDS,
+        "output_level",
+        output_level_str,
+        job_started_at.elapsed().as_secs_f64(),
+    );
+    crate::metrics::record(
+        crate::metrics::COMPACTION_OUTPUT_BYTES,
+        output_bytes_total as f64,
+    );
 
     // IMP-03: clear the row cache after compaction. Compaction rewrites
     // files and resolves MVCC versions — any entry cached from a now-obsolete

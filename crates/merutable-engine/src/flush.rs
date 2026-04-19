@@ -36,6 +36,13 @@ use crate::engine::MeruEngine;
 #[instrument(skip(engine), fields(op = "flush"))]
 pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     let _flush_guard = engine.flush_mutex.lock().await;
+    // Issue #14 Phase 3: sample wall-clock duration of the whole
+    // flush job (lock-held + merge + write + commit). Emitted once
+    // per flush, not per row — off the hot path. Started AFTER the
+    // mutex acquisition so the histogram reflects flush-work time,
+    // not queue-time; flush-mutex contention is visible separately
+    // via the flush-in-flight gauge (future work).
+    let flush_started_at = std::time::Instant::now();
 
     let immutable = match engine.memtable.oldest_immutable() {
         Some(m) => m,
@@ -216,7 +223,16 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
     // this lock. The commit itself is brief (single fsync chain).
     let new_version = {
         let _commit_guard = engine.commit_lock.lock().await;
-        engine.catalog.commit(&txn, engine.schema.clone()).await?
+        // Issue #14 Phase 3: per-commit duration histogram. Sampled
+        // once per snapshot; includes the puffin-upload + manifest-
+        // write + version-hint-rename chain.
+        let commit_started = std::time::Instant::now();
+        let v = engine.catalog.commit(&txn, engine.schema.clone()).await?;
+        crate::metrics::record(
+            crate::metrics::COMMIT_DURATION_SECONDS,
+            commit_started.elapsed().as_secs_f64(),
+        );
+        v
     };
     engine.version_set.install(new_version);
 
@@ -234,6 +250,13 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
 
     // Drop flushed memtable + notify stalled writers.
     engine.memtable.drop_flushed(first_seq);
+
+    // Issue #14 Phase 3: flush duration + output size histograms.
+    crate::metrics::record(
+        crate::metrics::FLUSH_DURATION_SECONDS,
+        flush_started_at.elapsed().as_secs_f64(),
+    );
+    crate::metrics::record(crate::metrics::FLUSH_OUTPUT_BYTES, file_size as f64);
 
     Ok(())
 }

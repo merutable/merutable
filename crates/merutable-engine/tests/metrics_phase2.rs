@@ -21,6 +21,7 @@ use tempfile::TempDir;
 #[derive(Default)]
 struct CounterSink {
     counts: Mutex<HashMap<String, u64>>,
+    histograms: Mutex<HashMap<String, Vec<f64>>>,
 }
 
 impl CounterSink {
@@ -34,6 +35,33 @@ impl CounterSink {
             .unwrap()
             .entry(name.to_string())
             .or_insert(0) += n;
+    }
+    fn histogram_samples(&self, name: &str) -> Vec<f64> {
+        self.histograms
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn record_histogram(&self, name: &str, value: f64) {
+        self.histograms
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default()
+            .push(value);
+    }
+}
+
+struct SinkHistogram {
+    sink: Arc<CounterSink>,
+    name: String,
+}
+
+impl metrics::HistogramFn for SinkHistogram {
+    fn record(&self, value: f64) {
+        self.sink.record_histogram(&self.name, value);
     }
 }
 
@@ -98,10 +126,14 @@ impl metrics::Recorder for TestRecorder {
     }
     fn register_histogram(
         &self,
-        _key: &metrics::Key,
+        key: &metrics::Key,
         _metadata: &metrics::Metadata<'_>,
     ) -> metrics::Histogram {
-        metrics::Histogram::noop()
+        let name = key.name().to_string();
+        metrics::Histogram::from_arc(Arc::new(SinkHistogram {
+            sink: self.sink.clone(),
+            name,
+        }))
     }
 }
 
@@ -110,6 +142,10 @@ impl metrics::Recorder for TestRecorder {
 // `#[test]` runs in the same binary share the same sink without
 // double-registration panics.
 static SINK: std::sync::OnceLock<Arc<CounterSink>> = std::sync::OnceLock::new();
+// Tests that read/write the shared sink must serialize; parallel
+// execution mixes counter increments. Use a tokio async mutex since
+// the test bodies hold this across await points.
+static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn install_once() -> Arc<CounterSink> {
     SINK.get_or_init(|| {
@@ -166,6 +202,7 @@ fn make_row(id: i64) -> Row {
 
 #[tokio::test]
 async fn put_get_delete_scan_fire_phase2_counters() {
+    let _serial = TEST_SERIAL.lock().await;
     let sink = install_once();
     let before_put = sink.get("merutable.write.puts_total");
     let before_del = sink.get("merutable.write.deletes_total");
@@ -223,6 +260,61 @@ async fn put_get_delete_scan_fire_phase2_counters() {
         9,
         "scan returned 9 rows"
     );
+
+    engine.close().await.unwrap();
+}
+
+/// Issue #14 Phase 3: flush and commit duration histograms record
+/// samples once per flush job — sampled post-operation, never per row.
+#[tokio::test]
+async fn flush_and_commit_duration_histograms_record_samples() {
+    let _serial = TEST_SERIAL.lock().await;
+    let sink = install_once();
+    let before_flush = sink
+        .histogram_samples("merutable.flush.duration_seconds")
+        .len();
+    let before_commit = sink
+        .histogram_samples("merutable.catalog.commit_duration_seconds")
+        .len();
+    let before_bytes = sink.histogram_samples("merutable.flush.output_bytes").len();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine: Arc<MeruEngine> = MeruEngine::open(config(&tmp)).await.unwrap();
+
+    for i in 0..20i64 {
+        engine
+            .put(vec![FieldValue::Int64(i)], make_row(i))
+            .await
+            .unwrap();
+    }
+    engine.flush().await.unwrap();
+
+    let flush_samples = sink.histogram_samples("merutable.flush.duration_seconds");
+    let commit_samples = sink.histogram_samples("merutable.catalog.commit_duration_seconds");
+    let bytes_samples = sink.histogram_samples("merutable.flush.output_bytes");
+
+    assert_eq!(
+        flush_samples.len() - before_flush,
+        1,
+        "exactly one flush-duration sample per flush call"
+    );
+    assert_eq!(
+        commit_samples.len() - before_commit,
+        1,
+        "exactly one commit-duration sample per flush commit"
+    );
+    assert_eq!(
+        bytes_samples.len() - before_bytes,
+        1,
+        "exactly one flush-output-bytes sample per flush"
+    );
+
+    // Durations are positive finite seconds. Output bytes are > 0
+    // because 20 rows went to disk.
+    let last_flush = flush_samples.last().copied().unwrap();
+    let last_bytes = bytes_samples.last().copied().unwrap();
+    assert!(last_flush > 0.0 && last_flush.is_finite());
+    assert!(last_bytes > 0.0);
 
     engine.close().await.unwrap();
 }
