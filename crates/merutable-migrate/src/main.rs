@@ -21,12 +21,15 @@
 //!   single transaction adding every copied file (v2). No DV
 //!   migration yet — a source catalog with non-empty DVs errors out;
 //!   Phase 3b will extend the copy step to puffin blobs.
-//! - Phase 4a (this commit): `--verify` re-reads every destination
+//! - Phase 4a (shipped): `--verify` re-reads every destination
 //!   file and SHA-256 compares against the source. Catches silent
 //!   corruption / truncation beyond what tokio::fs::copy's OK return
 //!   proves.
-//! - Phase 4b (planned): `--resume` (re-entrant after crash),
-//!   `--keep-source` / `--delete-source` lifecycle.
+//! - Phase 4b (this commit): `--resume` makes a re-run against an
+//!   already-migrated destination idempotent. Destinations whose
+//!   committed manifest diverges from the source are rejected with a
+//!   clear error pointing at cross-migration conflicts.
+//! - Phase 4c (planned): `--keep-source` / `--delete-source` lifecycle.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -195,6 +198,7 @@ async fn execute_posix_to_object_store(
     copy_parallelism: usize,
     source_schema: TableSchema,
     source_manifest_entries: &[merutable_iceberg::manifest::ManifestEntry],
+    resume: bool,
 ) -> Result<i64> {
     // Inspect the source manifest entries directly (not the plan)
     // because DV coordinates live on `ManifestEntry` or
@@ -228,6 +232,51 @@ async fn execute_posix_to_object_store(
     // Open the destination catalog: writes genesis v1 (empty) if the
     // destination is a fresh directory; otherwise re-uses HEAD.
     let catalog = ObjectStoreCatalog::open(store.clone(), source_schema).await?;
+
+    // Phase 4b: `--resume`. If the destination already contains the
+    // full migrated state (HEAD > 1 AND every source file is live on
+    // the destination manifest), skip both copy and commit. This
+    // makes a crashed-after-commit migration re-runnable without
+    // error or duplicated work.
+    //
+    // Without --resume, re-running against a committed destination
+    // would attempt to write a second "all files added" transaction,
+    // producing either duplicate entries or an applier error depending
+    // on the source state. --resume opts into the short-circuit.
+    if resume {
+        let dst_manifest = catalog.current_manifest().await;
+        if dst_manifest.snapshot_id > 1 {
+            let dst_live: std::collections::HashSet<&str> = dst_manifest
+                .entries
+                .iter()
+                .filter(|e| e.status != "deleted")
+                .map(|e| e.path.as_str())
+                .collect();
+            let src_live: std::collections::HashSet<&str> = source_manifest_entries
+                .iter()
+                .filter(|e| e.status != "deleted")
+                .map(|e| e.path.as_str())
+                .collect();
+            if dst_live == src_live {
+                return Ok(dst_manifest.snapshot_id);
+            }
+            // HEAD > 1 but file set differs — the destination was
+            // committed for a different migration. Refuse to overwrite.
+            return Err(MeruError::InvalidArgument(format!(
+                "--resume: destination at v{} has {} live files but source has {} — \
+                 file sets differ. This is NOT a resumable state; either the \
+                 destination was used for a different migration or the source \
+                 has evolved. Manual intervention required.",
+                dst_manifest.snapshot_id,
+                dst_live.len(),
+                src_live.len(),
+            )));
+        }
+        // HEAD == 1 (genesis-only) — resume proceeds as a normal
+        // migration; the only cost is redundant copies for files that
+        // were transferred before the earlier crash (tokio::fs::copy
+        // overwrites safely).
+    }
 
     // Copy phase. We deliberately copy BEFORE we write to the dest
     // catalog so that a crash mid-copy never leaves the catalog
@@ -503,6 +552,7 @@ fn run() -> std::result::Result<(), (i32, String)> {
                 args.copy_parallelism,
                 schema,
                 &entries,
+                args.resume,
             ))
             .map_err(|e| (8, format!("execute migration: {e}")))?;
         eprintln!(
@@ -710,6 +760,7 @@ mod tests {
             /*copy_parallelism=*/ 2,
             source_manifest.schema.clone(),
             &source_manifest.entries,
+            /*resume=*/ false,
         )
         .await
         .unwrap();
@@ -800,6 +851,140 @@ mod tests {
         assert!(msg.contains("mismatch"), "error must name mismatch: {msg}");
     }
 
+    /// Phase 4b: `--resume` against an already-migrated destination
+    /// short-circuits and returns the existing HEAD instead of
+    /// trying to re-commit. Rerunning a successful migration must
+    /// therefore be idempotent.
+    #[tokio::test]
+    async fn resume_after_successful_migration_is_idempotent() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(src.path(), test_schema())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        let mut txn = SnapshotTransaction::new();
+        for i in 0..3 {
+            let path = format!("data/L0/f{i}.parquet");
+            tokio::fs::write(src.path().join(&path), format!("body-{i}"))
+                .await
+                .unwrap();
+            txn.add_file(IcebergDataFile {
+                path,
+                file_size: 10,
+                num_rows: 1,
+                meta: test_meta(10),
+            });
+        }
+        catalog.commit(&txn, schema).await.unwrap();
+
+        let plan = build_plan_posix_source(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let source_manifest = read_source_manifest(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // First run: full migration lands at v2.
+        let v1 = execute_posix_to_object_store(
+            src.path().to_str().unwrap(),
+            dst.path().to_str().unwrap(),
+            &plan,
+            2,
+            source_manifest.schema.clone(),
+            &source_manifest.entries,
+            /*resume=*/ false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v1, 2);
+
+        // Second run with --resume: short-circuits, returns same v.
+        let v2 = execute_posix_to_object_store(
+            src.path().to_str().unwrap(),
+            dst.path().to_str().unwrap(),
+            &plan,
+            2,
+            source_manifest.schema.clone(),
+            &source_manifest.entries,
+            /*resume=*/ true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2, 2, "resume returns existing HEAD unchanged");
+    }
+
+    /// Phase 4b: --resume rejects a destination whose committed
+    /// manifest diverges from the source (signals a cross-migration
+    /// conflict that needs manual intervention).
+    #[tokio::test]
+    async fn resume_rejects_divergent_destination() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema());
+
+        // Source has 3 files.
+        let s_cat = IcebergCatalog::open(src.path(), test_schema())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(src.path().join("data/L0"))
+            .await
+            .unwrap();
+        let mut s_txn = SnapshotTransaction::new();
+        for i in 0..3 {
+            let path = format!("data/L0/src_{i}.parquet");
+            tokio::fs::write(src.path().join(&path), "x").await.unwrap();
+            s_txn.add_file(IcebergDataFile {
+                path,
+                file_size: 1,
+                num_rows: 1,
+                meta: test_meta(1),
+            });
+        }
+        s_cat.commit(&s_txn, schema.clone()).await.unwrap();
+
+        // Destination pre-committed with different files.
+        let dst_store = Arc::new(LocalFileStore::new(dst.path()).unwrap());
+        let dst_cat = ObjectStoreCatalog::open(dst_store, test_schema())
+            .await
+            .unwrap();
+        let mut d_txn = SnapshotTransaction::new();
+        d_txn.add_file(IcebergDataFile {
+            path: "data/L0/OTHER.parquet".into(),
+            file_size: 1,
+            num_rows: 1,
+            meta: test_meta(1),
+        });
+        dst_cat.commit(&d_txn, schema.clone()).await.unwrap();
+
+        let plan = build_plan_posix_source(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let source_manifest = read_source_manifest(src.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let err = execute_posix_to_object_store(
+            src.path().to_str().unwrap(),
+            dst.path().to_str().unwrap(),
+            &plan,
+            2,
+            source_manifest.schema.clone(),
+            &source_manifest.entries,
+            /*resume=*/ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("file sets differ") || msg.contains("NOT a resumable"),
+            "divergence error should be explicit: {msg}"
+        );
+    }
+
     /// Phase 4a: verify_destination passes when every file matches.
     #[tokio::test]
     async fn verify_passes_on_match() {
@@ -884,6 +1069,7 @@ mod tests {
             2,
             test_schema(),
             &entries,
+            /*resume=*/ false,
         )
         .await
         .unwrap_err();
