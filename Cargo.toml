@@ -12,6 +12,7 @@ members = [
     "crates/merutable-python",
     "crates/merutable-migrate",
     "crates/merutable-sql",
+    "crates/merutable-replica",
 ]
 # merutable-python requires Python dev headers + PyO3; exclude from
 # default `cargo test/clippy --workspace` so CI doesn't need Python.
@@ -27,6 +28,7 @@ default-members = [
     "crates/merutable",
     "crates/merutable-migrate",
     "crates/merutable-sql",
+    "crates/merutable-replica",
 ]
 
 [workspace.dependencies]

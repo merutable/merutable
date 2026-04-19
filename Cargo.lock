@@ -2326,6 +2326,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "merutable-replica"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "merutable",
+ "merutable-sql",
+ "merutable-types",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "merutable-sql"
 version = "0.1.0"
 dependencies = [
