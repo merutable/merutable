@@ -109,13 +109,22 @@ async fn single_flush_commit_writes_v1_metadata_and_hint() {
     let hint = fs::read_to_string(tmp.path().join("version-hint.text")).unwrap();
     assert_eq!(hint.trim(), "1");
 
-    // Only v1.metadata.json exists in metadata/.
-    let names: Vec<_> = fs::read_dir(tmp.path().join("metadata"))
+    // Issue #28 Phase 4: commit emits BOTH v1.metadata.json (legacy)
+    // AND v1.metadata.pb (canonical). Assert the set, not the order
+    // (readdir order is FS-dependent).
+    let mut names: Vec<_> = fs::read_dir(tmp.path().join("metadata"))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, vec!["v1.metadata.json".to_string()]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "v1.metadata.json".to_string(),
+            "v1.metadata.pb".to_string(),
+        ]
+    );
 
     // The JSON must parse cleanly with the catalog's own decoder.
     let json = fs::read(tmp.path().join("metadata").join("v1.metadata.json")).unwrap();

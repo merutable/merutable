@@ -313,32 +313,48 @@ impl IcebergCatalog {
         // puffin files written above are cleaned up (best-effort).
         let result: Result<Version> = async {
             let new_manifest = current.apply(txn, new_snapshot_id, &dv_locations)?;
+            let metadata_dir = self.base_path.join("metadata");
 
-            // Write manifest JSON.
-            let meta_path = self
-                .base_path
-                .join("metadata")
-                .join(format!("v{new_snapshot_id}.metadata.json"));
+            // Write manifest JSON (legacy canonical format). Still
+            // written for now so pre-#28 tooling and older merutable
+            // binaries keep reading. Phase 5 will drop this.
+            let meta_path_json = metadata_dir.join(format!("v{new_snapshot_id}.metadata.json"));
             let json = new_manifest.to_json()?;
-            tokio::fs::write(&meta_path, &json)
+            tokio::fs::write(&meta_path_json, &json)
                 .await
                 .map_err(MeruError::Io)?;
-            // fsync the metadata JSON so it is complete before the version-hint
-            // points at it. Without this, a crash can leave a truncated file.
-            tokio::fs::File::open(&meta_path)
+            tokio::fs::File::open(&meta_path_json)
                 .await
                 .map_err(MeruError::Io)?
                 .sync_all()
                 .await
                 .map_err(MeruError::Io)?;
-            // fsync the metadata DIRECTORY so the new metadata.json's
-            // directory entry is durably linked BEFORE the version-hint
-            // points at it. Without this, a crash between the version-
-            // hint rename and the metadata dir fsync can leave
-            // version-hint pointing at a filename that isn't yet in the
-            // directory listing (ext4/btrfs journal it separately), and
-            // recovery fails with "metadata.json not found".
-            let metadata_dir = self.base_path.join("metadata");
+
+            // Issue #28 Phase 4: also write the protobuf-encoded
+            // manifest. `read_manifest_payload` (Phase 3) prefers
+            // `.pb` when present — so starting now, every new commit
+            // becomes visible via the protobuf path. The JSON
+            // coexists as a safety net during the dual-read window.
+            let meta_path_pb = metadata_dir.join(format!("v{new_snapshot_id}.metadata.pb"));
+            let pb_bytes = new_manifest.to_protobuf()?;
+            tokio::fs::write(&meta_path_pb, &pb_bytes)
+                .await
+                .map_err(MeruError::Io)?;
+            tokio::fs::File::open(&meta_path_pb)
+                .await
+                .map_err(MeruError::Io)?
+                .sync_all()
+                .await
+                .map_err(MeruError::Io)?;
+
+            // fsync the metadata DIRECTORY so both files' directory
+            // entries are durably linked BEFORE the version-hint
+            // points at them. Without this, a crash between the
+            // version-hint rename and the metadata dir fsync can
+            // leave version-hint pointing at filenames that aren't
+            // yet in the directory listing (ext4/btrfs journal it
+            // separately), and recovery fails with "metadata not
+            // found".
             tokio::fs::File::open(&metadata_dir)
                 .await
                 .map_err(MeruError::Io)?
@@ -1038,6 +1054,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(catalog.current_manifest().await.snapshot_id, 7);
+    }
+
+    /// Issue #28 Phase 4: every commit emits BOTH v{N}.metadata.json
+    /// (legacy) AND v{N}.metadata.pb (canonical). Both files must
+    /// exist, must be valid, and must encode the same manifest.
+    #[tokio::test]
+    async fn commit_writes_both_json_and_protobuf_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_arc = Arc::new(test_schema());
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+
+        let mut txn = SnapshotTransaction::new();
+        txn.add_file(IcebergDataFile {
+            path: "data/L0/a.parquet".into(),
+            file_size: 1024,
+            num_rows: 100,
+            meta: test_meta(0),
+        });
+        catalog.commit(&txn, schema_arc.clone()).await.unwrap();
+
+        let metadata = tmp.path().join("metadata");
+        let json_path = metadata.join("v1.metadata.json");
+        let pb_path = metadata.join("v1.metadata.pb");
+        assert!(json_path.exists(), "JSON manifest missing after commit");
+        assert!(pb_path.exists(), "protobuf manifest missing after commit");
+
+        let json_m = Manifest::from_json(&std::fs::read(&json_path).unwrap()).unwrap();
+        let pb_m = Manifest::from_protobuf(&std::fs::read(&pb_path).unwrap()).unwrap();
+        assert_eq!(json_m.snapshot_id, pb_m.snapshot_id);
+        assert_eq!(json_m.entries.len(), pb_m.entries.len());
+        assert_eq!(json_m.entries[0].path, pb_m.entries[0].path);
+        assert_eq!(json_m.table_uuid, pb_m.table_uuid);
+    }
+
+    /// Reopening after a dual-write commit goes through the
+    /// protobuf path (Phase 3 tiebreak). This is the end-to-end
+    /// proof that write → read via protobuf works without anyone
+    /// manually touching files.
+    #[tokio::test]
+    async fn commit_roundtrip_reopen_through_protobuf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_arc = Arc::new(test_schema());
+        {
+            let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+                .await
+                .unwrap();
+            let mut txn = SnapshotTransaction::new();
+            txn.add_file(IcebergDataFile {
+                path: "data/L0/x.parquet".into(),
+                file_size: 2048,
+                num_rows: 200,
+                meta: test_meta(0),
+            });
+            catalog.commit(&txn, schema_arc.clone()).await.unwrap();
+        }
+        // Sanity: remove the JSON so we KNOW the reopen came via
+        // protobuf. If protobuf is missing or busted, open fails.
+        std::fs::remove_file(tmp.path().join("metadata/v1.metadata.json")).unwrap();
+
+        let catalog = IcebergCatalog::open(tmp.path(), test_schema())
+            .await
+            .unwrap();
+        let m = catalog.current_manifest().await;
+        assert_eq!(m.snapshot_id, 1);
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].path, "data/L0/x.parquet");
     }
 
     /// Orphan-metadata detection recognises both .pb and .json.
