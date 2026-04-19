@@ -1,0 +1,18 @@
+[package]
+name    = "merutable-sql"
+version = "0.1.0"
+edition = "2021"
+description = "SQL surface for merutable — change-feed table function and DataFusion integration (Issue #29)"
+publish = false  # internal; the 0.1-preview blocker. Stable surface follows DataFusion-integration completion.
+
+[dependencies]
+merutable          = { path = "../merutable" }
+merutable-types    = { path = "../merutable-types" }
+merutable-engine   = { path = "../merutable-engine" }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full"] }

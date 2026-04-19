@@ -46,6 +46,20 @@ pub enum MeruError {
     /// condition — the *expected* non-error outcome of losing a race.
     #[error("object already exists: {0}")]
     AlreadyExists(String),
+
+    /// Issue #29: change-feed caller requested a `since_seq` below
+    /// the engine's retention low-water.
+    ///
+    /// The change feed is bounded by `[low_water, visible_seq]`
+    /// where `low_water` is the oldest retained seq in the LSM
+    /// (driven by #11 snapshot-pin GC policy). A caller with stale
+    /// bookmarks must escalate to an Iceberg snapshot scan and
+    /// restart the feed from the seq embedded in that snapshot —
+    /// this matches Debezium + pg_logical's escalation pattern.
+    /// Critically, the change feed does NOT hold back retention;
+    /// stale consumers don't pin the LSM.
+    #[error("change feed below retention: requested {requested}, low_water {low_water} — escalate to Iceberg snapshot scan")]
+    ChangeFeedBelowRetention { requested: u64, low_water: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, MeruError>;

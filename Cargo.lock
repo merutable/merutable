@@ -2320,6 +2320,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "merutable-sql"
+version = "0.1.0"
+dependencies = [
+ "merutable",
+ "merutable-engine",
+ "merutable-types",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "merutable-store"
 version = "0.1.0"
 dependencies = [
