@@ -85,6 +85,11 @@ pub struct MeruDB {
     /// `close()` can `take()` and `shutdown().await` the workers
     /// before the engine's final flush.
     background: tokio::sync::Mutex<Option<BackgroundWorkers>>,
+    /// Issue #31 Phase 2a: mirror worker. Spawned iff
+    /// `OpenOptions::mirror` was set AND the DB is not read-only.
+    /// Same `take()/shutdown().await` lifecycle as `background` so
+    /// `close()` drains both before the engine's final flush.
+    mirror_worker: tokio::sync::Mutex<Option<crate::mirror::MirrorWorker>>,
 }
 
 impl MeruDB {
@@ -136,16 +141,10 @@ impl MeruDB {
                     .into(),
             ));
         }
-        // Issue #31 Phase 1: mirror is accepted (coherent with Posix
-        // above) but not yet spawned. Log a notice so operators see
-        // that the knob is recognized before Phase 2 lands the worker.
-        if options.mirror.is_some() {
-            tracing::info!(
-                "MirrorConfig accepted (Issue #31 Phase 1 validation only). \
-                 The mirror worker will be spawned in Phase 2; no uploads \
-                 happen yet."
-            );
-        }
+        // Issue #31 Phase 2a: pull the mirror config out of options
+        // BEFORE `options.schema` etc are moved into the EngineConfig.
+        // The worker is spawned after the engine is up.
+        let mirror_config = options.mirror.clone();
         // Issue #9: surface the full tuning matrix through
         // `OpenOptions`. Previously only 7/14 EngineConfig fields
         // were reachable from the public API — users who wanted to
@@ -189,9 +188,21 @@ impl MeruDB {
             Some(BackgroundWorkers::spawn(engine.clone()))
         };
 
+        // Issue #31 Phase 2a: spawn the mirror worker only for
+        // non-read-only writers that asked for a mirror. Read-only
+        // replicas never originate writes, so there's nothing to
+        // mirror; spawning anyway would burn a tokio task for no
+        // benefit.
+        let mirror_worker = if options.read_only {
+            None
+        } else {
+            mirror_config.map(|cfg| crate::mirror::MirrorWorker::spawn(engine.clone(), cfg))
+        };
+
         Ok(Self {
             engine,
             background: tokio::sync::Mutex::new(background),
+            mirror_worker: tokio::sync::Mutex::new(mirror_worker),
         })
     }
 
@@ -324,6 +335,17 @@ impl MeruDB {
         let workers = self.background.lock().await.take();
         if let Some(w) = workers {
             w.shutdown().await;
+        }
+        // Issue #31 Phase 2a: drain the mirror worker alongside the
+        // flush/compaction workers. Order doesn't matter between
+        // them (the mirror doesn't compete for the rotation lock)
+        // but draining before `engine.close()` ensures the final
+        // flush's manifest is observable in `mirror_seq` if a Phase
+        // 3 test relies on a close-synchronous snapshot of mirror
+        // state.
+        let mirror = self.mirror_worker.lock().await.take();
+        if let Some(mut m) = mirror {
+            m.shutdown().await;
         }
         self.engine.close().await
     }
@@ -712,6 +734,30 @@ mod tests {
         db.close().await.unwrap();
         db.close().await.unwrap(); // must not panic or error
         assert!(db.is_closed());
+    }
+
+    /// Issue #31 Phase 2a: attaching a MirrorConfig spawns the
+    /// mirror worker, writes+flushes advance the snapshot, and
+    /// close() drains the worker cleanly without hanging.
+    #[tokio::test]
+    async fn mirror_worker_spawned_and_drained_on_close() {
+        use crate::options::MirrorConfig;
+        use merutable_store::local::LocalFileStore;
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(mirror_dir.path()).unwrap());
+        let opts = test_options(&tmp).mirror(MirrorConfig::new(store));
+        let db = MeruDB::open(opts).await.unwrap();
+        // Write + flush so the snapshot advances past 0.
+        db.put(make_row(1, "alice")).await.unwrap();
+        db.flush().await.unwrap();
+        // Close must complete within a bounded time — any deadlock in
+        // the mirror worker's shutdown path would hang here.
+        tokio::time::timeout(std::time::Duration::from_secs(10), db.close())
+            .await
+            .expect("close hung past 10s — mirror worker deadlock?")
+            .unwrap();
     }
 
     #[tokio::test]

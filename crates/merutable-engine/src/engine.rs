@@ -638,6 +638,14 @@ impl MeruEngine {
         &self.schema
     }
 
+    /// Issue #31 Phase 2a: synchronous read of the current
+    /// committed snapshot id. O(1) — just an `ArcSwap` load. Used
+    /// by the mirror worker to poll for snapshot advances without
+    /// allocating a full `EngineStats` every tick.
+    pub fn current_snapshot_id(&self) -> i64 {
+        self.version_set.snapshot_id()
+    }
+
     /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()

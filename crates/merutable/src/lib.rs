@@ -3,6 +3,7 @@
 pub mod db;
 pub mod error;
 pub mod iterator;
+pub mod mirror;
 pub mod options;
 
 pub use db::MeruDB;
