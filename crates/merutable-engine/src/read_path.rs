@@ -30,7 +30,7 @@ use merutable_types::{
     key::InternalKey,
     level::Level,
     schema::TableSchema,
-    sequence::OpType,
+    sequence::{OpType, SeqNum},
     value::{FieldValue, Row},
     MeruError, Result,
 };
@@ -193,6 +193,69 @@ pub fn point_lookup(engine: &MeruEngine, pk_values: &[FieldValue]) -> Result<Opt
     }
 
     trace!("point lookup miss");
+    Ok(None)
+}
+
+/// Issue #29 Phase 2c: point-lookup that takes a pre-encoded
+/// user_key + explicit read_seq. Used by the change-feed pre-image
+/// path to resolve "what did the row look like at `delete_seq - 1`"
+/// without redoing the PK encoding (the change feed already carries
+/// `pk_bytes` from the op record).
+///
+/// Returns:
+/// - `Some(row)` if the key was live (last op `<= read_seq` was a Put).
+/// - `None` if the key was absent or tombstoned at `read_seq`.
+///
+/// Does NOT update the row cache — pre-image lookups happen during
+/// change-feed draining and shouldn't perturb the steady-state hit
+/// pattern that `point_lookup` caches against.
+pub fn point_lookup_at_seq(
+    engine: &MeruEngine,
+    user_key_bytes: &[u8],
+    read_seq: SeqNum,
+) -> Result<Option<Row>> {
+    // Stop 1: Memtable.
+    if let Some(entry) = engine.memtable.get(user_key_bytes, read_seq) {
+        if entry.op_type == OpType::Delete {
+            return Ok(None);
+        }
+        return Ok(Some(crate::codec::decode_row(&entry.value)?));
+    }
+
+    // Pin the version snapshot so GC doesn't delete files out from
+    // under us mid-read.
+    let (_pin, version) = engine.pin_current_snapshot();
+    let base = engine.catalog.base_path();
+
+    // Stop 2: L0 files (sorted by seq_max DESC — newest first).
+    for file in version.files_at(Level(0)) {
+        if !range_contains(&file.meta.key_min, &file.meta.key_max, user_key_bytes) {
+            continue;
+        }
+        let (reader, dv) = open_file(base, file, engine.schema.clone())?;
+        if let Some((hit_ikey, row)) = reader.get(user_key_bytes, read_seq, dv.as_ref())? {
+            if hit_ikey.op_type == OpType::Delete {
+                return Ok(None);
+            }
+            return Ok(Some(row));
+        }
+    }
+
+    // Stop 3: L1..LN (non-overlapping, binary search per level).
+    let max_level = version.max_level();
+    for lvl in 1..=max_level.0 {
+        let level = Level(lvl);
+        let Some(file) = version.find_file_for_key(level, user_key_bytes) else {
+            continue;
+        };
+        let (reader, dv) = open_file(base, file, engine.schema.clone())?;
+        if let Some((hit_ikey, row)) = reader.get(user_key_bytes, read_seq, dv.as_ref())? {
+            if hit_ikey.op_type == OpType::Delete {
+                return Ok(None);
+            }
+            return Ok(Some(row));
+        }
+    }
     Ok(None)
 }
 

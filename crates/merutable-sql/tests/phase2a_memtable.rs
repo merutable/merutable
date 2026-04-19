@@ -165,7 +165,11 @@ async fn empty_memtable_returns_empty_batch_not_error() {
 }
 
 #[tokio::test]
-async fn delete_op_carries_empty_row_phase_2a() {
+async fn delete_op_carries_pre_image_phase_2c() {
+    // Phase 2a originally asserted `row.fields.len() == 0` for
+    // Delete ops (pre-image reconstruction deferred). Phase 2c
+    // lifts that restriction: a Delete now carries the prior
+    // live row via a point lookup at `seq - 1`.
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_engine(&tmp).await;
     engine
@@ -180,6 +184,10 @@ async fn delete_op_carries_empty_row_phase_2a() {
         .iter()
         .find(|r| matches!(r.op, ChangeOp::Delete))
         .unwrap();
-    // Phase 2a contract: delete pre-image not yet reconstructed.
-    assert_eq!(del.row.fields.len(), 0);
+    // Phase 2c contract: delete pre-image is the Put's value.
+    assert_eq!(del.row.fields.len(), 2);
+    match del.row.fields.get(1).and_then(|f| f.as_ref()) {
+        Some(FieldValue::Int64(n)) => assert_eq!(*n, 777),
+        other => panic!("unexpected pre-image v field: {other:?}"),
+    }
 }

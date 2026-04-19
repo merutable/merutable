@@ -21,18 +21,30 @@
 //! low-latency subscribers (RO replicas, audit log tailers) as
 //! long as they keep up with the flush cadence.
 //!
-//! # Phase 2b (this commit): memtable + L0 scan
+//! # Phase 2b (shipped): memtable + L0 scan
 //!
-//! The cursor now calls `MeruEngine::scan_tail_changes`, which
-//! extends the scan across L0 Parquet files. Ops that flushed out
-//! of the memtable into L0 stay visible as long as the file lives
-//! in L0 (i.e., until compacted into L1). This lifts the "must
-//! keep up with flush cadence" constraint — subscribers can fall
-//! multiple snapshots behind and still recover without escalating.
+//! The cursor calls `MeruEngine::scan_tail_changes` and sees ops
+//! across memtable + L0. Subscribers can fall multiple snapshots
+//! behind without escalating.
 //!
-//! DELETE records carry an empty pre-image `Row` in both 2a and
-//! 2b; the `seq - 1` point-lookup reconstruction arrives in
-//! Phase 2c.
+//! # Phase 2c (this commit): pre-image reconstruction + INSERT vs UPDATE
+//!
+//! The cursor now calls `scan_tail_changes_with_pre_image`, which
+//! resolves each Delete op's pre-image via a point lookup at
+//! `seq - 1`. Records for Delete ops now carry the row that was
+//! live immediately before the delete — sufficient for a change
+//! consumer to invalidate its own derived state or replay against
+//! a sibling system.
+//!
+//! INSERT vs UPDATE is now distinguished by a pre-image lookup on
+//! Puts: a Put with no prior live state at `seq - 1` is an Insert;
+//! one with prior state is an Update. The `op` field of the
+//! `ChangeRecord` now reflects that distinction. Workloads
+//! dominated by pure Inserts pay one extra point-lookup per op;
+//! callers that don't need the distinction can set
+//! `ChangeFeedCursor::skip_update_discrimination(true)` to keep
+//! every Put tagged Insert (the Phase 2a behavior) — cheaper by
+//! 1 lookup per op.
 //!
 //! # Phase 2c (planned)
 //!
@@ -116,6 +128,10 @@ pub struct ChangeRecord {
 /// stable error shape on every call.
 pub struct ChangeFeedCursor {
     inner: CursorInner,
+    /// When true, every Put op is tagged `Insert` without the
+    /// pre-image lookup that would distinguish Insert from Update.
+    /// Defaults to false (full Phase 2c discrimination).
+    skip_update_discrimination: bool,
 }
 
 enum CursorInner {
@@ -136,6 +152,7 @@ impl ChangeFeedCursor {
     pub fn from_engine(engine: Arc<MeruEngine>, since_seq: u64) -> Self {
         Self {
             inner: CursorInner::Engine { engine, since_seq },
+            skip_update_discrimination: false,
         }
     }
 
@@ -148,7 +165,18 @@ impl ChangeFeedCursor {
                 requested,
                 low_water,
             },
+            skip_update_discrimination: false,
         }
+    }
+
+    /// Opt out of Insert/Update discrimination. Every Put op is
+    /// tagged Insert. Saves one point-lookup per op — useful for
+    /// subscribers that only care about the key + op kind at a
+    /// coarse level (replicas applying LWW, audit tailers that
+    /// don't branch on INSERT vs UPDATE).
+    pub fn skip_update_discrimination(mut self, skip: bool) -> Self {
+        self.skip_update_discrimination = skip;
+        self
     }
 
     /// Pull up to `max_rows` records from the feed.
@@ -174,19 +202,35 @@ impl ChangeFeedCursor {
                 if SeqNum(*since_seq) >= read_seq {
                     return Ok(Vec::new());
                 }
-                // Phase 2b: include L0 as well as the memtable.
-                let raw = engine.scan_tail_changes(*since_seq, read_seq)?;
+                // Phase 2c: pre-image reconstruction. Walks the
+                // tail AND resolves each Delete's prior live state.
+                let raw = engine.scan_tail_changes_with_pre_image(*since_seq, read_seq)?;
                 let mut out = Vec::with_capacity(raw.len().min(max_rows));
                 for tuple in raw.into_iter().take(max_rows) {
                     let op = match tuple.op_type {
                         OpType::Put => {
-                            // An Update vs. Insert discrimination requires
-                            // knowing whether a prior key existed — that's a
-                            // Phase 2c task (pre-image reconstruction). For
-                            // Phase 2a/b we tag every Put as Insert. Callers
-                            // tracking write-pattern details are expected to
-                            // opt into the Phase 2c upgrade when it lands.
-                            ChangeOp::Insert
+                            if self.skip_update_discrimination {
+                                ChangeOp::Insert
+                            } else {
+                                // Phase 2c: distinguish Insert from
+                                // Update by probing whether a live
+                                // row existed at `seq - 1`.
+                                let had_prior = if tuple.seq == 0 {
+                                    false
+                                } else {
+                                    engine
+                                        .point_lookup_by_user_key_at_seq(
+                                            &tuple.pk_bytes,
+                                            SeqNum(tuple.seq - 1),
+                                        )?
+                                        .is_some()
+                                };
+                                if had_prior {
+                                    ChangeOp::Update
+                                } else {
+                                    ChangeOp::Insert
+                                }
+                            }
                         }
                         OpType::Delete => ChangeOp::Delete,
                     };

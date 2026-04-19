@@ -723,6 +723,56 @@ impl MeruEngine {
         Ok(out)
     }
 
+    /// Issue #29 Phase 2c: point-lookup by pre-encoded user_key at
+    /// an explicit seq. Thin wrapper over
+    /// `read_path::point_lookup_at_seq` so change-feed callers can
+    /// probe a prior state without re-encoding PK values they already
+    /// have as bytes.
+    pub fn point_lookup_by_user_key_at_seq(
+        &self,
+        user_key_bytes: &[u8],
+        read_seq: SeqNum,
+    ) -> Result<Option<Row>> {
+        crate::read_path::point_lookup_at_seq(self, user_key_bytes, read_seq)
+    }
+
+    /// Issue #29 Phase 2c: variant of `scan_tail_changes` that also
+    /// reconstructs delete pre-images. For every Delete op in the
+    /// result, the `row` field carries the last live state of the
+    /// key at `seq - 1` (not `Row::default()` as Phase 2a/b did).
+    ///
+    /// Costs one extra point-lookup per Delete op. Callers on the
+    /// happy path (mostly Puts) pay nothing extra; delete-heavy
+    /// workloads can opt out by calling `scan_tail_changes` instead.
+    pub fn scan_tail_changes_with_pre_image(
+        &self,
+        since_seq: u64,
+        read_seq: SeqNum,
+    ) -> Result<Vec<ChangeTuple>> {
+        let mut tuples = self.scan_tail_changes(since_seq, read_seq)?;
+        for t in &mut tuples {
+            if t.op_type != OpType::Delete {
+                continue;
+            }
+            if t.seq == 0 {
+                // Can't look up at seq-1 = u64::MAX sentinel;
+                // leave the Row empty. seq=0 is never a real
+                // committed op anyway.
+                continue;
+            }
+            let pre_image =
+                crate::read_path::point_lookup_at_seq(self, &t.pk_bytes, SeqNum(t.seq - 1))?;
+            if let Some(row) = pre_image {
+                t.row = row;
+            }
+            // If None, the key was already tombstoned or absent at
+            // seq-1 — a delete-of-delete or a legitimately new
+            // tombstone with no history. Leave `row` as
+            // Row::default() to signal "no pre-image available."
+        }
+        Ok(tuples)
+    }
+
     /// Issue #29 Phase 2b: extend the change-feed scan to include
     /// L0 Parquet files. Every file whose `seq_max > since_seq`
     /// AND `seq_min <= read_seq` is opened + scanned; rows whose
@@ -730,8 +780,9 @@ impl MeruEngine {
     /// and returned alongside the memtable ops.
     ///
     /// Result is seq-ascending across memtable + L0. Callers treat
-    /// this as the "live-tail" view of the change feed; L1..LN scan
-    /// + DELETE pre-image reconstruction are Phase 2c.
+    /// this as the "live-tail" view of the change feed. L1..LN scan
+    /// is Phase 2c (in-progress); DELETE pre-image reconstruction is
+    /// in `scan_tail_changes_with_pre_image`.
     pub fn scan_tail_changes(&self, since_seq: u64, read_seq: SeqNum) -> Result<Vec<ChangeTuple>> {
         use bytes::Bytes;
         use merutable_iceberg::DeletionVector;
