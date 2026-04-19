@@ -52,18 +52,47 @@ pub type Head = i64;
 /// transient network failure during discovery must NOT be silently
 /// treated as a missing key (that would cause the caller to emit a
 /// second genesis or worse, clobber an existing chain).
-pub async fn discover_head<F, Fut>(mut exists_fn: F) -> Result<Head>
+pub async fn discover_head<F, Fut>(exists_fn: F) -> Result<Head>
 where
     F: FnMut(i64) -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
-    // Phase 1: exponential scan. Start at 1 (genesis).
-    if !exists_fn(1).await? {
-        // Empty catalog — caller writes genesis.
+    discover_head_from(1, exists_fn).await
+}
+
+/// Like `discover_head`, but start probing from `start_version`
+/// instead of 1. Used after Phase-6 manifest GC, where a low-water
+/// pointer file records the lowest surviving version; starting the
+/// exponential scan there keeps discovery correct when the pre-cutoff
+/// chain has been reclaimed.
+///
+/// Invariant: the caller must pass a `start_version ≥ 1` that is
+/// known to either (a) exist on the store, or (b) be the catalog's
+/// genesis position (v1 on a fresh catalog). Passing a start that
+/// sits inside a reclaimed gap produces `HEAD = 0` (misinterpreted as
+/// empty catalog).
+pub async fn discover_head_from<F, Fut>(start_version: i64, mut exists_fn: F) -> Result<Head>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    if start_version < 1 {
+        return Err(MeruError::Corruption(format!(
+            "discover_head_from: start_version must be ≥ 1 (got {start_version})"
+        )));
+    }
+    // Phase 1: exponential scan. Start at `start_version`.
+    if !exists_fn(start_version).await? {
+        // Empty catalog (or low-water gap) — caller interprets.
         return Ok(0);
     }
-    let mut low = 1i64; // confirmed present
-    let mut probe = 2i64;
+    let mut low = start_version; // confirmed present
+                                 // Double from low, matching the classic "probe 1, 2, 4, 8..."
+                                 // pattern rooted at the start position. `checked_mul` guards the
+                                 // i64-overflow case; the MAX_PROBE cap below still applies.
+    let mut probe = start_version
+        .checked_mul(2)
+        .ok_or_else(|| MeruError::Corruption("HEAD discovery probe overflow".into()))?;
     // Cap at 2^62 to keep arithmetic safe; a catalog larger than
     // that has bigger problems.
     const MAX_PROBE: i64 = 1 << 62;

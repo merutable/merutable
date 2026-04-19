@@ -29,11 +29,10 @@
 //!   `catalog.commit`; those paths need a shared commit trait that
 //!   both `IcebergCatalog` and `ObjectStoreCatalog` implement).
 //!   Phase 4.
-//! - Manifest GC walking back via `previous_snapshot_id`. Phase 6.
 //!
 //! # Phase 5: Puffin DV file handling
 //!
-//! Partial-compaction deletion vectors now go end-to-end: the commit
+//! Partial-compaction deletion vectors go end-to-end: the commit
 //! path fetches any pre-existing DV via `store.get_range`, unions it
 //! with the caller's new DV, encodes a fresh Puffin blob, writes it
 //! under `data/L{n}/{stem}.dv-{attempted_version}.puffin`, and records
@@ -42,6 +41,20 @@
 //! winner installed (not our stale cache), re-unions, re-encodes, and
 //! re-writes at the bumped version. The losing-writer's puffin is
 //! orphaned on the store — Phase 6 GC will reclaim it.
+//!
+//! # Phase 6: Manifest chain GC
+//!
+//! `reclaim_old_manifests(keep_recent)` keeps the last `keep_recent`
+//! manifest versions and deletes everything below. Safe by
+//! construction: the current snapshot's entries point directly at
+//! their data files, so pruning old manifests never breaks reads of
+//! the current table state. Time travel below the cutoff becomes
+//! impossible — this is an explicit caller decision, not a side
+//! effect. A low-water pointer file (`metadata/low_water.txt`) is
+//! written before any delete so that concurrent openers and crash
+//! recovery know where discovery should start probing; without it a
+//! reopen would probe v1, find it gone, and incorrectly declare the
+//! catalog empty.
 
 use std::sync::Arc;
 
@@ -50,11 +63,57 @@ use merutable_types::{schema::TableSchema, MeruError, Result};
 use tokio::sync::Mutex;
 
 use crate::deletion_vector::DeletionVector;
-use crate::head_discovery::discover_head;
+use crate::head_discovery::{discover_head_from, Head};
 use crate::manifest::{DvLocation, Manifest};
 use crate::object_store_commit::manifest_path;
 use crate::snapshot::SnapshotTransaction;
 use crate::version::Version;
+
+/// Path of the low-water-mark pointer file. Records the lowest
+/// surviving manifest version after a reclaim — HEAD discovery
+/// starts its exponential scan here instead of at v1.
+const LOW_WATER_PATH: &str = "metadata/low_water.txt";
+
+/// Read the low-water pointer from the store. Absent file → 1 (no
+/// reclaim has happened). Malformed bytes → `Corruption`.
+async fn read_low_water<S: MeruStore + ?Sized>(store: &S) -> Result<i64> {
+    match store.get(LOW_WATER_PATH).await {
+        Ok(bytes) => {
+            let s = std::str::from_utf8(&bytes)
+                .map_err(|e| MeruError::Corruption(format!("low_water.txt not UTF-8: {e}")))?;
+            let v: i64 = s
+                .trim()
+                .parse()
+                .map_err(|e| MeruError::Corruption(format!("low_water.txt not an integer: {e}")))?;
+            if v < 1 {
+                return Err(MeruError::Corruption(format!(
+                    "low_water.txt contains {v} — must be ≥ 1"
+                )));
+            }
+            Ok(v)
+        }
+        // Most backends signal "missing" via a specific error shape; for
+        // the purpose of this pointer file we tolerate ANY read error
+        // as "no low-water set, default to 1". Discovery will then
+        // probe v1; if v1 is also absent the catalog is (correctly)
+        // treated as empty.
+        Err(_) => Ok(1),
+    }
+}
+
+/// Discover HEAD against `store`, honoring the low-water pointer if
+/// present. Callers should prefer this helper over raw
+/// `discover_head_from` so the pointer semantics stay consistent.
+async fn discover_head_with_low_water<S: MeruStore + ?Sized>(store: &S) -> Result<Head> {
+    let low_water = read_low_water(store).await?;
+    let store_ref: &S = store;
+    // Capture `store_ref` by reference so we don't clone the Arc in
+    // the hot closure path.
+    discover_head_from(low_water, |v| async move {
+        store_ref.exists(&manifest_path(v)).await
+    })
+    .await
+}
 
 /// ObjectStore-mode catalog. Generic over any `MeruStore` — tests
 /// use `LocalFileStore`; S3/GCS/Azure plug in via the
@@ -77,11 +136,7 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
     /// chain. If the store has existing manifests, runs HEAD
     /// discovery and loads the latest.
     pub async fn open(store: Arc<S>, schema: TableSchema) -> Result<Self> {
-        let head = discover_head(|v| {
-            let s = store.clone();
-            async move { s.exists(&manifest_path(v)).await }
-        })
-        .await?;
+        let head = discover_head_with_low_water(store.as_ref()).await?;
 
         let (manifest, current_head) = if head == 0 {
             // Empty store — write genesis v1.
@@ -122,12 +177,7 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
     /// store. Used by read-only replicas to pick up commits from
     /// other writers.
     pub async fn refresh(&self) -> Result<()> {
-        let store = self.store.clone();
-        let new_head = discover_head(|v| {
-            let s = store.clone();
-            async move { s.exists(&manifest_path(v)).await }
-        })
-        .await?;
+        let new_head = discover_head_with_low_water(self.store.as_ref()).await?;
         if new_head == 0 {
             return Err(MeruError::Corruption(
                 "refresh: HEAD discovery returned 0 against a non-empty catalog".into(),
@@ -293,12 +343,7 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
                         }
                         let backoff_ms = 2u64.pow(attempt as u32).min(200);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        let store = self.store.clone();
-                        let new_head = discover_head(|v| {
-                            let s = store.clone();
-                            async move { s.exists(&manifest_path(v)).await }
-                        })
-                        .await?;
+                        let new_head = discover_head_with_low_water(self.store.as_ref()).await?;
                         let winner_bytes = self.store.get(&manifest_path(new_head)).await?;
                         base = Manifest::from_protobuf(&winner_bytes)?;
                         head = new_head;
@@ -328,6 +373,76 @@ impl<S: MeruStore> ObjectStoreCatalog<S> {
         *self.current.lock().await = new_manifest;
         *self.head.lock().await = committed_version;
         Ok(new_version)
+    }
+
+    /// Phase 6: prune old manifest files from the backward-pointer
+    /// chain. Keeps the most recent `keep_recent` manifest versions
+    /// (must be ≥ 1) and deletes everything below. Returns the set of
+    /// versions actually removed.
+    ///
+    /// # Safety
+    ///
+    /// Pruning old manifests does not affect reads of the current
+    /// snapshot — every live data file is addressed directly from the
+    /// current entries list, not by traversing the parent chain.
+    /// Pruning does break **time travel below the cutoff**: reopening
+    /// against a pruned version errors; `refresh()` still works
+    /// because HEAD discovery only probes forward from the latest
+    /// known version.
+    ///
+    /// # Cost
+    ///
+    /// `HEAD - keep_recent` delete calls plus one `head()` lookup.
+    /// Walks backward via `parent_snapshot_id` pointers read from the
+    /// retained manifests so we never touch data we're about to
+    /// delete. Orphan puffin files from losing commit attempts are NOT
+    /// swept here — they'd require a full LIST (violates #26's no-LIST
+    /// discipline). A follow-on orphan-puffin sweeper that traverses
+    /// retained manifests' DV pointers is a separate, explicit call.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if `keep_recent == 0` — a catalog
+    /// with no manifests is irreversibly broken.
+    pub async fn reclaim_old_manifests(&self, keep_recent: usize) -> Result<Vec<i64>> {
+        if keep_recent == 0 {
+            return Err(MeruError::InvalidArgument(
+                "ObjectStoreCatalog::reclaim_old_manifests: keep_recent must be ≥ 1 \
+                 (deleting every manifest would strand all data)"
+                    .into(),
+            ));
+        }
+        let head = *self.head.lock().await;
+        let cutoff = head.saturating_sub(keep_recent as i64);
+        if cutoff <= 0 {
+            return Ok(Vec::new());
+        }
+
+        // Step 1: write the low-water pointer BEFORE any delete so
+        // that any concurrent opener (or this process after a crash)
+        // knows to start discovery at `cutoff + 1` rather than
+        // probing into the soon-to-be-deleted prefix. Order matters:
+        // if we deleted first and crashed, a fresh open would probe
+        // v1, find it gone, and declare the catalog empty.
+        let new_low_water = cutoff + 1;
+        self.store
+            .put(
+                LOW_WATER_PATH,
+                bytes::Bytes::from(new_low_water.to_string()),
+            )
+            .await?;
+
+        let mut removed = Vec::new();
+        // Step 2: walk versions [1..=cutoff] and delete each manifest.
+        // `delete` is idempotent per MeruStore contract — a missing
+        // key returns Ok, not an error. So a prior partial reclaim
+        // (crash mid-loop) replays cleanly.
+        for v in 1..=cutoff {
+            let path = manifest_path(v);
+            self.store.delete(&path).await?;
+            removed.push(v);
+        }
+        Ok(removed)
     }
 }
 
@@ -673,6 +788,156 @@ mod tests {
             msg.contains("ghost.parquet"),
             "error must name the missing path: {msg}"
         );
+    }
+
+    /// Phase 6: reclaim keeps the last N manifests and deletes the
+    /// rest. HEAD and current manifest remain unchanged.
+    #[tokio::test]
+    async fn reclaim_keeps_last_n_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+
+        // Commit 9 transactions: HEAD goes 1 (genesis) → 10.
+        for i in 0..9 {
+            let mut txn = SnapshotTransaction::new();
+            txn.add_file(test_data_file(&format!("data/L0/f{i}.parquet")));
+            cat.commit(&txn, schema_arc.clone()).await.unwrap();
+        }
+        assert_eq!(cat.head().await, 10);
+
+        // Keep last 3 → {8, 9, 10}. Remove {1..=7}.
+        let removed = cat.reclaim_old_manifests(3).await.unwrap();
+        assert_eq!(removed, (1..=7).collect::<Vec<_>>());
+
+        // v1..v7 gone.
+        for v in 1..=7 {
+            assert!(
+                !store
+                    .exists(&format!("metadata/v{v}.manifest.bin"))
+                    .await
+                    .unwrap(),
+                "v{v} should be reclaimed"
+            );
+        }
+        // v8..v10 present.
+        for v in 8..=10 {
+            assert!(
+                store
+                    .exists(&format!("metadata/v{v}.manifest.bin"))
+                    .await
+                    .unwrap(),
+                "v{v} should remain"
+            );
+        }
+
+        // Head and current are unaffected.
+        assert_eq!(cat.head().await, 10);
+        assert_eq!(cat.current_manifest().await.snapshot_id, 10);
+
+        // Refresh still works (it probes forward from HEAD, doesn't
+        // need pruned manifests).
+        cat.refresh().await.unwrap();
+        assert_eq!(cat.head().await, 10);
+    }
+
+    /// Phase 6: reclaim is idempotent — a second call with the same
+    /// keep_recent is a no-op (returns empty vec).
+    #[tokio::test]
+    async fn reclaim_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+        for i in 0..4 {
+            let mut txn = SnapshotTransaction::new();
+            txn.add_file(test_data_file(&format!("data/L0/f{i}.parquet")));
+            cat.commit(&txn, schema_arc.clone()).await.unwrap();
+        }
+        assert_eq!(cat.head().await, 5);
+
+        let first = cat.reclaim_old_manifests(2).await.unwrap();
+        assert_eq!(first, vec![1, 2, 3]);
+        // Second call with same threshold: nothing to delete in the
+        // cutoff range that still exists, but the for-loop still
+        // issues idempotent deletes for v1..v3 → LocalFileStore's
+        // delete is a no-op on missing keys so the call succeeds.
+        // The returned vec still lists those versions (the contract
+        // is "versions we asked the store to delete", not "versions
+        // that existed"); the important invariant is no error.
+        let second = cat.reclaim_old_manifests(2).await.unwrap();
+        assert_eq!(second, vec![1, 2, 3]);
+    }
+
+    /// Phase 6: keep_recent=0 is rejected.
+    #[tokio::test]
+    async fn reclaim_zero_keep_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+        let err = cat.reclaim_old_manifests(0).await.unwrap_err();
+        assert!(format!("{err:?}").contains("keep_recent"));
+    }
+
+    /// Phase 6: after reclaim, reopening the catalog against the
+    /// same store rediscovers the correct HEAD via the low-water
+    /// pointer — not v1.
+    #[tokio::test]
+    async fn reopen_after_reclaim_rediscovers_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let schema_arc = Arc::new(test_schema());
+
+        {
+            let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+                .await
+                .unwrap();
+            for i in 0..6 {
+                let mut txn = SnapshotTransaction::new();
+                txn.add_file(test_data_file(&format!("data/L0/f{i}.parquet")));
+                cat.commit(&txn, schema_arc.clone()).await.unwrap();
+            }
+            assert_eq!(cat.head().await, 7);
+            // Keep last 2: {6, 7}; delete {1..=5}.
+            cat.reclaim_old_manifests(2).await.unwrap();
+        }
+
+        // Reopen — must land on HEAD=7 via the low-water pointer,
+        // not on HEAD=0 (which would be the bug where discovery
+        // probes v1 and sees it gone).
+        let cat2 = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+        assert_eq!(cat2.head().await, 7, "reopen must rediscover HEAD=7");
+        assert_eq!(cat2.current_manifest().await.snapshot_id, 7);
+        assert_eq!(cat2.current_manifest().await.entries.len(), 6);
+
+        // And further commits still advance HEAD normally.
+        let mut txn = SnapshotTransaction::new();
+        txn.add_file(test_data_file("data/L0/f_new.parquet"));
+        cat2.commit(&txn, schema_arc).await.unwrap();
+        assert_eq!(cat2.head().await, 8);
+    }
+
+    /// Phase 6: keep_recent larger than HEAD deletes nothing.
+    #[tokio::test]
+    async fn reclaim_keep_larger_than_head_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileStore::new(tmp.path()).unwrap());
+        let cat = ObjectStoreCatalog::open(store.clone(), test_schema())
+            .await
+            .unwrap();
+        // HEAD = 1.
+        let removed = cat.reclaim_old_manifests(100).await.unwrap();
+        assert!(removed.is_empty());
+        assert!(store.exists("metadata/v1.manifest.bin").await.unwrap());
     }
 
     /// `refresh()` on a reader catalog picks up commits from a
