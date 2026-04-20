@@ -164,6 +164,57 @@ async fn skip_update_discrimination_tags_every_put_as_insert() {
     }
 }
 
+/// Issue #33 regression: the DELETE pre-image MUST survive
+/// compaction. Under stress, a Put→Delete pair on the same key
+/// can be compacted to L1 before the change feed drains; if
+/// pre-image reconstruction relied on looking up the prior Put
+/// at `seq-1`, the Put would be gone (compaction merged it away
+/// behind the tombstone). The fix (#33) captures the pre-image
+/// inline on the tombstone at write time.
+#[tokio::test]
+async fn issue_33_delete_pre_image_survives_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open_engine(&tmp).await;
+
+    // Put key=7 → flush (lands in L0).
+    engine
+        .put(vec![FieldValue::Int64(7)], row(7, 12345))
+        .await
+        .unwrap();
+    engine.flush().await.unwrap();
+
+    // Delete key=7 → flush → compact. The L0 Put + L0 Delete
+    // should compact together; after compaction only the Delete
+    // tombstone survives (Put is obsolete at the newer seq).
+    engine.delete(vec![FieldValue::Int64(7)]).await.unwrap();
+    engine.flush().await.unwrap();
+    engine.compact().await.unwrap();
+
+    // Change feed from seq 0 — the DELETE record MUST carry the
+    // pre-image (id=7, v=12345), not an empty row. Pre-#33 this
+    // returned Row::default() because `point_lookup_at(seq-1)`
+    // couldn't find the Put any more.
+    let mut cur = ChangeFeedCursor::from_engine(engine, 0);
+    let batch = cur.next_batch(100).unwrap();
+    let del = batch
+        .iter()
+        .find(|r| matches!(r.op, ChangeOp::Delete))
+        .expect("delete op present in feed");
+    assert!(
+        !del.row.fields.is_empty(),
+        "#33 regression: DELETE at seq {} returned empty pre-image",
+        del.seq
+    );
+    match del.row.fields.first().and_then(|f| f.as_ref()) {
+        Some(FieldValue::Int64(n)) => assert_eq!(*n, 7),
+        other => panic!("pre-image id: {other:?}"),
+    }
+    match del.row.fields.get(1).and_then(|f| f.as_ref()) {
+        Some(FieldValue::Int64(n)) => assert_eq!(*n, 12345),
+        other => panic!("pre-image v: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn delete_without_prior_state_returns_empty_pre_image() {
     let tmp = tempfile::tempdir().unwrap();

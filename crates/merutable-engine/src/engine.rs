@@ -490,12 +490,25 @@ impl MeruEngine {
         let user_key_bytes = InternalKey::encode_user_key(&pk_values, &self.schema)?;
 
         // Encode value bytes (CPU work, outside the WAL lock).
-        let value_bytes = match row {
-            Some(r) => {
-                let encoded = crate::codec::encode_row(&r)?;
-                Some(bytes::Bytes::from(encoded))
+        // Issue #33 fix: for Delete ops, the pre-image row IS the
+        // value we encode — captured via point_lookup BEFORE the
+        // WAL lock so the change feed gets a meaningful pre-image
+        // on the resulting DELETE record. An empty bytes result
+        // means the key had no prior live state (the delete is
+        // idempotent over an already-tombstoned or never-existed
+        // key).
+        let value_bytes = match op_type {
+            OpType::Put => match row {
+                Some(r) => Some(bytes::Bytes::from(crate::codec::encode_row(&r)?)),
+                None => None,
+            },
+            OpType::Delete => {
+                let pre_image = crate::read_path::point_lookup(self, &pk_values)?;
+                match pre_image {
+                    Some(r) => Some(bytes::Bytes::from(crate::codec::encode_row(&r)?)),
+                    None => Some(bytes::Bytes::new()),
+                }
             }
-            None => None,
         };
 
         // IMP-02: allocate seq, WAL append, and memtable apply all happen
@@ -513,7 +526,10 @@ impl MeruEngine {
                     bytes::Bytes::from(user_key_bytes.clone()),
                     value_bytes.unwrap_or_default(),
                 ),
-                OpType::Delete => batch.delete(bytes::Bytes::from(user_key_bytes.clone())),
+                OpType::Delete => batch.delete_with_pre_image(
+                    bytes::Bytes::from(user_key_bytes.clone()),
+                    value_bytes.clone().unwrap_or_default(),
+                ),
             }
 
             wal.append(&batch)?;
@@ -708,9 +724,19 @@ impl MeruEngine {
             if entry.seq.0 <= since_seq {
                 continue;
             }
+            // Issue #33 fix: for Delete ops, the pre-image row is
+            // encoded inline as the value (see apply_batch /
+            // write_internal). Empty value → no pre-image was
+            // available at delete time.
             let row = match entry.entry.op_type {
                 OpType::Put => crate::codec::decode_row(&entry.entry.value)?,
-                OpType::Delete => merutable_types::value::Row::default(),
+                OpType::Delete => {
+                    if entry.entry.value.is_empty() {
+                        merutable_types::value::Row::default()
+                    } else {
+                        crate::codec::decode_row(&entry.entry.value)?
+                    }
+                }
             };
             out.push(ChangeTuple {
                 seq: entry.seq.0,
@@ -853,9 +879,22 @@ impl MeruEngine {
                 if seq <= since_seq || seq > read_seq.0 {
                     continue;
                 }
+                // Issue #33 fix: for Delete ops in L0 Parquet, the
+                // pre-image row is the row data stored alongside
+                // the tombstone (Parquet preserves the value column
+                // through flush + compaction). If for any reason
+                // the row decodes as empty (no pre-image captured
+                // at write time, or legacy file), fall back to
+                // Row::default().
                 let op_row = match ikey.op_type {
                     OpType::Put => row,
-                    OpType::Delete => merutable_types::value::Row::default(),
+                    OpType::Delete => {
+                        if row.fields.is_empty() {
+                            merutable_types::value::Row::default()
+                        } else {
+                            row
+                        }
+                    }
                 };
                 // Encode pk_bytes from the InternalKey's decoded
                 // pk_values so the tuple carries the same key

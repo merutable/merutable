@@ -153,7 +153,35 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
                     Bytes::from(encoded)
                 })
                 .unwrap_or_default(),
-            OpType::Delete => Bytes::new(),
+            // Issue #33 fix: capture the delete pre-image at write
+            // time instead of reconstructing post-hoc via
+            // point_lookup_at(seq-1). The reconstruction approach
+            // (Phase 2c) silently returned empty rows whenever
+            // compaction had already merged the superseded Put into
+            // L1+ and dropped it behind the tombstone — exactly
+            // what happens under a hot stress workload. Capturing
+            // the pre-image inline on the tombstone means the
+            // change feed reads the pre-image directly from the
+            // memtable/L0/L1+ without a lookup. Compaction
+            // preserves the tombstone's value bytes, so the
+            // pre-image survives to wherever the feed drains.
+            //
+            // Cost: one point_lookup per delete op at write time.
+            // Amortized into the WAL-fsync critical section by
+            // doing the lookup BEFORE acquiring the WAL lock.
+            // Stale-window risk: between the lookup and the WAL
+            // append, another writer could update the key; the
+            // captured pre-image would then be "one op behind."
+            // For a change feed this is acceptable — the
+            // semantics are "last-known state at delete seq,"
+            // not "causally-immediate pre-image."
+            OpType::Delete => {
+                let pre_image = crate::read_path::point_lookup(engine, &mutation.pk_values)?;
+                match pre_image {
+                    Some(row) => Bytes::from(codec::encode_row(&row).unwrap_or_default()),
+                    None => Bytes::new(),
+                }
+            }
         };
         encoded_ops.push(EncodedOp {
             user_key_bytes,
@@ -187,7 +215,14 @@ pub async fn apply_batch(engine: &Arc<MeruEngine>, batch: MutationBatch) -> Resu
                     );
                 }
                 OpType::Delete => {
-                    wal_batch.delete(Bytes::from(op.user_key_bytes.clone()));
+                    // Issue #33 fix: delete carries its pre-image
+                    // bytes (possibly empty). The value was
+                    // populated by the earlier encoding loop via
+                    // `point_lookup(&mutation.pk_values)`.
+                    wal_batch.delete_with_pre_image(
+                        Bytes::from(op.user_key_bytes.clone()),
+                        op.value_bytes.clone(),
+                    );
                 }
             }
         }

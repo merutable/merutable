@@ -53,14 +53,38 @@ impl WriteBatch {
     }
 
     pub fn delete(&mut self, key: Bytes) {
+        // Back-compat shim. Issue #33 fix: prefer
+        // `delete_with_pre_image` so the change feed surfaces
+        // a meaningful pre-image on the resulting DELETE record.
+        self.delete_with_pre_image(key, Bytes::new());
+    }
+
+    /// Issue #33: delete carrying a pre-image payload for the
+    /// change feed. `pre_image` is the encoded row state at the
+    /// instant before the delete; empty bytes signal "no prior
+    /// live state" (the key was already tombstoned or never
+    /// existed). Persists through compaction because the memtable
+    /// + SST formats keep the full `EntryValue::value`.
+    pub fn delete_with_pre_image(&mut self, key: Bytes, pre_image: Bytes) {
         self.records.push(BatchRecord {
             op_type: OpType::Delete,
             user_key: key,
-            value: None,
+            // Store as `Some` even when empty so the encode/decode
+            // path treats Delete records identically to Put: a
+            // varint length prefix always follows the user key.
+            value: Some(pre_image),
         });
     }
 
     /// Encode to wire bytes for WAL append.
+    ///
+    /// Issue #33 breaking change: Delete records now ALWAYS carry
+    /// a varint-prefixed value segment (possibly zero-length).
+    /// Pre-#33 WAL files encoded Delete records with no value
+    /// segment at all; they are not readable by the post-#33
+    /// decoder. merutable is pre-0.1 — WAL-format incompat is
+    /// acceptable at this phase, and fresh catalogs are
+    /// unaffected.
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(16 + self.records.len() * 32);
         buf.put_u64_le(self.sequence.0);
@@ -69,10 +93,11 @@ impl WriteBatch {
             buf.put_u8(rec.op_type as u8);
             put_varint(&mut buf, rec.user_key.len() as u64);
             buf.put_slice(&rec.user_key);
-            if let Some(val) = &rec.value {
-                put_varint(&mut buf, val.len() as u64);
-                buf.put_slice(val);
-            }
+            // Both Put and Delete records carry a value segment.
+            // Delete with no pre-image → empty bytes (varint(0)).
+            let val = rec.value.as_ref().cloned().unwrap_or_default();
+            put_varint(&mut buf, val.len() as u64);
+            buf.put_slice(&val);
         }
         buf.freeze()
     }
@@ -94,12 +119,13 @@ impl WriteBatch {
             };
             let key_len = read_varint(&mut data)?;
             let user_key = read_bytes(&mut data, key_len as usize)?;
-            let value = if op_type == OpType::Put {
-                let val_len = read_varint(&mut data)?;
-                Some(read_bytes(&mut data, val_len as usize)?)
-            } else {
-                None
-            };
+            // Issue #33: both Put and Delete records carry a
+            // varint-prefixed value segment. Delete records use
+            // the value to store the pre-image row at delete
+            // time; empty bytes (varint(0)) mean "no prior
+            // state."
+            let val_len = read_varint(&mut data)?;
+            let value = Some(read_bytes(&mut data, val_len as usize)?);
             records.push(BatchRecord {
                 op_type,
                 user_key,
@@ -209,7 +235,9 @@ mod tests {
         assert_eq!(decoded.records[0].user_key, Bytes::from("key1"));
         assert_eq!(decoded.records[0].value.as_deref().unwrap(), b"value1");
         assert_eq!(decoded.records[1].op_type, OpType::Delete);
-        assert!(decoded.records[1].value.is_none());
+        // Issue #33: Delete records now carry an (empty-for-no-
+        // pre-image) value segment. Empty bytes → Some(0-len).
+        assert_eq!(decoded.records[1].value.as_deref(), Some(&[][..]));
         assert_eq!(
             decoded.records[2].value.as_deref().unwrap(),
             b"\x00\xFF\x00"
