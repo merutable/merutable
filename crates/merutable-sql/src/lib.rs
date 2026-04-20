@@ -165,6 +165,27 @@ enum CursorInner {
     Engine {
         engine: Arc<MeruEngine>,
         since_seq: u64,
+        /// Issue #36 fix: pre-resolved records waiting to be
+        /// served. `next_batch` drains up to `max_rows` from the
+        /// head on each call; when the buffer empties, the next
+        /// call refills it by scanning from the cursor's current
+        /// `since_seq` to the engine's current `read_seq`.
+        ///
+        /// Pre-#36, every call re-scanned the ENTIRE
+        /// `(since_seq, read_seq]` range and returned only the
+        /// first `max_rows`. For a 3M-record drain at
+        /// `batch_size=1024`, that's ~3k batches × ~3M scan =
+        /// O(N²) work; the 30s budget blew out at ~1M records.
+        /// Buffering collapses the drain to a single O(N) scan
+        /// plus O(1) per `next_batch` pop.
+        ///
+        /// Records are stored in reverse order (newest at the
+        /// front of `Vec::pop`) so `next_batch` can use O(1)
+        /// `pop` from the tail. But we want seq-ascending output,
+        /// so we store them in ascending order and drain from
+        /// the front via `split_off`. `split_off` is O(k) where k
+        /// is the drained count — amortized O(1) per record.
+        buffer: Vec<ChangeRecord>,
     },
     BelowRetention {
         requested: u64,
@@ -178,7 +199,11 @@ impl ChangeFeedCursor {
     /// `(since_seq, engine.read_seq()]` are returned.
     pub fn from_engine(engine: Arc<MeruEngine>, since_seq: u64) -> Self {
         Self {
-            inner: CursorInner::Engine { engine, since_seq },
+            inner: CursorInner::Engine {
+                engine,
+                since_seq,
+                buffer: Vec::new(),
+            },
             skip_update_discrimination: false,
         }
     }
@@ -224,50 +249,79 @@ impl ChangeFeedCursor {
                 requested: *requested,
                 low_water: *low_water,
             }),
-            CursorInner::Engine { engine, since_seq } => {
-                let read_seq = engine.read_seq();
-                if SeqNum(*since_seq) >= read_seq {
-                    return Ok(Vec::new());
-                }
-                // Phase 2c: pre-image reconstruction. Walks the
-                // tail AND resolves each Delete's prior live state.
-                let raw = engine.scan_tail_changes_with_pre_image(*since_seq, read_seq)?;
-                let mut out = Vec::with_capacity(raw.len().min(max_rows));
-                for tuple in raw.into_iter().take(max_rows) {
-                    let op = match tuple.op_type {
-                        OpType::Put => {
-                            if self.skip_update_discrimination {
-                                ChangeOp::Insert
-                            } else {
-                                // Phase 2c: distinguish Insert from
-                                // Update by probing whether a live
-                                // row existed at `seq - 1`.
-                                let had_prior = if tuple.seq == 0 {
-                                    false
-                                } else {
-                                    engine
-                                        .point_lookup_by_user_key_at_seq(
-                                            &tuple.pk_bytes,
-                                            SeqNum(tuple.seq - 1),
-                                        )?
-                                        .is_some()
-                                };
-                                if had_prior {
-                                    ChangeOp::Update
-                                } else {
+            CursorInner::Engine {
+                engine,
+                since_seq,
+                buffer,
+            } => {
+                // Issue #36 fix: refill the buffer in ONE scan when
+                // it empties, then serve O(1) batches from the
+                // buffer. Pre-#36, every `next_batch` call re-scanned
+                // the entire `(since_seq, read_seq]` range and took
+                // only the first `max_rows` — quadratic total work
+                // for a bootstrap drain from seq=0. A 3M-record drain
+                // at batch_size=1024 blew past the 30s budget at
+                // ~1M records. Buffering makes the total work
+                // O(N) in the tail size (one scan) plus O(1) per
+                // returned record.
+                if buffer.is_empty() {
+                    let read_seq = engine.read_seq();
+                    if SeqNum(*since_seq) >= read_seq {
+                        return Ok(Vec::new());
+                    }
+                    // Phase 2c: pre-image reconstruction. Walks the
+                    // tail AND resolves each Delete's prior live state.
+                    let raw = engine.scan_tail_changes_with_pre_image(*since_seq, read_seq)?;
+                    buffer.reserve(raw.len());
+                    for tuple in raw {
+                        let op = match tuple.op_type {
+                            OpType::Put => {
+                                if self.skip_update_discrimination {
                                     ChangeOp::Insert
+                                } else {
+                                    // Distinguish Insert from Update
+                                    // by probing whether a live row
+                                    // existed at `seq - 1`.
+                                    let had_prior = if tuple.seq == 0 {
+                                        false
+                                    } else {
+                                        engine
+                                            .point_lookup_by_user_key_at_seq(
+                                                &tuple.pk_bytes,
+                                                SeqNum(tuple.seq - 1),
+                                            )?
+                                            .is_some()
+                                    };
+                                    if had_prior {
+                                        ChangeOp::Update
+                                    } else {
+                                        ChangeOp::Insert
+                                    }
                                 }
                             }
-                        }
-                        OpType::Delete => ChangeOp::Delete,
-                    };
-                    *since_seq = tuple.seq;
-                    out.push(ChangeRecord {
-                        seq: tuple.seq,
-                        op,
-                        row: tuple.row,
-                        pk_bytes: tuple.pk_bytes,
-                    });
+                            OpType::Delete => ChangeOp::Delete,
+                        };
+                        buffer.push(ChangeRecord {
+                            seq: tuple.seq,
+                            op,
+                            row: tuple.row,
+                            pk_bytes: tuple.pk_bytes,
+                        });
+                    }
+                }
+
+                // Serve up to `max_rows` from the head of the buffer.
+                let drain_n = buffer.len().min(max_rows);
+                if drain_n == 0 {
+                    return Ok(Vec::new());
+                }
+                // `split_off(drain_n)` keeps the tail in the buffer
+                // and returns the head-drained chunk. We want the
+                // HEAD out; so swap.
+                let remainder = buffer.split_off(drain_n);
+                let out = std::mem::replace(buffer, remainder);
+                if let Some(last) = out.last() {
+                    *since_seq = last.seq;
                 }
                 Ok(out)
             }
@@ -280,6 +334,18 @@ impl ChangeFeedCursor {
         match &self.inner {
             CursorInner::Engine { since_seq, .. } => *since_seq,
             CursorInner::BelowRetention { requested, .. } => *requested,
+        }
+    }
+
+    /// Records prefetched but not yet drained to the caller. Zero
+    /// on a fresh cursor and between the drain and the next scan;
+    /// non-zero after a scan fills the buffer and before subsequent
+    /// `next_batch` calls empty it. Useful for tests and operators
+    /// reasoning about cursor memory footprint.
+    pub fn buffered_len(&self) -> usize {
+        match &self.inner {
+            CursorInner::Engine { buffer, .. } => buffer.len(),
+            CursorInner::BelowRetention { .. } => 0,
         }
     }
 }
