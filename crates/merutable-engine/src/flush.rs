@@ -19,7 +19,7 @@ use merutable_memtable::iterator::MemEntry;
 use merutable_types::{
     key::InternalKey,
     level::{Level, ParquetFileMeta},
-    sequence::{OpType, SeqNum},
+    sequence::SeqNum,
     value::Row,
     MeruError, Result,
 };
@@ -97,25 +97,41 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         wire.extend_from_slice(&tag.to_be_bytes());
         let ikey = InternalKey::decode(&wire, &engine.schema)?;
 
-        // The row data is stored in EntryValue.value as serialized bytes.
-        // Deserialize back to Row.
-        let row = if entry.entry.op_type == OpType::Put && !entry.entry.value.is_empty() {
+        // The row data is stored in EntryValue.value as serialized
+        // bytes. Deserialize back to Row.
+        //
+        // Issue #33 fix: whenever `value` is non-empty, decode it as
+        // the authoritative Row for BOTH Put and Delete ops. For a
+        // Put this is the post-state; for a Delete this is the
+        // pre-image captured at write time (see write_path.rs).
+        // Writing the pre-image as the tombstone's typed columns
+        // AND `_merutable_value` blob means the pre-image survives
+        // flush + compaction, which is what the change feed needs
+        // to emit meaningful DELETE records.
+        //
+        // Pre-#33, the Put-only branch decoded the value and the
+        // Delete branch built a PK-only row, discarding any
+        // pre-image bytes the memtable may have carried. Under
+        // turbo-mode stress this produced empty DELETE pre-images
+        // once compaction dropped the prior Put file.
+        let row = if !entry.entry.value.is_empty() {
             // Issue #12: decode errors surface as Corruption; a
             // single bad row aborts flush so the caller knows to
             // investigate rather than silently writing empty rows.
             crate::codec::decode_row(&entry.entry.value)?
         } else {
-            // Bug N fix: tombstone rows must carry the correct PK values in
-            // their typed columns so HTAP readers (Spark/DuckDB) can identify
-            // which key was deleted. Previously Row::default() produced zero
-            // fields, which the codec's Bug K fix filled with sentinel values
-            // (session_id=0, turn_id=0, etc.) — making tombstones look like
-            // phantom rows with PK (0,0) in external queries.
+            // Legacy / no-pre-image path: Bug N fix — tombstone
+            // rows still carry the correct PK values in their
+            // typed columns so HTAP readers (Spark/DuckDB) can
+            // identify which key was deleted. Previously
+            // Row::default() produced zero fields, which the
+            // codec's Bug K fix filled with sentinel values
+            // (session_id=0, turn_id=0, etc.) — making tombstones
+            // look like phantom rows with PK (0,0) in external
+            // queries.
             //
-            // Build a Row with PK columns populated from the InternalKey and
-            // non-PK columns set to None (the codec will fill sentinels for
-            // non-nullable non-PK columns, which is acceptable since external
-            // readers filter tombstones via the _merutable_ikey op_type tag).
+            // Build a Row with PK columns populated from the
+            // InternalKey and non-PK columns set to None.
             let pk_values = ikey.pk_values();
             let mut fields: Vec<Option<merutable_types::value::FieldValue>> =
                 vec![None; engine.schema.columns.len()];
