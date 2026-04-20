@@ -815,6 +815,16 @@ impl MeruEngine {
         use merutable_parquet::reader::ParquetReader;
         use merutable_types::level::Level;
 
+        // Issue #37 fix: pin the snapshot before ANY memtable or
+        // file work. Pre-#37, this scan read `version_set.current()`
+        // with no pin at all — GC could (and did, under the chaos-
+        // monkey concurrent-export workload) delete an L0 Parquet
+        // file while the change-feed cursor was about to open it,
+        // producing `IO error: No such file or directory`. Holding
+        // `_pin` for the duration of the scan ties every L0 file
+        // the captured `Version` references to disk.
+        let (_pin, version) = self.pin_current_snapshot();
+
         // Memtable first so the L0 rows append after the memtable
         // rows before the final sort. Either order is correct
         // (sort is the invariant), ordering this way just keeps
@@ -822,7 +832,6 @@ impl MeruEngine {
         // dominates.
         let mut out = self.scan_memtable_changes(since_seq, read_seq)?;
 
-        let version = self.version_set.current();
         let files = version.files_at(Level(0));
         let base = self.catalog.base_path();
         for file in files {
@@ -1146,11 +1155,29 @@ impl MeruEngine {
         SnapshotPin<'_>,
         std::sync::Arc<merutable_iceberg::version::Version>,
     ) {
+        // Issue #37 fix: acquire `live_snapshots` BEFORE reading the
+        // current version. Pre-#37 this read the version first, then
+        // took the lock — the window between the two calls let GC
+        // observe `min_pinned_snapshot == None`, decide a file was
+        // deletable, and unlink it before our pin registered. A
+        // subsequent read against our captured `Version` would then
+        // fail with `ENOENT`.
+        //
+        // Lock-first makes the check-then-act atomic with respect
+        // to GC's pin-status read (which takes the same lock):
+        //   - If GC's pass runs BEFORE our lock acquisition, we
+        //     subsequently observe the NEWER version (compaction
+        //     installed before GC enqueued the delete), which does
+        //     not reference the deleted file.
+        //   - If GC's pass runs AFTER our lock acquisition, GC sees
+        //     our pin in `min_pinned_snapshot` and defers any file
+        //     whose `obsoleted_after_snapshot >= our_id`.
+        // Either way, files in our pinned `Version` remain on disk.
+        let mut pins = self.live_snapshots.lock().unwrap();
         let version_guard = self.version_set.current();
         let snapshot_id = version_guard.snapshot_id;
         let version: std::sync::Arc<merutable_iceberg::version::Version> = (*version_guard).clone();
         drop(version_guard);
-        let mut pins = self.live_snapshots.lock().unwrap();
         *pins.entry(snapshot_id).or_insert(0) += 1;
         drop(pins);
         (

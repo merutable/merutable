@@ -279,6 +279,17 @@ pub fn range_scan(
     start_pk: Option<&[FieldValue]>,
     end_pk: Option<&[FieldValue]>,
 ) -> Result<Vec<(InternalKey, Row)>> {
+    // Issue #37 fix: pin BEFORE the memtable harvest. Pre-#37 this
+    // pin happened after the encode + memtable-decode work (tens of
+    // ms under heavy load), leaving a TOCTOU window where a
+    // concurrent compaction-GC could delete a Parquet file still
+    // referenced by the `Version` this scan was about to open.
+    // Pinning at the top of the function — before ANY work that
+    // might depend on the Version — closes the window: GC sees our
+    // pin on its first `min_pinned_snapshot()` read after we
+    // register, and the pinned `Version`'s files are guaranteed to
+    // remain on disk until `_pin` drops at function return.
+    let (_pin, version) = engine.pin_current_snapshot();
     let read_seq = engine.read_seq();
 
     // Encode start/end user key bytes.
@@ -339,15 +350,10 @@ pub fn range_scan(
         harvest.push((ikey, row, entry.entry.op_type));
     }
 
-    // 2. Every live Parquet file at every level.
-    //
-    // Pin the current snapshot for the full scan — on large datasets
-    // a range scan can take longer than `gc_grace_period_secs` (default
-    // 5 minutes); without pinning, GC could delete a Parquet file mid-
-    // scan and produce `IO NotFound` (BUG-0007..0013). The `_pin` guard
-    // keeps every file the `version` references on disk until this
-    // function returns.
-    let (_pin, version) = engine.pin_current_snapshot();
+    // 2. Every live Parquet file at every level. `version` and
+    // `_pin` were acquired at the top of the function (#37 fix);
+    // GC cannot delete any file the pinned `version` references
+    // until we return and `_pin` drops.
     let base = engine.catalog.base_path();
     let max_level = version.max_level();
     for lvl in 0..=max_level.0 {
