@@ -201,27 +201,59 @@ impl InProcessLogSource {
 impl LogSource for InProcessLogSource {
     async fn stream(&self, since: u64) -> Result<BoxStream<'static, Result<OpRecord>>> {
         use futures::stream::StreamExt;
-        // Drain the cursor eagerly into a Vec and hand back a
-        // once-through stream. Phase 2a's cursor is sync under the
-        // hood (memtable scan); streaming primarily gives us
-        // back-pressure on the replica side as it applies ops.
+        // Issue #34 fix: snapshot the primary's latest seq AT
+        // stream-open time and drain only up to that bound.
+        //
+        // Pre-#34, this loop called `cursor.next_batch` until it
+        // returned empty. But `next_batch` captures a FRESH
+        // `engine.read_seq()` on each call — so under a live
+        // primary with steady writes, the target kept advancing
+        // and the drain never terminated. `rebase_hotswap()` and
+        // `advance()` both drain the stream and both hung
+        // indefinitely (observed: 35+ min against a 1.7 MB/s
+        // primary, replica RSS ballooned 10x disk size as the
+        // tail accumulated every op since seq 0).
+        //
+        // The replica contract is "catch up to the primary's NOW
+        // at drain-open time." Ops committed AFTER we started are
+        // out of scope for this drain; the next advance/rebase
+        // will pick them up. This makes stream() snapshot-
+        // semantic and guaranteed to terminate regardless of
+        // primary write rate.
         let engine = self.db.engine_for_replica();
-        let mut cursor = merutable_sql::ChangeFeedCursor::from_engine(engine, since);
-        let mut records: Vec<Result<OpRecord>> = Vec::new();
-        loop {
-            let batch = cursor.next_batch(self.batch_size)?;
-            if batch.is_empty() {
-                break;
+        let upper = engine.read_seq().0;
+        let records: Vec<Result<OpRecord>> = if since >= upper {
+            Vec::new()
+        } else {
+            let mut cursor = merutable_sql::ChangeFeedCursor::from_engine(engine, since);
+            let mut out: Vec<Result<OpRecord>> = Vec::new();
+            loop {
+                let batch = cursor.next_batch(self.batch_size)?;
+                if batch.is_empty() {
+                    break;
+                }
+                let mut reached_upper = false;
+                for r in batch {
+                    if r.seq > upper {
+                        // Cursor's internal read_seq raced past
+                        // our snapshot bound. Drop — next drain
+                        // will pick it up.
+                        reached_upper = true;
+                        break;
+                    }
+                    out.push(Ok(OpRecord {
+                        seq: r.seq,
+                        op: r.op,
+                        row: r.row,
+                        pk_bytes: r.pk_bytes,
+                    }));
+                }
+                if reached_upper || cursor.since_seq() >= upper {
+                    break;
+                }
             }
-            for r in batch {
-                records.push(Ok(OpRecord {
-                    seq: r.seq,
-                    op: r.op,
-                    row: r.row,
-                    pk_bytes: r.pk_bytes,
-                }));
-            }
-        }
+            out
+        };
         Ok(futures::stream::iter(records).boxed())
     }
 
@@ -436,6 +468,16 @@ pub struct Replica {
     /// `RwLock::read`.
     rebase_count: std::sync::atomic::AtomicU64,
     last_rebase_warmup_millis: std::sync::atomic::AtomicU64,
+    /// Issue #34: `rebase_hotswap` deadline in milliseconds. Zero
+    /// disables the timeout (unbounded). Default 60_000 — 60s is
+    /// generous for warm catalog reopens + log-source drain;
+    /// hangs beyond that indicate the primary's write rate
+    /// exceeds replica drain throughput and the caller should
+    /// escalate (raise timeout, throttle writes, or rebuild the
+    /// replica). Before #34, there was no timeout — a hang meant
+    /// the caller await'd forever. See
+    /// `Replica::set_rebase_timeout`.
+    rebase_timeout_millis: std::sync::atomic::AtomicU64,
     /// OpenOptions used to spawn the initial base; cloned + used
     /// again by `rebase_hotswap` to open a fresh read-only MeruDB
     /// for the new state. The new MeruDB reads the latest
@@ -485,7 +527,31 @@ impl Replica {
             base_opts,
             rebase_count: std::sync::atomic::AtomicU64::new(0),
             last_rebase_warmup_millis: std::sync::atomic::AtomicU64::new(0),
+            rebase_timeout_millis: std::sync::atomic::AtomicU64::new(60_000),
         })
+    }
+
+    /// Issue #34: tune `rebase_hotswap`'s deadline. `None`
+    /// disables the timeout; `Some(d)` sets it to `d`. Storage
+    /// is milliseconds; values are clamped to `u64::MAX ms`.
+    /// Default (set in `open`) is 60s.
+    pub fn set_rebase_timeout(&self, timeout: Option<std::time::Duration>) {
+        let millis = timeout.map(|d| d.as_millis() as u64).unwrap_or(0);
+        self.rebase_timeout_millis
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Currently configured `rebase_hotswap` deadline. `None` if
+    /// timeouts are disabled.
+    pub fn rebase_timeout(&self) -> Option<std::time::Duration> {
+        let m = self
+            .rebase_timeout_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if m == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(m))
+        }
     }
 
     /// Phase 5: observability snapshot. Cheap — atomic loads +
@@ -635,51 +701,78 @@ impl Replica {
     /// confirmation signal for caller timers / metrics exporters.
     pub async fn rebase_hotswap(&self) -> Result<(u64, u64)> {
         let start = std::time::Instant::now();
-        // Step 1: open the new base. This is a fresh MeruDB
-        // independent from the one the current state uses, so
-        // old readers (holding an Arc<ReplicaState>) keep reading
-        // from the OLD base's pinned snapshot.
-        let new_base = std::sync::Arc::new(merutable::MeruDB::open(self.base_opts.clone()).await?);
-        let new_base_seq = new_base.read_seq().0;
+        let timeout_millis = self
+            .rebase_timeout_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let base_opts = self.base_opts.clone();
+        let log_source = self.log_source.clone();
 
-        // Step 2: empty tail anchored at new_base_seq.
-        let mut fresh_tail = ReplicaTail::new();
-        if new_base_seq > 0 {
-            fresh_tail.seed_visible_seq(new_base_seq);
-        }
-
-        // Step 3: warm up by draining the log source. Happens
-        // BEFORE the swap, so the new state is fully caught up
-        // the moment it becomes the live target.
+        // All the slow work — open a fresh MeruDB, drain the log
+        // source into a warm tail — is wrapped in one future so
+        // #34's timeout applies to the combined chain. Any single
+        // step (reopen, drain) that runs long enough to exceed
+        // the budget produces a clean `Timeout` error instead of
+        // an indefinite `.await`.
         //
-        // Phase 6: tolerate `ChangeFeedBelowRetention` during
-        // warmup. This IS the recovery path from a retention gap —
-        // the log source can't catch the new tail up because
-        // it's already too far behind, but the new base is fresh,
-        // so leaving the tail empty at new_base_seq is the
-        // correct end state. Every other error propagates.
-        match fresh_tail.advance(self.log_source.as_ref()).await {
-            Ok(()) => {}
-            Err(MeruError::ChangeFeedBelowRetention { .. }) => {
-                // Fresh tail stays empty; visible_seq stays at
-                // seeded new_base_seq. Readers see the base
-                // snapshot only, which is exactly the recovered
-                // state.
+        // Pre-#34, a drain-loop hang (InProcessLogSource chasing
+        // a moving target under live writes) wedged this call
+        // forever. The source-side snapshot bound (this commit)
+        // is the root-cause fix; this timeout is the belt-and-
+        // braces safety net for any future `LogSource` impl that
+        // could reintroduce unbounded drain (network, Raft,
+        // Kafka) or for warm-up I/O that genuinely takes too long
+        // (degraded disk, large catalog refresh).
+        let work = async move {
+            // Step 1: open the new base.
+            let new_base = std::sync::Arc::new(merutable::MeruDB::open(base_opts).await?);
+            let new_base_seq = new_base.read_seq().0;
+
+            // Step 2: empty tail anchored at new_base_seq.
+            let mut fresh_tail = ReplicaTail::new();
+            if new_base_seq > 0 {
+                fresh_tail.seed_visible_seq(new_base_seq);
             }
-            Err(other) => return Err(other),
-        }
-        let new_visible_seq = fresh_tail.visible_seq();
 
-        let new_state = std::sync::Arc::new(ReplicaState {
-            base: new_base,
-            tail: tokio::sync::RwLock::new(fresh_tail),
-        });
+            // Step 3: warm up by draining the log source.
+            // Phase 6: tolerate `ChangeFeedBelowRetention` — it's
+            // the recovery path, and an empty tail at
+            // new_base_seq is the correct end state. Every other
+            // error propagates.
+            match fresh_tail.advance(log_source.as_ref()).await {
+                Ok(()) => {}
+                Err(MeruError::ChangeFeedBelowRetention { .. }) => {}
+                Err(other) => return Err(other),
+            }
+            let new_visible_seq = fresh_tail.visible_seq();
 
-        // Step 4: atomic swap. After this returns, new incoming
-        // reads land on new_state. Old state has no new readers;
-        // it drops when the last outstanding Arc is released
-        // (typically immediately, since read methods hold the
-        // Arc only for the duration of the call).
+            let new_state = std::sync::Arc::new(ReplicaState {
+                base: new_base,
+                tail: tokio::sync::RwLock::new(fresh_tail),
+            });
+            Ok::<_, MeruError>((new_state, new_base_seq, new_visible_seq))
+        };
+
+        let (new_state, new_base_seq, new_visible_seq) = if timeout_millis > 0 {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_millis), work).await
+            {
+                Ok(inner) => inner?,
+                Err(_) => {
+                    return Err(MeruError::InvalidArgument(format!(
+                        "rebase_hotswap timed out after {timeout_millis}ms — \
+                         primary's write rate likely exceeds replica drain \
+                         throughput; raise `Replica::set_rebase_timeout` or \
+                         reduce primary load. The replica's old state is still \
+                         serving reads (this call left it untouched)."
+                    )))
+                }
+            }
+        } else {
+            work.await?
+        };
+
+        // Step 4: atomic swap. Moved outside the timed block so
+        // that a caller who asks for "no timeout" still gets an
+        // `ArcSwap::store` that cannot itself block indefinitely.
         self.state.store(new_state);
 
         // Phase 5 counters. Record BEFORE returning so a caller
