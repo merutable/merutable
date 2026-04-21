@@ -1,29 +1,95 @@
 [package]
-name    = "merutable"
-version = "0.1.0"
-edition = "2021"
+name        = "merutable"
+version     = "0.1.0"
+edition     = "2021"
 description = "Embeddable HTAP database: LSM-tree over Apache Iceberg and Parquet"
 keywords    = ["database", "lsm", "iceberg", "parquet", "htap"]
 license     = "Apache-2.0"
+build       = "build.rs"
+
+# Issue #38: this crate is the single published artifact for
+# merutable. The `sql` and `replica` modules are feature-gated so
+# downstream users can opt out of the DataFusion / replica
+# dependency weight. `default = ["sql"]` — change-feed is the
+# 0.1-preview headline feature. `replica` is opt-in (depends on
+# `sql` because the replica's log source consumes the change feed).
+[features]
+default = ["sql"]
+sql = ["dep:datafusion"]
+replica = ["sql"]
+
+[[bin]]
+name = "merutable-migrate"
+path = "src/bin/merutable-migrate.rs"
+
+[build-dependencies]
+prost-build = { workspace = true }
 
 [dependencies]
-metrics  = { workspace = true }
-merutable-types   = { workspace = true }
-merutable-engine  = { workspace = true }
-merutable-iceberg = { workspace = true }
-merutable-store   = { workspace = true }
-tokio            = { workspace = true }
-futures          = { workspace = true }
-tracing          = { workspace = true }
-serde            = { workspace = true }
-bytes            = { workspace = true }
+# Core deps absorbed from every former internal crate.
+metrics            = { workspace = true }
+bytes              = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+hex                = { workspace = true }
+
+# WAL / format
+crc32fast          = { workspace = true }
+
+# Memtable
+crossbeam-skiplist = { workspace = true }
+bumpalo            = { workspace = true }
+
+# Object store + LRU + checksum
+object_store       = { workspace = true }
+lru                = { workspace = true }
+blake3             = { workspace = true }
+
+# Parquet / Arrow
+parquet            = { workspace = true }
+arrow              = { workspace = true }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+xxhash-rust        = { workspace = true }
+once_cell          = { workspace = true }
+roaring            = { workspace = true }
+postcard           = { workspace = true }
+
+# Iceberg + protobuf
+prost              = { workspace = true }
+iceberg            = { workspace = true }
+arc-swap           = { workspace = true }
+uuid               = { workspace = true }
+
+# Async runtime
+tokio              = { workspace = true }
+futures            = { workspace = true }
+async-trait        = { workspace = true }
+tracing            = { workspace = true }
+
+# CLI (for the merutable-migrate binary)
+clap               = { version = "4", features = ["derive"] }
+sha2               = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SQL / DataFusion (feature `sql`)
+datafusion         = { version = "43", default-features = false, optional = true }
 
 [dev-dependencies]
+proptest           = { workspace = true }
+criterion          = { workspace = true }
 tempfile           = { workspace = true }
 tokio              = { workspace = true, features = ["full"] }
-tracing-subscriber = "0.3"
-# Used only by the Iceberg translator compatibility test — parses our
-# exported `metadata.json` back into a `TableMetadata` struct to pin
-# spec compliance.
-iceberg            = { workspace = true }
-serde_json         = { workspace = true }
+
+[[bench]]
+name    = "memtable_memtable"
+harness = false
+
+[[bench]]
+name    = "parquet_bloom"
+harness = false
+
+[[bench]]
+name    = "engine_compaction"
+harness = false

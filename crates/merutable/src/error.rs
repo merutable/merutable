@@ -1,2 +1,2 @@
-pub use merutable_types::MeruError as Error;
-pub use merutable_types::Result;
+pub use crate::types::MeruError as Error;
+pub use crate::types::Result;

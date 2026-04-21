@@ -9,8 +9,8 @@
 //! you override individually. Unset knobs pass `EngineConfig::default()`
 //! through.
 
-pub use merutable_engine::config::CommitMode;
-use merutable_types::schema::TableSchema;
+pub use crate::engine::config::CommitMode;
+use crate::types::schema::TableSchema;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct MirrorConfig {
     /// S3 / GCS / Azure destination. Must implement `MeruStore`.
-    pub target: Arc<dyn merutable_store::traits::MeruStore>,
+    pub target: Arc<dyn crate::store::traits::MeruStore>,
     /// Warn above this lag (seconds between primary commit_time and
     /// last-mirrored commit_time). Alert-only in v1; writes never
     /// block on mirror lag.
@@ -69,7 +69,7 @@ impl std::fmt::Debug for MirrorConfig {
 impl MirrorConfig {
     /// Production defaults for lag alert (60s) and parallelism (4).
     /// Callers must still provide `target`.
-    pub fn new(target: Arc<dyn merutable_store::traits::MeruStore>) -> Self {
+    pub fn new(target: Arc<dyn crate::store::traits::MeruStore>) -> Self {
         Self {
             target,
             max_lag_alert_secs: 60,
@@ -157,12 +157,12 @@ pub struct OpenOptions {
 impl OpenOptions {
     /// Construct a builder with the given table schema and
     /// production defaults for every other field. The defaults come
-    /// from `merutable_engine::config::EngineConfig::default()` — see
+    /// from `crate::engine::config::EngineConfig::default()` — see
     /// that type for the authoritative values.
     pub fn new(schema: TableSchema) -> Self {
         // Pull defaults from EngineConfig so there's exactly one
         // place to change production constants.
-        let ec = merutable_engine::config::EngineConfig::default();
+        let ec = crate::engine::config::EngineConfig::default();
         Self {
             schema,
             catalog_uri: String::new(),
@@ -362,8 +362,8 @@ impl OpenOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use merutable_store::local::LocalFileStore;
-    use merutable_types::schema::{ColumnDef, ColumnType};
+    use crate::store::local::LocalFileStore;
+    use crate::types::schema::{ColumnDef, ColumnType};
 
     fn schema() -> TableSchema {
         TableSchema {

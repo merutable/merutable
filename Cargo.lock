@@ -2626,134 +2626,41 @@ dependencies = [
 name = "merutable"
 version = "0.1.0"
 dependencies = [
- "bytes",
- "futures",
- "iceberg",
- "merutable-engine",
- "merutable-iceberg",
- "merutable-store",
- "merutable-types",
- "metrics",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "merutable-engine"
-version = "0.1.0"
-dependencies = [
  "arc-swap",
  "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "blake3",
+ "bumpalo",
  "bytes",
- "criterion",
- "futures",
- "lru",
- "merutable-iceberg",
- "merutable-memtable",
- "merutable-parquet",
- "merutable-store",
- "merutable-types",
- "merutable-wal",
- "metrics",
- "object_store",
- "parquet",
- "postcard",
- "proptest",
- "roaring",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "merutable-iceberg"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "bytes",
+ "clap",
  "crc32fast",
+ "criterion",
+ "crossbeam-skiplist",
+ "datafusion",
+ "futures",
  "hex",
  "iceberg",
- "merutable-parquet",
- "merutable-store",
- "merutable-types",
+ "lru",
  "metrics",
  "object_store",
+ "once_cell",
+ "parquet",
+ "postcard",
  "proptest",
  "prost",
  "prost-build",
  "roaring",
  "serde",
  "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "merutable-memtable"
-version = "0.1.0"
-dependencies = [
- "bumpalo",
- "bytes",
- "criterion",
- "crossbeam-skiplist",
- "merutable-types",
- "merutable-wal",
- "metrics",
- "proptest",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "merutable-migrate"
-version = "0.1.0"
-dependencies = [
- "clap",
- "merutable",
- "merutable-engine",
- "merutable-iceberg",
- "merutable-store",
- "merutable-types",
  "sha2",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "merutable-parquet"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-schema",
- "bytes",
- "criterion",
- "hex",
- "merutable-types",
- "once_cell",
- "parquet",
- "postcard",
- "proptest",
- "roaring",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
+ "uuid",
  "xxhash-rust",
 ]
 
@@ -2763,90 +2670,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "merutable",
- "merutable-engine",
- "merutable-types",
  "pyo3",
  "tokio",
-]
-
-[[package]]
-name = "merutable-replica"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "futures",
- "merutable",
- "merutable-engine",
- "merutable-sql",
- "merutable-types",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "merutable-sql"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "async-trait",
- "bytes",
- "datafusion",
- "futures",
- "merutable",
- "merutable-engine",
- "merutable-types",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "merutable-store"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "bytes",
- "futures",
- "lru",
- "merutable-types",
- "object_store",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "merutable-types"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "hex",
- "proptest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "merutable-wal"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "merutable-types",
- "metrics",
- "proptest",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

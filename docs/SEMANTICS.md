@@ -10,7 +10,7 @@ disagree, this file wins and the README is wrong.
 **Read-side (live).** On every compaction merge, each input file is
 opened with its associated DV, if any, and the DV's marked row
 positions are filtered out before the merge iterator sees them.
-Implementation: `crates/merutable-engine/src/compaction/job.rs`
+Implementation: `crates/merutable/src/engine/compaction/job.rs`
 (`open_source_file`). This is load-bearing for Apache Iceberg v3
 interop — an external writer (Spark, pyiceberg, Trino) is permitted
 to stamp a DV on a data file that merutable owns, and merutable will
@@ -19,9 +19,9 @@ read-side would break v3 compatibility.
 
 **Write-side (dormant).** The API for constructing a DV-stamping
 commit exists and is verified: `SnapshotTransaction::add_dv(path,
-dv)` in `crates/merutable-iceberg/src/snapshot.rs`, backed by the
+dv)` in `crates/merutable/src/iceberg/snapshot.rs`, backed by the
 Puffin v3 `deletion-vector-v1` encoder in
-`crates/merutable-iceberg/src/deletion_vector.rs`, with the
+`crates/merutable/src/iceberg/deletion_vector.rs`, with the
 post-union cardinality validation performed in
 `IcebergCatalog::commit` (IMP-17). The full path round-trips in the
 catalog test suite.
@@ -77,5 +77,5 @@ Every successful compaction commit satisfies:
 - The output file set is fsynced before the manifest rename commits.
 - The row cache is invalidated at commit.
 
-See the compaction job in `crates/merutable-engine/src/compaction/job.rs`
+See the compaction job in `crates/merutable/src/engine/compaction/job.rs`
 for the authoritative sequence.

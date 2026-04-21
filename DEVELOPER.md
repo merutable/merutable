@@ -62,22 +62,45 @@ Benchmarks run on PRs only.
 
 ## Workspace layout
 
+Issue #38 collapsed every internal `merutable-*` crate into a single
+`merutable` crate. Two crates remain — `merutable` (the published
+library + `merutable-migrate` binary) and `merutable-python`
+(PyO3 cdylib; structurally must be its own crate).
+
 ```
 merutable/
-├── Cargo.toml                    # Workspace root, shared dependency versions
+├── Cargo.toml                          # Workspace root, shared dependency versions
 ├── crates/
-│   ├── merutable-types/          # Core types (key encoding, schema, errors)
-│   ├── merutable-wal/            # Write-ahead log
-│   ├── merutable-memtable/       # Skip-list memtable + arena
-│   ├── merutable-parquet/        # Parquet SSTable + bloom filter
-│   ├── merutable-iceberg/        # Iceberg catalog, manifest, deletion vectors
-│   ├── merutable-store/          # Object store abstraction
-│   ├── merutable-engine/         # Engine orchestration (flush, compaction, read/write)
-│   └── merutable/                # Public API
-└── .github/workflows/ci.yml     # CI pipeline
+│   ├── merutable/                      # Published library + migrate binary
+│   │   ├── Cargo.toml                  # Single-crate manifest with [features]
+│   │   ├── build.rs                    # prost-build for the manifest .proto
+│   │   ├── proto/manifest.proto        # Catalog manifest schema
+│   │   └── src/
+│   │       ├── lib.rs                  # Public API + module declarations
+│   │       ├── db.rs / options.rs / error.rs / iterator.rs / mirror.rs
+│   │       ├── types/                  # InternalKey, schema, FieldValue, errors
+│   │       ├── store/                  # Pluggable object store
+│   │       ├── wal/                    # Write-ahead log
+│   │       ├── memtable/               # Skip-list memtable + arena
+│   │       ├── parquet/                # Parquet SSTable + bloom + KvSparseIndex
+│   │       ├── iceberg/                # Iceberg catalog + manifest + deletion vectors
+│   │       ├── engine/                 # Flush, compaction, read/write paths
+│   │       ├── sql/                    # Change-feed (feature `sql`, on by default)
+│   │       ├── replica/                # Scale-out RO replica (feature `replica`)
+│   │       └── bin/merutable-migrate.rs
+│   └── merutable-python/               # PyO3 bindings (cdylib)
+└── .github/workflows/ci.yml            # CI pipeline
 ```
 
-Dependencies flow downward: `merutable` -> `merutable-engine` -> `{iceberg, parquet, memtable, wal, store}` -> `merutable-types`.
+`merutable` features: `default = ["sql"]`, `sql` (DataFusion-backed
+change feed), `replica = ["sql"]`. The replica module depends on
+the change-feed cursor, so enabling `replica` automatically enables
+`sql`.
+
+Internal dependencies flow `db.rs` → `engine` → `{iceberg, parquet,
+memtable, wal, store}` → `types`. After #38 these are intra-crate
+modules with `pub` visibility (a follow-up sweep tightens to
+`pub(crate)`).
 
 ## Adding a dependency
 

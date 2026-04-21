@@ -12,8 +12,8 @@
 //!    message that names the tracking issue — callers can see
 //!    *why* it's rejected without digging through docs.
 
+use merutable::types::schema::{ColumnDef, ColumnType, TableSchema};
 use merutable::{CommitMode, MeruDB, OpenOptions};
-use merutable_types::schema::{ColumnDef, ColumnType, TableSchema};
 
 fn schema() -> TableSchema {
     TableSchema {

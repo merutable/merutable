@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-blue.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
-An embeddable Rust HTAP database engine. One logical table backed by an LSM-tree: SSTables are Apache Parquet files, deletion vectors are Apache Iceberg v3 `deletion-vector-v1` Puffin blobs, and each commit writes a native JSON manifest that is a **strict superset of Apache Iceberg v2 `TableMetadata`** — losslessly projectable onto a spec-compliant Iceberg table via [`merutable-iceberg::translate`](crates/merutable-iceberg/src/translate.rs) and exportable on demand with `db.export_iceberg(target_dir)`. DuckDB, Spark, Trino, and pyiceberg read the exported view; the Parquet files themselves are the single source of truth — no ETL, no format conversion.
+An embeddable Rust HTAP database engine. One logical table backed by an LSM-tree: SSTables are Apache Parquet files, deletion vectors are Apache Iceberg v3 `deletion-vector-v1` Puffin blobs, and each commit writes a native JSON manifest that is a **strict superset of Apache Iceberg v2 `TableMetadata`** — losslessly projectable onto a spec-compliant Iceberg table via [`merutable::iceberg::translate`](crates/merutable/src/iceberg/translate.rs) and exportable on demand with `db.export_iceberg(target_dir)`. DuckDB, Spark, Trino, and pyiceberg read the exported view; the Parquet files themselves are the single source of truth — no ETL, no format conversion.
 
 Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from Indian mythology.
 
@@ -34,16 +34,27 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 ## Crate map
 
-| Crate | Responsibility |
+Issue #38 collapsed the workspace into a single published crate.
+Internal modules under `crates/merutable/src/` retain the same
+responsibility split:
+
+| Module | Responsibility |
 |---|---|
-| `merutable-types` | `InternalKey` encoding, `TableSchema`, `FieldValue`, `SeqNum`, `OpType`, `MeruError` |
-| `merutable-wal` | 32 KiB block format WAL with CRC32, recovery, rotation |
-| `merutable-memtable` | `crossbeam` skip-list memtable, `bumpalo` arena, rotation, flow control |
-| `merutable-parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, `KvSparseIndex`, footer KV metadata |
-| `merutable-iceberg` | Native JSON manifest + `VersionSet` (ArcSwap) + `DeletionVector` (Puffin v3 `deletion-vector-v1`) + `translate` module projecting snapshots onto Apache Iceberg v2 `TableMetadata`. Not a catalog — catalog integration (Hive, Glue, REST) is external. |
-| `merutable-store` | Pluggable object store: local FS, S3, LRU disk cache |
-| `merutable-engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, `RowCache`, read/write paths |
-| `merutable` | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator` |
+| `merutable::types` | `InternalKey` encoding, `TableSchema`, `FieldValue`, `SeqNum`, `OpType`, `MeruError` |
+| `merutable::wal` | 32 KiB block format WAL with CRC32, recovery, rotation |
+| `merutable::memtable` | `crossbeam` skip-list memtable, `bumpalo` arena, rotation, flow control |
+| `merutable::parquet` | Parquet SSTable writer/reader, `FastLocalBloom`, `KvSparseIndex`, footer KV metadata |
+| `merutable::iceberg` | Native JSON manifest + `VersionSet` (ArcSwap) + `DeletionVector` (Puffin v3 `deletion-vector-v1`) + `translate` module projecting snapshots onto Apache Iceberg v2 `TableMetadata`. Not a catalog — catalog integration (Hive, Glue, REST) is external. |
+| `merutable::store` | Pluggable object store: local FS, S3, LRU disk cache |
+| `merutable::engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, `RowCache`, read/write paths |
+| `merutable::sql` | Change-feed cursor + DataFusion `TableProvider` (feature `sql`, on by default) |
+| `merutable::replica` | Scale-out RO replica with hot-swap rebase (feature `replica`, depends on `sql`) |
+| `merutable` (root) | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator`, `CommitMode`, `MirrorConfig` |
+
+The `merutable-migrate` CLI ships as a `[[bin]]` target inside the
+same crate. The PyO3 bindings live in `crates/merutable-python/`
+(structurally separate because Python extensions must be a
+`cdylib`).
 
 ## Storage tuning
 

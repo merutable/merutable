@@ -1,46 +1,23 @@
 [workspace]
 resolver = "2"
+# Issue #38: collapsed all internal merutable-* crates into the
+# single `merutable` crate. Only `merutable` (the published library)
+# and `merutable-python` (cdylib for PyO3 bindings; can't merge into
+# `merutable` because Python extensions must be their own crate)
+# remain. The `merutable-migrate` CLI now lives as
+# `merutable/src/bin/merutable-migrate.rs`.
 members = [
-    "crates/merutable-types",
-    "crates/merutable-wal",
-    "crates/merutable-memtable",
-    "crates/merutable-parquet",
-    "crates/merutable-iceberg",
-    "crates/merutable-store",
-    "crates/merutable-engine",
     "crates/merutable",
     "crates/merutable-python",
-    "crates/merutable-migrate",
-    "crates/merutable-sql",
-    "crates/merutable-replica",
 ]
 # merutable-python requires Python dev headers + PyO3; exclude from
 # default `cargo test/clippy --workspace` so CI doesn't need Python.
 # Build it explicitly via `maturin develop` (see lab/setup.sh).
 default-members = [
-    "crates/merutable-types",
-    "crates/merutable-wal",
-    "crates/merutable-memtable",
-    "crates/merutable-parquet",
-    "crates/merutable-iceberg",
-    "crates/merutable-store",
-    "crates/merutable-engine",
     "crates/merutable",
-    "crates/merutable-migrate",
-    "crates/merutable-sql",
-    "crates/merutable-replica",
 ]
 
 [workspace.dependencies]
-# Internal crates
-merutable-types    = { path = "crates/merutable-types" }
-merutable-wal      = { path = "crates/merutable-wal" }
-merutable-memtable = { path = "crates/merutable-memtable" }
-merutable-parquet  = { path = "crates/merutable-parquet" }
-merutable-iceberg  = { path = "crates/merutable-iceberg" }
-merutable-store    = { path = "crates/merutable-store" }
-merutable-engine   = { path = "crates/merutable-engine" }
-
 # Parquet / Arrow (arrow-rs monorepo)
 parquet      = { version = "53", features = ["async"] }
 arrow        = { version = "53" }
@@ -89,10 +66,7 @@ hex       = { version = "0.4" }
 prost       = { version = "0.13" }
 prost-build = { version = "0.13" }
 
-# Metrics facade (Issue #14). No-op when no recorder is registered,
-# so zero cost by default. Embedders opt in via
-# `OpenOptions::metrics_recorder` with a concrete exporter
-# (prometheus, opentelemetry, etc.).
+# Metrics facade (Issue #14). No-op when no recorder is registered.
 metrics = { version = "0.24" }
 
 # Python bindings

@@ -65,7 +65,7 @@ Future impls plug in without changing the replica core:
 - `KafkaLogSource` — federated CDC topology.
 - `ObjectStoreLogSource` — if we ever expose the WAL on object store.
 
-Trait shape (Phase 1 — merutable-replica crate):
+Trait shape (Phase 1 — `merutable::replica` module):
 
 ```rust
 #[async_trait]
@@ -167,7 +167,7 @@ hot-swap is zero serving gap; (a) preserves it.
 
 ## Phases
 
-- **Phase 1 (shipped, merutable-replica crate)**: `LogSource`
+- **Phase 1 (shipped, `merutable::replica` module)**: `LogSource`
   trait, `OpRecord`, `LogGap`, placeholder `ChangeFeedLogSource`
   stub. No `ReplicaState` yet.
 - **Phase 2 (planned)**: real `ChangeFeedLogSource` over Flight SQL

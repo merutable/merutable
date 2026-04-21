@@ -45,11 +45,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::engine::engine::MeruEngine;
+use crate::iceberg::Manifest;
+use crate::store::traits::MeruStore;
+use crate::types::MeruError;
 use bytes::Bytes;
-use merutable_engine::engine::MeruEngine;
-use merutable_iceberg::Manifest;
-use merutable_store::traits::MeruStore;
-use merutable_types::MeruError;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -367,9 +367,9 @@ fn spawn_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use merutable_engine::config::EngineConfig;
-    use merutable_store::local::LocalFileStore;
-    use merutable_types::schema::{ColumnDef, ColumnType, TableSchema};
+    use crate::engine::config::EngineConfig;
+    use crate::store::local::LocalFileStore;
+    use crate::types::schema::{ColumnDef, ColumnType, TableSchema};
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -470,11 +470,11 @@ mod tests {
     /// doesn't need to race the worker's polling tick.
     #[tokio::test]
     async fn mirror_snapshot_uploads_files_manifest_and_low_water() {
-        use merutable_iceberg::{
+        use crate::iceberg::{
             snapshot::{IcebergDataFile, SnapshotTransaction},
             IcebergCatalog,
         };
-        use merutable_types::level::{Level, ParquetFileMeta};
+        use crate::types::level::{Level, ParquetFileMeta};
         let tmp = tempfile::tempdir().unwrap();
         let mirror_dir = tempfile::tempdir().unwrap();
 

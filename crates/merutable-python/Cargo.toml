@@ -10,9 +10,11 @@ name = "merutable"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Issue #38: workspace collapsed; PyO3 bindings now depend only
+# on the consolidated `merutable` crate. Internal modules
+# (`merutable::types`, `merutable::engine`) are re-exported as
+# `pub mod` so existing PyO3 imports keep working.
 merutable        = { path = "../merutable" }
-merutable-types  = { path = "../merutable-types" }
-merutable-engine = { path = "../merutable-engine" }
 pyo3             = { workspace = true }
 tokio            = { workspace = true }
 bytes            = { workspace = true }

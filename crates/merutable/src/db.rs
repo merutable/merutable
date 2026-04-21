@@ -47,8 +47,8 @@
 
 use std::sync::Arc;
 
-use merutable_engine::{background::BackgroundWorkers, config::EngineConfig, engine::MeruEngine};
-use merutable_types::{
+use crate::engine::{background::BackgroundWorkers, config::EngineConfig, engine::MeruEngine};
+use crate::types::{
     key::InternalKey,
     schema::TableSchema,
     sequence::SeqNum,
@@ -125,16 +125,16 @@ impl MeruDB {
         // The mirror ships in phases (this one locks the type surface
         // and the validation; the worker is Phase 2).
         if let Err(msg) = options.validate_mirror() {
-            return Err(merutable_types::MeruError::InvalidArgument(msg));
+            return Err(crate::types::MeruError::InvalidArgument(msg));
         }
         // Issue #26 Phase 1: reject ObjectStore commit mode until the
         // protobuf-manifest + conditional-PUT implementation lands.
         // The type shape is stable; the behavior is phased.
         if matches!(
             options.commit_mode,
-            merutable_engine::config::CommitMode::ObjectStore
+            crate::engine::config::CommitMode::ObjectStore
         ) {
-            return Err(merutable_types::MeruError::InvalidArgument(
+            return Err(crate::types::MeruError::InvalidArgument(
                 "CommitMode::ObjectStore is not yet implemented \
                  (Issue #26 Phase 2 pending). Use CommitMode::Posix \
                  on local filesystems for now."
@@ -224,7 +224,7 @@ impl MeruDB {
     /// Batch insert/update. All rows share a single WAL sync — N× faster than
     /// individual `put()` calls.
     pub async fn put_batch(&self, rows: Vec<Row>) -> Result<SeqNum> {
-        use merutable_engine::write_path::{self, MutationBatch};
+        use crate::engine::write_path::{self, MutationBatch};
 
         let mut batch = MutationBatch::new();
         for row in rows {
@@ -274,7 +274,7 @@ impl MeruDB {
     }
 
     /// Engine statistics snapshot. Zero hot-path overhead.
-    pub fn stats(&self) -> merutable_engine::EngineStats {
+    pub fn stats(&self) -> crate::engine::EngineStats {
         self.engine.stats()
     }
 
@@ -323,7 +323,7 @@ impl MeruDB {
     /// DuckDB, Snowflake, Athena) can read the exported metadata to
     /// register the table, inspect its schema, or audit lineage.
     ///
-    /// See [`merutable_iceberg::IcebergCatalog::export_to_iceberg`] for
+    /// See [`crate::iceberg::IcebergCatalog::export_to_iceberg`] for
     /// the full field mapping and the current limitations
     /// (manifest-list / manifest Avro emission is follow-on work).
     ///
@@ -414,8 +414,8 @@ impl Drop for MeruDB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::schema::{ColumnDef, ColumnType};
     use bytes::Bytes;
-    use merutable_types::schema::{ColumnDef, ColumnType};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -783,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_worker_spawned_and_drained_on_close() {
         use crate::options::MirrorConfig;
-        use merutable_store::local::LocalFileStore;
+        use crate::store::local::LocalFileStore;
         use std::sync::Arc;
         let tmp = tempfile::tempdir().unwrap();
         let mirror_dir = tempfile::tempdir().unwrap();
@@ -807,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_seq_surfaces_worker_state() {
         use crate::options::MirrorConfig;
-        use merutable_store::local::LocalFileStore;
+        use crate::store::local::LocalFileStore;
         use std::sync::Arc;
         // No-mirror case.
         let tmp1 = tempfile::tempdir().unwrap();

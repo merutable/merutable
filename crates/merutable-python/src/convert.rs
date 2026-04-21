@@ -1,10 +1,10 @@
 //! Python ↔ Rust type conversion.
 
-use bytes::Bytes;
-use merutable_types::{
+use ::merutable::types::{
     schema::{ColumnType, TableSchema},
     value::{FieldValue, Row},
 };
+use bytes::Bytes;
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyString},

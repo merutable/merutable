@@ -10,8 +10,8 @@ mod convert;
 
 use std::sync::Arc;
 
+use ::merutable::types::schema::{ColumnDef, TableSchema};
 use ::merutable::MeruDB as RustMeruDB;
-use merutable_types::schema::{ColumnDef, TableSchema};
 use pyo3::{prelude::*, types::PyDict};
 
 /// Python-visible MeruDB wrapper.
@@ -345,7 +345,7 @@ impl PyMeruDB {
         &self,
         py: Python<'_>,
         vals: &[PyObject],
-    ) -> PyResult<Vec<merutable_types::value::FieldValue>> {
+    ) -> PyResult<Vec<::merutable::types::value::FieldValue>> {
         if vals.len() != self.schema.primary_key.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "expected {} PK value(s), got {}",
