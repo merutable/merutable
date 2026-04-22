@@ -27,7 +27,7 @@ pub mod options;
 
 pub use db::MeruDB;
 pub use error::Error;
-pub use options::{CommitMode, MirrorConfig, OpenOptions};
+pub use options::{MirrorConfig, OpenOptions};
 
 // Re-export core types so users don't need to dive into the
 // internal `types` module.

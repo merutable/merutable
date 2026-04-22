@@ -49,12 +49,10 @@ responsibility split:
 | `merutable::engine` | `FlushJob`, `CompactionJob`, `MergingIterator`, `RowCache`, read/write paths |
 | `merutable::sql` | Change-feed cursor + DataFusion `TableProvider` (feature `sql`, on by default) |
 | `merutable::replica` | Scale-out RO replica with hot-swap rebase (feature `replica`, depends on `sql`) |
-| `merutable` (root) | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator`, `CommitMode`, `MirrorConfig` |
+| `merutable` (root) | Public embedding API: `MeruDB`, `OpenOptions`, `ScanIterator`, `MirrorConfig` |
 
-The `merutable-migrate` CLI ships as a `[[bin]]` target inside the
-same crate. The PyO3 bindings live in `crates/merutable-python/`
-(structurally separate because Python extensions must be a
-`cdylib`).
+The PyO3 bindings live in `crates/merutable-python/` (structurally
+separate because Python extensions must be a `cdylib`).
 
 ## Storage tuning
 

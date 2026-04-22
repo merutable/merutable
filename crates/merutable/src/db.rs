@@ -122,25 +122,6 @@ impl MeruDB {
     pub async fn open(options: OpenOptions) -> Result<Self> {
         // Issue #31 Phase 1: reject incoherent mirror+mode combinations
         // at the API boundary BEFORE we touch the WAL or the catalog.
-        // The mirror ships in phases (this one locks the type surface
-        // and the validation; the worker is Phase 2).
-        if let Err(msg) = options.validate_mirror() {
-            return Err(crate::types::MeruError::InvalidArgument(msg));
-        }
-        // Issue #26 Phase 1: reject ObjectStore commit mode until the
-        // protobuf-manifest + conditional-PUT implementation lands.
-        // The type shape is stable; the behavior is phased.
-        if matches!(
-            options.commit_mode,
-            crate::engine::config::CommitMode::ObjectStore
-        ) {
-            return Err(crate::types::MeruError::InvalidArgument(
-                "CommitMode::ObjectStore is not yet implemented \
-                 (Issue #26 Phase 2 pending). Use CommitMode::Posix \
-                 on local filesystems for now."
-                    .into(),
-            ));
-        }
         // Issue #31 Phase 2a: pull the mirror config out of options
         // BEFORE `options.schema` etc are moved into the EngineConfig.
         // The worker is spawned after the engine is up.
@@ -173,7 +154,6 @@ impl MeruDB {
             gc_grace_period_secs: options.gc_grace_period_secs,
             read_only: options.read_only,
             dual_format_max_level: options.dual_format_max_level,
-            commit_mode: options.commit_mode,
         };
 
         let engine = MeruEngine::open(config).await?;

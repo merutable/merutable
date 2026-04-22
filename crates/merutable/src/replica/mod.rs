@@ -5,7 +5,7 @@
 //!
 //! - **Base**: an object-store layout (#26 / #31 mirror target).
 //!   Read via `crate::OpenOptions::read_only(true) +
-//!   CommitMode::ObjectStore`.
+//!   the object-store layout`.
 //! - **Tail**: a streamed log of ops newer than the base. The log
 //!   source is pluggable; see [`LogSource`] for the contract.
 //!
@@ -481,7 +481,7 @@ pub struct Replica {
     /// OpenOptions used to spawn the initial base; cloned + used
     /// again by `rebase_hotswap` to open a fresh read-only MeruDB
     /// for the new state. The new MeruDB reads the latest
-    /// committed manifest (via CommitMode::Posix's
+    /// committed manifest (via the POSIX commit path's
     /// version-hint.text or ObjectStore's HEAD discovery), so
     /// re-open is equivalent to `base.refresh()` on a shared base
     /// — but the two states get INDEPENDENT Version snapshots,
@@ -651,7 +651,7 @@ impl Replica {
         // Advance the base MeruDB to the newest manifest on its
         // underlying catalog. For a POSIX-mounted base this
         // re-reads version-hint.text and reloads the current
-        // manifest; for CommitMode::ObjectStore (once wired) it
+        // manifest; for the object-store layout (once wired) it
         // re-discovers HEAD and reloads.
         let state = self.state.load_full();
         state.base.refresh().await?;

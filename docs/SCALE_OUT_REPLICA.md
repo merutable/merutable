@@ -27,8 +27,8 @@ claim end-to-end deliverable to a remote analytical consumer.
 The replica's view is composed from two sources:
 
 - **Base**: an object-store layout (a #31 mirror destination, or a
-  full `CommitMode::ObjectStore` bucket — same shape). Read via
-  `OpenOptions::read_only(true) + CommitMode::ObjectStore`.
+  full a conditional-PUT object-store layout bucket — same shape). Read via
+  `OpenOptions::read_only(true) + the object-store layout`.
 - **Tail**: streamed from a sequenced log. The log source is
   pluggable via the `LogSource` trait.
 

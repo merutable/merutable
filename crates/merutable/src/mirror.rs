@@ -59,13 +59,13 @@ use crate::options::MirrorConfig;
 /// The mirror destination's low-water marker path — matches what
 /// `ObjectStoreCatalog::reclaim_old_manifests` and its HEAD discovery
 /// both use. Keeping the exact same path means a remote reader
-/// opening the mirror with `CommitMode::ObjectStore` probes from the
+/// opening the mirror with the object-store layout probes from the
 /// right position without any special coordination.
 const LOW_WATER_PATH: &str = "metadata/low_water.txt";
 
 fn manifest_path(v: i64) -> String {
     // Mirror the naming used by ObjectStoreCatalog so remote readers
-    // opening the mirror via CommitMode::ObjectStore find HEAD in
+    // opening the mirror via the object-store layout find HEAD in
     // the expected location.
     format!("metadata/v{v}.manifest.bin")
 }

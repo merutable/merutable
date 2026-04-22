@@ -45,7 +45,7 @@ pub trait MeruStore: Send + Sync + 'static {
     /// Default impl delegates to `put` after an `exists` check so
     /// existing `MeruStore` implementations compile. The default is
     /// RACY and MUST be overridden by any backend that commits
-    /// metadata in `CommitMode::ObjectStore` mode. Override with the
+    /// metadata in the object-store layout mode. Override with the
     /// backend-native conditional primitive.
     async fn put_if_absent(&self, path: &str, data: Bytes) -> Result<()> {
         if self.exists(path).await? {

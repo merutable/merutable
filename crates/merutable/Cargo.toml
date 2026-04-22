@@ -18,9 +18,11 @@ default = ["sql"]
 sql = ["dep:datafusion"]
 replica = ["sql"]
 
-[[bin]]
-name = "merutable-migrate"
-path = "src/bin/merutable-migrate.rs"
+# Issue #43: removed `[[bin]] merutable-migrate`. The tool was the
+# `CommitMode::Posix` → `CommitMode::ObjectStore` migrator; with
+# `CommitMode` gone and only the POSIX commit path retained, the
+# binary has no target to migrate to. If an object-store commit
+# path ever ships, the migrator comes back with it.
 
 [build-dependencies]
 prost-build = { workspace = true }
@@ -67,11 +69,6 @@ tokio              = { workspace = true }
 futures            = { workspace = true }
 async-trait        = { workspace = true }
 tracing            = { workspace = true }
-
-# CLI (for the merutable-migrate binary)
-clap               = { version = "4", features = ["derive"] }
-sha2               = "0.10"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # SQL / DataFusion (feature `sql`)
 datafusion         = { version = "43", default-features = false, optional = true }

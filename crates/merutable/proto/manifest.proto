@@ -1,7 +1,7 @@
 // Issue #28: merutable's internal catalog manifest format.
 //
-// Protobuf replaces JSON on disk (both CommitMode::Posix and
-// CommitMode::ObjectStore — see Issue #26). This is purely the
+// Protobuf replaces JSON on disk (both the POSIX commit path and
+// the object-store layout — see Issue #26). This is purely the
 // internal catalog file; Iceberg v2 translation (translate.rs) still
 // emits JSON `metadata.json` for external consumers.
 //

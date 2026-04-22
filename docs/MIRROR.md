@@ -5,7 +5,7 @@ combine local-disk write latency with object-store read scale-out.
 
 ## What problem this solves
 
-`CommitMode::Posix` (the default) is the right answer for sub-
+the POSIX (atomic-rename) commit path (the default) is the right answer for sub-
 millisecond commit latency — local atomic rename is faster than any
 conditional-PUT roundtrip will ever be. But local disk has two
 fundamental limits:
@@ -13,7 +13,7 @@ fundamental limits:
 1. **Durability**: dies with the host.
 2. **Read scaling**: only the host machine can read it.
 
-`CommitMode::ObjectStore` (Issue #26) goes the other way: every
+a conditional-PUT object-store layout (Issue #26) goes the other way: every
 commit is a conditional PUT against an object store. Multi-writer
 safe, durable cross-host, but pays roundtrip latency per commit.
 
@@ -35,14 +35,14 @@ let db = MeruDB::open(
     OpenOptions::new(schema)
         .wal_dir("/local/wal")
         .catalog_uri("/local/data")
-        .commit_mode(CommitMode::Posix)
         .mirror(mirror),
 ).await?;
 ```
 
-Validation rejects `mirror.is_some() && commit_mode == ObjectStore`
-up-front. The two modes target the same layout; mirroring while
-already writing to an object store would double-write every manifest.
+Issue #43 collapsed merutable to a single POSIX commit path, so
+there is no longer a validation step that rejects mirror + commit-
+mode combinations — the POSIX atomic-rename path is the only
+commit path the primary uses, and the mirror always shadows it.
 
 ## Scope: flushed files only
 
@@ -57,7 +57,7 @@ This is a hard boundary:
 - The mirror picks up exactly that state — SSTs and manifests — and
   no earlier.
 
-If you need the WAL's durability cross-host, use `CommitMode::ObjectStore`
+If you need the WAL's durability cross-host, use a conditional-PUT object-store layout
 directly. That's what it's for. Going halfway — a mirror that covers
 WAL on top of POSIX — is worse than either endpoint: more complexity
 than the POSIX baseline, less consistency than the ObjectStore mode.
@@ -68,10 +68,10 @@ reader on the mirror sees the most recent fully-mirrored snapshot,
 missing all post-mirror activity. RPO is bounded by
 `max(mirror_lag, gc_grace_period)`.
 
-## Mirror layout = `CommitMode::ObjectStore` layout
+## Mirror layout = a conditional-PUT object-store layout layout
 
 The mirror writes to its target in the EXACT same shape that
-`CommitMode::ObjectStore` uses:
+a conditional-PUT object-store layout uses:
 
 ```
 bucket/prefix/
@@ -96,7 +96,7 @@ no mirror-format-vs-canonical-format discrimination, no special
 reader path. The mirror IS a live, mountable layout.
 
 Cross-region RO replica drops out as a byproduct: point a
-`OpenOptions::read_only(true) + CommitMode::ObjectStore` at the
+`OpenOptions::read_only(true) + the object-store layout` at the
 mirror destination from another region. The replica catches up by
 reading manifests as the primary mirrors them. (See Issue #32 for
 the replica's hot-swap-rebase architecture that builds on this.)
@@ -119,7 +119,7 @@ Per snapshot S:
    pattern. Idempotent throughout.
 
 The conditional PUT on the manifest gives the same race-safety
-guarantee as `CommitMode::ObjectStore`: if a second process is
+guarantee as a conditional-PUT object-store layout: if a second process is
 somehow also trying to mirror to the same destination, only one
 wins. **Mirror destinations should not be shared targets**; this is
 documented loudly but not enforced beyond the conditional-PUT
@@ -161,7 +161,7 @@ and reviewable:
 
 ## Guarantees (v1)
 
-- Mirror destination is byte-compatible with `CommitMode::ObjectStore`.
+- Mirror destination is byte-compatible with a conditional-PUT object-store layout.
   Remote readers open it via the standard read path. No special
   tools.
 - Commit order on the mirror matches commit order on the primary.
@@ -177,7 +177,7 @@ and reviewable:
 - **Not multi-writer**. One primary per mirror destination.
   Conditional PUT on the manifest protects against accidental
   misconfiguration; operators should not rely on this for
-  deliberate multi-writer workloads (use `CommitMode::ObjectStore`).
+  deliberate multi-writer workloads (use a conditional-PUT object-store layout).
 - **Not backpressured**. Mirror lag never blocks writes. Alert-only.
 - **Not WAL durable**. An un-flushed tail is lost on primary crash.
 
@@ -185,8 +185,8 @@ and reviewable:
 
 | Need | Recommendation |
 |---|---|
-| Sub-ms commit latency, single host | `CommitMode::Posix` |
-| Cross-host durability, ms RPO | `CommitMode::Posix` + mirror |
-| Multi-writer, any RPO | `CommitMode::ObjectStore` |
-| Cross-region analytics reader | Mirror destination + `read_only(true) + CommitMode::ObjectStore` |
-| Zero-RPO, any latency | `CommitMode::ObjectStore` |
+| Sub-ms commit latency, single host | the POSIX (atomic-rename) commit path |
+| Cross-host durability, ms RPO | the POSIX (atomic-rename) commit path + mirror |
+| Multi-writer, any RPO | a conditional-PUT object-store layout |
+| Cross-region analytics reader | Mirror destination + `read_only(true) + the object-store layout` |
+| Zero-RPO, any latency | a conditional-PUT object-store layout |

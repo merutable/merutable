@@ -98,7 +98,7 @@ impl MeruStore for S3Store {
     /// `object_store::Error::AlreadyExists` → mapped to our
     /// `MeruError::AlreadyExists`.
     ///
-    /// This override is mandatory for `CommitMode::ObjectStore` — the
+    /// This override is mandatory for the object-store layout — the
     /// racy `exists + put` default would let two concurrent writers
     /// both succeed at committing the same version, corrupting the
     /// backward-pointer chain.

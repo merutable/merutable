@@ -1,10 +1,7 @@
 pub mod catalog;
 pub mod deletion_vector;
-pub mod head_discovery;
 pub mod manifest;
 pub mod manifest_pb;
-pub mod object_store_catalog;
-pub mod object_store_commit;
 pub mod snapshot;
 pub mod translate;
 pub mod version;
