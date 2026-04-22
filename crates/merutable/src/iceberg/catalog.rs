@@ -60,25 +60,22 @@ pub struct IcebergCatalog {
     next_version: Mutex<i64>,
 }
 
-/// Issue #42: reject a reopen with a schema incompatible with what
-/// the catalog already persists. Used by `IcebergCatalog::open` when
-/// a manifest is loaded from disk (the fresh-open path has nothing
-/// to compare against, so it skips this check).
+/// Issue #42 / #44: compatibility check for reopen.
 ///
-/// Comparison rules for 0.1:
-///   - `table_name` must match exactly.
-///   - Column count must match.
-///   - Every column's `name`, `col_type`, and `nullable` must match
-///     at the same index. Column order is semantically significant
-///     because PK columns are referenced by index, and field_id is
-///     assigned positionally by `TableSchema::validate`.
-///   - `primary_key` indices must match.
+/// Two shapes are accepted:
+///   1. Identical schema (the #42 baseline).
+///   2. Additive extension (#44 Stage 1): provided is a strict
+///      superset of persisted — the first `persisted.columns.len()`
+///      entries match byte-for-byte, and each newly-appended column
+///      is either nullable or carries a `write_default` /
+///      `initial_default` so existing data can be back-filled.
 ///
-/// Additive schema evolution (allowing strictly-additive column
-/// appends on reopen) is #44's scope; this check is intentionally
-/// strict so a caller who reopens with a stale or reordered schema
-/// gets an error instead of silent data corruption.
-fn check_schema_compatible(persisted: &TableSchema, provided: &TableSchema) -> Result<()> {
+/// Every other shape (rename, reorder, type change, PK change,
+/// column removal) is rejected.
+pub(crate) fn check_schema_compatible(
+    persisted: &TableSchema,
+    provided: &TableSchema,
+) -> Result<()> {
     if persisted.table_name != provided.table_name {
         return Err(MeruError::SchemaMismatch(format!(
             "catalog at this path was created for table `{}`; reopen provided \
@@ -87,16 +84,20 @@ fn check_schema_compatible(persisted: &TableSchema, provided: &TableSchema) -> R
             persisted.table_name, provided.table_name,
         )));
     }
-    if persisted.columns.len() != provided.columns.len() {
+    // Provided must cover at least every persisted column (can only
+    // grow, never shrink or replace).
+    if provided.columns.len() < persisted.columns.len() {
         return Err(MeruError::SchemaMismatch(format!(
             "schema mismatch on reopen of table `{}`: persisted has {} \
-             columns, provided has {}. Additive schema evolution is tracked \
-             separately (#44); full-replace is not a valid reopen.",
+             columns, provided has {}. Column removal is not supported \
+             (additive-only evolution — #44).",
             persisted.table_name,
             persisted.columns.len(),
             provided.columns.len(),
         )));
     }
+    // Prefix must match exactly. Columns are positional — reorder or
+    // type change breaks existing files.
     for (i, (pc, vc)) in persisted
         .columns
         .iter()
@@ -123,6 +124,20 @@ fn check_schema_compatible(persisted: &TableSchema, provided: &TableSchema) -> R
                 "schema mismatch on reopen of table `{}`: column `{}` has \
                  nullable={} persisted, but {} provided.",
                 persisted.table_name, pc.name, pc.nullable, vc.nullable,
+            )));
+        }
+    }
+    // Newly-appended columns must be back-fillable against the
+    // existing data — nullable, or carry a non-null default.
+    for new_col in &provided.columns[persisted.columns.len()..] {
+        if !new_col.nullable && new_col.write_default.is_none() && new_col.initial_default.is_none()
+        {
+            return Err(MeruError::SchemaMismatch(format!(
+                "schema evolution on reopen of table `{}`: new column `{}` \
+                 is non-nullable and has no write_default / initial_default. \
+                 Cannot back-fill existing rows — additive evolution requires \
+                 nullable OR a default (#44).",
+                persisted.table_name, new_col.name,
             )));
         }
     }

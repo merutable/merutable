@@ -94,14 +94,34 @@ async fn mismatched_table_name_rejected() {
     }
 }
 
+/// #44 Stage 1: strictly-additive schema extensions are ALLOWED
+/// on reopen (nullable or defaulted new columns).
 #[tokio::test]
-async fn mismatched_column_count_rejected() {
+async fn strictly_additive_nullable_column_accepted_on_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut evolved = base_schema();
+    evolved.columns.push(ColumnDef {
+        name: "extra_nullable".into(),
+        col_type: ColumnType::Int64,
+        nullable: true,
+        ..Default::default()
+    });
+    let out = open_once_then_reopen_with(&tmp, evolved).await;
+    if let Err(e) = out {
+        panic!("strictly-additive nullable reopen must succeed; got {e:?}");
+    }
+}
+
+/// #44 Stage 1 counterpart: a non-nullable, no-default new column
+/// is NOT back-fillable against existing rows and must be rejected.
+#[tokio::test]
+async fn additive_non_nullable_without_default_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let mut evil = base_schema();
     evil.columns.push(ColumnDef {
-        name: "extra".into(),
+        name: "extra_required".into(),
         col_type: ColumnType::Int64,
-        nullable: true,
+        nullable: false,
         ..Default::default()
     });
     let err = match open_once_then_reopen_with(&tmp, evil).await {
@@ -110,7 +130,28 @@ async fn mismatched_column_count_rejected() {
     };
     match err {
         MeruError::SchemaMismatch(s) => {
-            assert!(s.contains("columns") && s.contains("2") && s.contains("3"))
+            assert!(
+                s.contains("extra_required") && s.contains("default"),
+                "error must name the offending column + its missing default: {s}"
+            );
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+/// Column removal still rejected — #44 is additive-only.
+#[tokio::test]
+async fn column_removal_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut evil = base_schema();
+    evil.columns.pop();
+    let err = match open_once_then_reopen_with(&tmp, evil).await {
+        Ok(_) => panic!("reopen should have been rejected"),
+        Err(e) => e,
+    };
+    match err {
+        MeruError::SchemaMismatch(s) => {
+            assert!(s.contains("removal") || s.contains("2") && s.contains("1"))
         }
         other => panic!("expected SchemaMismatch, got {other:?}"),
     }
