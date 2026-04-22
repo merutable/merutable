@@ -196,7 +196,15 @@ impl MeruDB {
     }
 
     /// Insert or update a row. PK is extracted from the row.
-    pub async fn put(&self, row: Row) -> Result<SeqNum> {
+    ///
+    /// Issue #44 Stage 4: rows shorter than the schema's column
+    /// count are auto-padded with each missing tail column's
+    /// `write_default` (or `None` if the column is nullable with
+    /// no default). A missing non-nullable-no-default column
+    /// surfaces `SchemaMismatch` at this boundary so the caller
+    /// sees it before the WAL lock.
+    pub async fn put(&self, mut row: Row) -> Result<SeqNum> {
+        row.pad_with_defaults(self.engine.schema())?;
         let pk_values = row.pk_values(&self.engine.schema().primary_key)?;
         self.engine.put(pk_values, row).await
     }
@@ -207,11 +215,86 @@ impl MeruDB {
         use crate::engine::write_path::{self, MutationBatch};
 
         let mut batch = MutationBatch::new();
-        for row in rows {
-            let pk_values = row.pk_values(&self.engine.schema().primary_key)?;
+        let schema = self.engine.schema();
+        for mut row in rows {
+            // Issue #44 Stage 4: per-row pad with write_default.
+            row.pad_with_defaults(schema)?;
+            let pk_values = row.pk_values(&schema.primary_key)?;
             batch.put(pk_values, row);
         }
         write_path::apply_batch(&self.engine, batch).await
+    }
+
+    /// Issue #44 Stage 2: additive schema evolution.
+    ///
+    /// Append `col` to the table's schema and persist the new
+    /// version in the catalog. Returns the new `TableSchema`.
+    ///
+    /// Contract (strict, matches `check_schema_compatible`):
+    ///   - The column name must not already exist in the schema.
+    ///   - PK columns cannot be added post-creation.
+    ///   - The column must be nullable OR carry a `write_default`
+    ///     / `initial_default` — otherwise existing rows cannot
+    ///     be back-filled.
+    ///
+    /// After this call returns, the NEXT `MeruDB::open` sees the
+    /// extended schema; the currently-open `MeruDB` instance does
+    /// NOT swap its in-engine schema (live-engine schema swap is
+    /// follow-up work). This is safe because Stage 3's read-path
+    /// projection makes pre-evolution files readable under the new
+    /// schema on reopen, and Stage 4's `pad_with_defaults` handles
+    /// short writes from that reopen-point forward.
+    pub async fn add_column(
+        &self,
+        col: crate::types::schema::ColumnDef,
+    ) -> Result<crate::types::schema::TableSchema> {
+        use crate::iceberg::SnapshotTransaction;
+        use std::sync::Arc;
+
+        let current = self.engine.schema().clone();
+
+        // Validation — every reject message names the offending
+        // shape so the caller can fix it without guessing.
+        if current.columns.iter().any(|c| c.name == col.name) {
+            return Err(crate::types::MeruError::SchemaMismatch(format!(
+                "add_column: column '{}' already exists in table '{}'",
+                col.name, current.table_name,
+            )));
+        }
+        if !col.nullable && col.write_default.is_none() && col.initial_default.is_none() {
+            return Err(crate::types::MeruError::SchemaMismatch(format!(
+                "add_column: new column '{}' is NOT NULL and has no \
+                 write_default / initial_default — cannot back-fill existing rows",
+                col.name,
+            )));
+        }
+
+        // Build the evolved schema. `validate` on the new schema
+        // assigns the field_id from `last_column_id + 1` and bumps
+        // `last_column_id`, so the caller doesn't have to stamp
+        // field_id manually.
+        let mut evolved = current.clone();
+        evolved.columns.push(col);
+        // The new column cannot be a PK (PK is validated by
+        // positions, and the issue explicitly disallows PK
+        // additions); `validate` doesn't enforce that directly,
+        // but the column was appended at the tail so its index
+        // isn't in `primary_key` unless the caller mutated that —
+        // we leave `primary_key` untouched and rely on the
+        // `check_schema_compatible` PK-match check at reopen time.
+        evolved.validate()?;
+
+        // Persist via an empty snapshot transaction. `commit`
+        // writes a new manifest version with the evolved schema
+        // embedded; `check_schema_compatible` on next open
+        // accepts the extension per #44 Stage 1.
+        let txn = SnapshotTransaction::new();
+        self.engine
+            .catalog
+            .commit(&txn, Arc::new(evolved.clone()))
+            .await?;
+
+        Ok(evolved)
     }
 
     /// Delete by primary key values.

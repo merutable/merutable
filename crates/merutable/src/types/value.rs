@@ -64,6 +64,46 @@ impl Row {
     /// Called at every write entry point (put, put_batch, apply_batch,
     /// internal engine.put) so malformed rows never reach the WAL or
     /// memtable. Cheap — just field iteration; no allocations.
+    /// Issue #44 Stage 4: pad a row that was built under an older
+    /// schema arity up to the current schema's column count by
+    /// appending each missing tail column's `write_default` (or
+    /// `None` if the column is nullable and no default is set).
+    ///
+    /// Called at every write entry point BEFORE `validate` so that
+    /// a caller who omits newly-added columns doesn't get a row-
+    /// arity mismatch. Non-evolution writes (where the row already
+    /// matches the schema's arity) pay a single length check and
+    /// no extra work.
+    ///
+    /// Errors if a missing column is non-nullable AND has no
+    /// `write_default` — that's the one case the caller MUST fix
+    /// by supplying the value, and it mirrors the constraint
+    /// `check_schema_compatible` applies at reopen time (Stage 1).
+    pub fn pad_with_defaults(
+        &mut self,
+        schema: &crate::types::schema::TableSchema,
+    ) -> crate::types::Result<()> {
+        if self.fields.len() >= schema.columns.len() {
+            return Ok(());
+        }
+        for idx in self.fields.len()..schema.columns.len() {
+            let col = &schema.columns[idx];
+            let fill = col
+                .write_default
+                .clone()
+                .or_else(|| col.initial_default.clone());
+            if fill.is_none() && !col.nullable {
+                return Err(crate::types::MeruError::SchemaMismatch(format!(
+                    "row omits column {idx} '{}' which is NOT NULL and has no write_default — \
+                     caller must provide a value",
+                    col.name,
+                )));
+            }
+            self.fields.push(fill);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, schema: &crate::types::schema::TableSchema) -> crate::types::Result<()> {
         use crate::types::schema::ColumnType;
         if self.fields.len() != schema.columns.len() {
