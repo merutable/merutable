@@ -373,23 +373,42 @@ pub fn record_batch_to_rows(
             let ikey_bytes = ikey_col.value(row_idx);
             let ikey = InternalKey::decode(ikey_bytes, schema)?;
             let blob = blob_col.value(row_idx);
-            let row: Row = postcard::from_bytes(blob)
+            let mut row: Row = postcard::from_bytes(blob)
                 .map_err(|e| MeruError::Parquet(format!("postcard decode row: {e}")))?;
+            // Issue #44 Stage 3: if the blob was written under an
+            // older schema (fewer columns), pad the decoded Row
+            // with `initial_default` / `None` so every downstream
+            // code path sees a Row matching the current schema's
+            // arity. Blobs written under the CURRENT schema are
+            // already the right length — this loop is a no-op for
+            // them.
+            while row.fields.len() < schema.columns.len() {
+                let missing_idx = row.fields.len();
+                let col = &schema.columns[missing_idx];
+                row.fields.push(col.initial_default.clone());
+            }
             result.push((ikey, row));
         }
         return Ok(result);
     }
 
     // L1+ path: rebuild Row from typed user columns by name.
-    let mut user_col_indices: Vec<usize> = Vec::with_capacity(schema.columns.len());
+    //
+    // Issue #44 Stage 3 — additive-evolution tolerance. A Parquet
+    // file written under an older schema_id may legitimately be
+    // missing one or more of the current schema's user columns
+    // (the column was added after this file was flushed). For
+    // those columns the batch has no Arrow array at all; we fill
+    // the missing cell with the column's `initial_default` (or
+    // `None` if the column is nullable and no default is set).
+    //
+    // `check_schema_compatible` (iceberg/catalog.rs) has already
+    // guaranteed that any missing column is either nullable or
+    // carries a default — so the None fallback here can never
+    // violate a NOT NULL constraint.
+    let mut user_col_indices: Vec<Option<usize>> = Vec::with_capacity(schema.columns.len());
     for col_def in &schema.columns {
-        let idx = arrow_schema.index_of(&col_def.name).map_err(|_| {
-            MeruError::Parquet(format!(
-                "missing user column '{}' in record batch",
-                col_def.name
-            ))
-        })?;
-        user_col_indices.push(idx);
+        user_col_indices.push(arrow_schema.index_of(&col_def.name).ok());
     }
 
     let mut result = Vec::with_capacity(n);
@@ -398,8 +417,13 @@ pub fn record_batch_to_rows(
         let ikey = InternalKey::decode(ikey_bytes, schema)?;
 
         let mut fields = Vec::with_capacity(schema.columns.len());
-        for (col_def, &arrow_col_idx) in schema.columns.iter().zip(&user_col_indices) {
-            let fv = extract_field(batch.column(arrow_col_idx), row_idx, &col_def.col_type)?;
+        for (col_def, slot) in schema.columns.iter().zip(&user_col_indices) {
+            let fv = match slot {
+                Some(arrow_col_idx) => {
+                    extract_field(batch.column(*arrow_col_idx), row_idx, &col_def.col_type)?
+                }
+                None => col_def.initial_default.clone(),
+            };
             fields.push(fv);
         }
         result.push((ikey, Row::new(fields)));

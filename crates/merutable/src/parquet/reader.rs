@@ -486,8 +486,20 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
         if format.has_value_blob() {
             leaf_indices.push(find_leaf(parquet_schema, VALUE_BLOB_COLUMN_NAME)?);
         } else {
+            // Issue #44 Stage 3: additive schema evolution. A file
+            // written under an older schema_id may legitimately be
+            // missing one of the current schema's user columns.
+            // SKIP missing leaves in the projection mask; the codec
+            // layer (`record_batch_to_rows`) fills them with
+            // `initial_default` (or null) at row-construction time.
+            // Without this tolerance, a reopen-with-extended-schema
+            // (already accepted by `check_schema_compatible` per
+            // #44 Stage 1) would break every read of an existing
+            // Parquet file.
             for col in &self.schema.columns {
-                leaf_indices.push(find_leaf(parquet_schema, &col.name)?);
+                if let Some(idx) = find_leaf_opt(parquet_schema, &col.name) {
+                    leaf_indices.push(idx);
+                }
             }
         }
         Ok(ProjectionMask::leaves(parquet_schema, leaf_indices))
@@ -495,14 +507,18 @@ impl<R: ChunkReader + Clone + 'static> ParquetReader<R> {
 }
 
 fn find_leaf(schema: &parquet::schema::types::SchemaDescriptor, name: &str) -> Result<usize> {
-    for i in 0..schema.num_columns() {
-        if schema.column(i).name() == name {
-            return Ok(i);
-        }
-    }
-    Err(MeruError::Corruption(format!(
-        "column '{name}' not found in Parquet schema"
-    )))
+    find_leaf_opt(schema, name).ok_or_else(|| {
+        MeruError::Corruption(format!("column '{name}' not found in Parquet schema"))
+    })
+}
+
+/// Issue #44 Stage 3: non-failing leaf lookup. Returns `None` when
+/// the column is absent from the Parquet file, letting the caller
+/// decide whether that's a hard error (e.g., `_merutable_ikey`
+/// missing → corruption) or an acceptable additive-evolution gap
+/// the codec fills with a default.
+fn find_leaf_opt(schema: &parquet::schema::types::SchemaDescriptor, name: &str) -> Option<usize> {
+    (0..schema.num_columns()).find(|&i| schema.column(i).name() == name)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
