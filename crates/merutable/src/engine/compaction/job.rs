@@ -458,7 +458,7 @@ async fn run_one_compaction_job(engine: &Arc<MeruEngine>) -> Result<bool> {
     // Collect surviving entries and split into multiple output chunks
     // so no single file's aggregate-column-bytes can overflow Arrow's
     // i32 byte-array offset limit (~2.14 GiB per column). Issue #3:
-    // a 10 GiB HTAP stress test panicked in
+    // a 10 GiB external analytics stress test panicked in
     // `arrow_array::builder::GenericBytesBuilder::append_value` when
     // a single ByteArray column in the output exceeded 2 GiB. Cap at
     // `TARGET_OUTPUT_FILE_BYTES` per chunk with 4× safety margin.

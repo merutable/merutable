@@ -10,7 +10,7 @@
 //! engine's public API and asserts values match.
 //!
 //! If any of these regress, the engine has stopped reading Parquet files
-//! again — which is an HTAP-ending correctness bug.
+//! again — which is an external analytics-ending correctness bug.
 
 use bytes::Bytes;
 use merutable::engine::{EngineConfig, MeruEngine};
@@ -316,7 +316,7 @@ async fn compaction_rewrites_l0_to_l1_and_reads_survive() {
     }
 
     // Also verify the L1 Parquet file is still readable by an upstream
-    // Parquet crate — the HTAP claim must survive compaction.
+    // Parquet crate — the external analytics claim must survive compaction.
     let l1_dir = tmp.path().join("data").join("L1");
     let mut parquet_files: Vec<std::path::PathBuf> = Vec::new();
     let mut entries = tokio::fs::read_dir(&l1_dir)

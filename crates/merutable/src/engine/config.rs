@@ -79,7 +79,7 @@ pub struct EngineConfig {
     /// columns. Levels beyond this carry typed columns only.
     ///
     /// - `Some(0)` — L0 dual, L1+ columnar-only. Default; matches
-    ///   the pre-Issue-#15 hard-coded behavior (HTAP generic bias).
+    ///   the pre-Issue-#15 hard-coded behavior (row/column generic bias).
     /// - `Some(N)` — L0..=LN dual, LN+1+ columnar-only (OLTP-leaning,
     ///   push fast-path deeper so hot keys at L2/L3 resolve in a
     ///   single column-chunk decode).

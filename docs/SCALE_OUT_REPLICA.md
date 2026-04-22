@@ -19,7 +19,7 @@ reads it intelligently. A naive remote reader has two bad options:
 The right shape is a **scale-out RO replica**: a long-lived process
 that maintains hot in-memory state on top of an object-store base,
 advances incrementally as the mirror advances, and consumes the
-in-flight tail from a sequenced log. This is what makes the HTAP
+in-flight tail from a sequenced log. This is what makes the external analytics
 claim end-to-end deliverable to a remote analytical consumer.
 
 ## Composition

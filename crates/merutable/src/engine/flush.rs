@@ -122,7 +122,7 @@ pub async fn run_flush(engine: &Arc<MeruEngine>) -> Result<()> {
         } else {
             // Legacy / no-pre-image path: Bug N fix — tombstone
             // rows still carry the correct PK values in their
-            // typed columns so HTAP readers (Spark/DuckDB) can
+            // typed columns so external analytical readers (Spark/DuckDB) can
             // identify which key was deleted. Previously
             // Row::default() produced zero fields, which the
             // codec's Bug K fix filled with sentinel values

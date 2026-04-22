@@ -1,4 +1,4 @@
-# HTAP read contract for external engines
+# external analytical reads contract for external engines
 
 This document defines the correct read-time projection for external
 SQL engines (DuckDB, Spark, Trino, Snowflake, Athena) consuming a
@@ -7,7 +7,7 @@ external reader MUST apply this projection.** A naive `SELECT *`
 returns MVCC duplicates and tombstones as if they were valid distinct
 rows — silent wrong answers.
 
-This contract is structurally unavoidable for any LSM-based HTAP
+This contract is structurally unavoidable for any LSM-based external analytics
 table. It is not a temporary gap that future work removes. See
 [RFC #19](https://github.com/merutable/merutable/issues/19) for why
 Deletion Vectors cannot replace it.

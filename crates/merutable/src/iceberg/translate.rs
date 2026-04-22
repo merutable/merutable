@@ -120,7 +120,7 @@ pub fn to_iceberg_v2_table_metadata(manifest: &Manifest, table_location: &str) -
         // effect — and the part an Iceberg sort-order can express — is
         // PK ASC. Issue #20: projecting this lets Iceberg-aware engines
         // (DuckDB, Spark, Trino) apply streaming "first row per partition"
-        // for the MVCC dedup projection (docs/HTAP_READS.md) instead of
+        // for the MVCC dedup projection (docs/EXTERNAL_READS.md) instead of
         // a full sort, turning an O(N log N) scan into O(N).
         "default-sort-order-id": 1i32,
         "sort-orders": [
@@ -202,7 +202,7 @@ pub fn to_iceberg_schema_v2(schema: &TableSchema, schema_id: i32) -> Value {
 ///
 /// External engines that recognize the sort order apply streaming
 /// partition-aware reductions — specifically, the mandatory MVCC
-/// dedup projection in `docs/HTAP_READS.md` collapses from an
+/// dedup projection in `docs/EXTERNAL_READS.md` collapses from an
 /// O(N log N) full sort to an O(N) streaming pass.
 ///
 /// We express only the PK ASC part. The seq DESC tail is embedded in

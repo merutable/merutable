@@ -60,7 +60,7 @@ Short version: an external reader sees the *union* of every live
 Parquet file — which includes cross-level duplicates and tombstones.
 An `ORDER BY seq DESC, LIMIT 1` (or `ROW_NUMBER() QUALIFY …`)
 projection is required to recover the `MeruDB::get`/`scan`-equivalent
-view. Full treatment is in [docs/HTAP_READS.md](HTAP_READS.md) once
+view. Full treatment is in [docs/EXTERNAL_READS.md](EXTERNAL_READS.md) once
 that file lands; until then see the `IcebergCatalog::commit` and
 `read_path` modules.
 

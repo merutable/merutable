@@ -1,9 +1,9 @@
-//! HTAP claim validation: a Parquet file produced by merutable's flush
+//! external analytics claim validation: a Parquet file produced by merutable's flush
 //! pipeline can be opened by an *unmodified upstream Parquet reader* and
 //! every user-defined column appears as a typed Arrow column with the
 //! original values.
 //!
-//! This is the integration test that backs the HTAP marketing claim:
+//! This is the integration test that backs the external analytics marketing claim:
 //! "merutable files are real Parquet files that Spark/DuckDB/iceberg-rust
 //! can scan directly." If this test passes, an external reader does not
 //! need any merutable code on its read side.
@@ -105,7 +105,7 @@ async fn discover_l0_file(catalog_root: &Path) -> PathBuf {
     panic!("no parquet file found in {dir:?}");
 }
 
-/// End-to-end HTAP claim: insert rows, force flush, then open the resulting
+/// End-to-end external analytics claim: insert rows, force flush, then open the resulting
 /// L0 Parquet file with the upstream `parquet` crate (no merutable code on
 /// the read side) and verify that every user column is present as a typed
 /// Arrow column with the exact values that were written.
@@ -283,14 +283,14 @@ async fn l0_file_is_readable_by_upstream_parquet_with_typed_columns() {
     }
 }
 
-/// Cold-tier (L1+) HTAP claim: an L1 Parquet file produced by merutable's
+/// Cold-tier (L1+) external analytics claim: an L1 Parquet file produced by merutable's
 /// writer must (a) NOT carry the `_merutable_value` blob and (b) still be
 /// fully decodable by an upstream Parquet reader through the typed columns.
 ///
 /// This bypasses `engine.compact()` because the compaction-job's reader
 /// integration is still pending — but it exercises the same writer path
 /// (`merutable::parquet::writer::write_sorted_rows` at `Level(1)`) that a
-/// future compaction will use, so the cross-crate HTAP contract is what's
+/// future compaction will use, so the cross-crate external analytics contract is what's
 /// being validated.
 #[tokio::test]
 async fn l1_file_is_readable_by_upstream_parquet_without_value_blob() {

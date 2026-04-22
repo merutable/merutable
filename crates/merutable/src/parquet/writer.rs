@@ -645,7 +645,7 @@ mod tests {
 
     /// The cold tier should be *significantly* larger than the hot tier —
     /// not just nominally larger. If the ratio collapses below 8x, the
-    /// HTAP tradeoff has been weakened and the level differentiation is
+    /// external analytics tradeoff has been weakened and the level differentiation is
     /// no longer meaningful.
     #[test]
     fn cold_tier_significantly_larger_than_hot() {
@@ -962,7 +962,7 @@ mod tests {
                 .any(|c| c == crate::parquet::codec::VALUE_BLOB_COLUMN_NAME),
             "L1 must NOT contain value blob column; got {l1_cols:?}"
         );
-        // Both levels must expose user-defined typed columns for HTAP visibility.
+        // Both levels must expose user-defined typed columns for external analytics visibility.
         assert!(l0_cols.iter().any(|c| c == "id") && l0_cols.iter().any(|c| c == "payload"));
         assert!(l1_cols.iter().any(|c| c == "id") && l1_cols.iter().any(|c| c == "payload"));
     }

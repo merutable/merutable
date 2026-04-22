@@ -4,14 +4,14 @@
 [![Rust](https://img.shields.io/badge/rust-stable-blue.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 
-An embeddable Rust HTAP database engine. One logical table backed by an LSM-tree: SSTables are Apache Parquet files, deletion vectors are Apache Iceberg v3 `deletion-vector-v1` Puffin blobs, and each commit writes a native JSON manifest that is a **strict superset of Apache Iceberg v2 `TableMetadata`** — losslessly projectable onto a spec-compliant Iceberg table via [`merutable::iceberg::translate`](crates/merutable/src/iceberg/translate.rs) and exportable on demand with `db.export_iceberg(target_dir)`. DuckDB, Spark, Trino, and pyiceberg read the exported view; the Parquet files themselves are the single source of truth — no ETL, no format conversion.
+**An embeddable single-table engine where the data is both row and columnar and metadata is Iceberg-compatible.** One logical table backed by an LSM-tree. L0 SSTables are Parquet tuned as a rowstore (8 KiB pages, PLAIN encoding — optimized for point lookups). L1+ SSTables are Parquet tuned as a columnstore (128 KiB pages, per-column encoding — optimized for scans). Deletion vectors are Apache Iceberg v3 `deletion-vector-v1` Puffin blobs, and each commit writes a native JSON manifest that is a **strict superset of Apache Iceberg v2 `TableMetadata`** — losslessly projectable onto a spec-compliant Iceberg table via [`merutable::iceberg::translate`](crates/merutable/src/iceberg/translate.rs) and exportable on demand with `db.export_iceberg(target_dir)`. DuckDB, Spark, Trino, and pyiceberg read the exported view; the Parquet files themselves are the single source of truth — no ETL, no format conversion. **Analytical query execution happens in those external engines, not inside merutable** — see [docs/EXTERNAL_READS.md](docs/EXTERNAL_READS.md) for the reader contract.
 
 Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from Indian mythology.
 
 ## Why merutable
 
 - **One table, two workloads**: Write rows through a KV API, query them with SQL. Same Parquet files, zero ETL.
-- **Open format, no lock-in**: Data is Parquet. Metadata is Iceberg. DuckDB, Spark, Trino, Snowflake read it natively via the exported Iceberg manifest — apply the MVCC dedup projection ([docs/HTAP_READS.md](docs/HTAP_READS.md)) once and any v2-aware reader sees consistent results.
+- **Open format, no lock-in**: Data is Parquet. Metadata is Iceberg. DuckDB, Spark, Trino, Snowflake read it natively via the exported Iceberg manifest — apply the MVCC dedup projection ([docs/EXTERNAL_READS.md](docs/EXTERNAL_READS.md)) once and any v2-aware reader sees consistent results.
 - **Embed, don't deploy**: Link one crate. No server, no cluster, no JVM.
 
 ## Architecture
@@ -26,7 +26,7 @@ Named after the [Meru Parvatha](https://en.wikipedia.org/wiki/Mount_Meru) from I
 
 **Read path**: Memtable (active + immutable queue) → L0 files (bloom → `KvSparseIndex` page skip → scan) → L1..LN (bloom → `KvSparseIndex` → binary search).
 
-**Compaction**: Leveled compaction, always full-rewrite — every selected input is fully read, merged, and removed from the manifest. Compactions on disjoint level sets run in parallel (L0→L1 and L2→L3 concurrently) via per-level reservation; the catalog commit phase is serialized by a separate brief lock. L0 is prioritized above the slowdown trigger so deep compactions can't starve flush drainage. Each job's input is capped by `max_compaction_bytes` to bound per-worker memory. Output SST is fsynced before manifest commit. Fully compacted files are removed from the manifest and queued for deferred deletion; GC waits on BOTH a time-based grace (for external HTAP readers) AND version-pin refcounts (for internal `get`/`scan` holding an old `Version`) — a long integrity scan on tens of GB will never see a file it needs disappear mid-read. Row cache is cleared on every compaction commit. Snapshot-aware version dropping preserves MVCC versions needed by active readers.
+**Compaction**: Leveled compaction, always full-rewrite — every selected input is fully read, merged, and removed from the manifest. Compactions on disjoint level sets run in parallel (L0→L1 and L2→L3 concurrently) via per-level reservation; the catalog commit phase is serialized by a separate brief lock. L0 is prioritized above the slowdown trigger so deep compactions can't starve flush drainage. Each job's input is capped by `max_compaction_bytes` to bound per-worker memory. Output SST is fsynced before manifest commit. Fully compacted files are removed from the manifest and queued for deferred deletion; GC waits on BOTH a time-based grace (for external analytical readers like DuckDB / Spark) AND version-pin refcounts (for internal `get`/`scan` holding an old `Version`) — a long integrity scan on tens of GB will never see a file it needs disappear mid-read. Row cache is cleared on every compaction commit. Snapshot-aware version dropping preserves MVCC versions needed by active readers.
 
 **Deletion Vectors (read-side live, write-side dormant)**: merutable's format reads and applies any Puffin `deletion-vector-v1` blob it finds on a source file (Iceberg v3 compatibility — an external writer can stamp a DV on data merutable owns, and merutable will honor it on the next compaction merge). merutable itself does **not** produce DVs today, because every compaction is a full rewrite — there is no residual source file to stamp. The write-side API (`SnapshotTransaction::add_dv` + Puffin v3 encoder + post-union cardinality validation) is implemented and tested; it waits for a partial-compaction caller ([RFC #19](https://github.com/merutable/merutable/issues/19)). This is intentional simplicity, not a missing feature — see [docs/SEMANTICS.md](docs/SEMANTICS.md).
 
@@ -110,7 +110,7 @@ The [`lab/lab_merutable.ipynb`](lab/lab_merutable.ipynb) notebook is a live, run
 cd lab && bash setup.sh
 ```
 
-The notebook covers: write/flush/inspect, compaction with Deletion Vectors, **HTAP with DuckDB** (SQL queries on merutable's Parquet files — zero ETL), acceleration structures (bloom filter + KvSparseIndex), and write/read performance benchmarks.
+The notebook covers: write/flush/inspect, compaction with Deletion Vectors, **external analytical reads from DuckDB** (SQL queries on merutable's Parquet files — zero ETL), acceleration structures (bloom filter + KvSparseIndex), and write/read performance benchmarks.
 
 ## Python bindings
 
@@ -139,11 +139,11 @@ db.flush()              # → L0 Parquet file + new v{N}.metadata.json
 db.compact()            # → L1 columnstore + Deletion Vectors (Puffin v3)
 print(db.stats())       # includes cache hit/miss counters
 
-# HTAP: register merutable's Iceberg metadata with DuckDB.
+# External analytical reads: register merutable's Iceberg metadata with DuckDB.
 # Always go through the Iceberg manifest — raw-glob `read_parquet` picks
 # up files still in the GC grace window and skips the MVCC dedup
 # projection, producing wrong answers on any non-trivial workload.
-# See docs/HTAP_READS.md for the canonical projection.
+# See docs/EXTERNAL_READS.md for the canonical projection.
 import duckdb
 db.export_iceberg("/tmp/events-iceberg")  # metadata.json + version-hint
 duckdb.sql("INSTALL iceberg; LOAD iceberg;")

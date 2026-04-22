@@ -74,7 +74,7 @@ pub fn level_has_value_blob(level: Level) -> bool {
 /// - Column 0: `_merutable_ikey` (always)
 /// - Column 1: `_merutable_value` (FileFormat::Dual only)
 /// - Remaining: one typed column per `TableSchema::columns` entry, in
-///   schema order. These are the columns external HTAP readers see.
+///   schema order. These are the columns external external analytical readers see.
 pub fn arrow_schema(schema: &TableSchema, format: FileFormat) -> Arc<Schema> {
     let mut fields = vec![
         Field::new(IKEY_COLUMN_NAME, DataType::Binary, false),

@@ -159,7 +159,7 @@ impl LogSource for ChangeFeedLogSource {
 }
 
 /// Issue #32 Phase 2: co-located log source for single-process
-/// replica setups (tests, benchmarks, single-host HTAP demos).
+/// replica setups (tests, benchmarks, single-host external analytics demos).
 ///
 /// Pulls ops directly from an `Arc<MeruDB>` via the change-feed
 /// cursor (#29 Phase 2a). No network, no serialization, no

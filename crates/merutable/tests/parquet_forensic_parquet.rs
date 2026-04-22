@@ -7,7 +7,7 @@
 //!
 //! 1. **Every footer KV we claim to write is present** and nothing else is
 //!    there that we didn't put there. The schema of the footer is the
-//!    cross-system contract with HTAP readers — it must be stable.
+//!    cross-system contract with external analytical readers — it must be stable.
 //! 2. **The column layout matches the per-level contract**: L0 carries
 //!    `_merutable_ikey`, `_merutable_value`, then typed user columns in
 //!    order; L1+ carries `_merutable_ikey` then typed user columns in
@@ -391,8 +391,8 @@ fn every_column_chunk_uses_snappy_compression() {
 /// Every column chunk must have an `OffsetIndex` and a `ColumnIndex`.
 /// The writer relies on the OffsetIndex for kv_index extraction; missing
 /// it silently disables the kv_index entirely. ColumnIndex gives
-/// external HTAP readers page-level min/max pruning, which is part of
-/// the HTAP performance story.
+/// external external analytical readers page-level min/max pruning, which is part of
+/// the external analytics performance story.
 #[test]
 fn offset_and_column_indexes_exist_on_every_column_chunk() {
     let schema = forensic_schema();

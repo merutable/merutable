@@ -287,7 +287,7 @@ impl MeruDB {
         guard.as_ref().and_then(|w| w.mirror_lag_secs())
     }
 
-    /// Catalog base directory path (for HTAP file access).
+    /// Catalog base directory path (for external analytics file access).
     pub fn catalog_path(&self) -> String {
         self.engine.catalog_path()
     }

@@ -2,8 +2,8 @@
 name        = "merutable"
 version     = "0.1.0"
 edition     = "2021"
-description = "Embeddable HTAP database: LSM-tree over Apache Iceberg and Parquet"
-keywords    = ["database", "lsm", "iceberg", "parquet", "htap"]
+description = "Embeddable single-table engine: row + columnar Parquet with Iceberg-compatible metadata"
+keywords    = ["embedded", "lsm", "iceberg", "parquet", "table"]
 license     = "Apache-2.0"
 build       = "build.rs"
 

@@ -4,7 +4,7 @@
 //! - `"merutable.meta"` → JSON-serialized `ParquetFileMeta`
 //! - `"merutable.schema"` → JSON-serialized `TableSchema`
 //!
-//! External HTAP readers (DuckDB, Spark, iceberg-rust) can pick up the
+//! External external analytical readers (DuckDB, Spark, iceberg-rust) can pick up the
 //! schema from the footer without any merutable imports — the JSON shape
 //! is stable and human-readable.
 

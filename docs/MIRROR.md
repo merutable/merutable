@@ -17,7 +17,7 @@ a conditional-PUT object-store layout (Issue #26) goes the other way: every
 commit is a conditional PUT against an object store. Multi-writer
 safe, durable cross-host, but pays roundtrip latency per commit.
 
-The deployment shape that matters in practice for HTAP is **neither
+The deployment shape that matters in practice for external analytics is **neither
 endpoint alone**: a single-writer primary with local POSIX commit
 (for latency) AND a continuously-updated object-store copy (for
 durability + read scaling).

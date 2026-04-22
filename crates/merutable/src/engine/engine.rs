@@ -118,7 +118,7 @@ pub struct MeruEngine {
     ///    integrity scans hit `IO NotFound` because GC ran while the
     ///    reader still held the old `Version`).
     /// 2. `obsoleted_at.elapsed() >= gc_grace_period_secs` (time-based
-    ///    grace for external HTAP readers, e.g. DuckDB, which don't
+    ///    grace for external external analytical readers, e.g. DuckDB, which don't
     ///    participate in the pin protocol).
     ///
     /// Both must hold: version-pin protects internal readers,
@@ -845,7 +845,7 @@ impl MeruEngine {
         for file in files {
             // Prune files that can't possibly contribute rows in
             // the requested range. `seq_min/seq_max` are the tight
-            // bounds the compaction iterator + HTAP readers already
+            // bounds the compaction iterator + external analytical readers already
             // rely on.
             if file.meta.seq_max <= since_seq || file.meta.seq_min > read_seq.0 {
                 continue;
@@ -933,7 +933,7 @@ impl MeruEngine {
         Ok(out)
     }
 
-    /// Catalog base directory (for HTAP: point DuckDB at Parquet files).
+    /// Catalog base directory (for external analytics: point DuckDB at Parquet files).
     pub fn catalog_path(&self) -> String {
         self.catalog.base_path().to_string_lossy().to_string()
     }
@@ -1083,7 +1083,7 @@ impl MeruEngine {
 
     /// Delete files that are both (a) no longer pinned by any live
     /// internal reader AND (b) past the `gc_grace_period_secs` time
-    /// grace for external (HTAP) readers. Called after compaction
+    /// grace for external (external analytics) readers. Called after compaction
     /// commits and periodically by the optional background worker.
     ///
     /// Version-pinned safety (fixes BUG-0007..0013): even when the

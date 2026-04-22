@@ -45,7 +45,7 @@ claim to produce." That rationale is voided by the [Issue #17 fix](../../docs/SE
 (README corrected to state the read/write asymmetry; DV write-side
 preserved but dormant). The external-reader dedup projection
 ([Issue #16](https://github.com/merutable/merutable/issues/16),
-[docs/HTAP_READS.md](../HTAP_READS.md)) is mandatory whether or not
+[docs/EXTERNAL_READS.md](../EXTERNAL_READS.md)) is mandatory whether or not
 partial compaction is implemented — partial compaction addresses
 write-amp only, not the duplicates external readers see.
 

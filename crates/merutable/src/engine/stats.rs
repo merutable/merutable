@@ -44,7 +44,7 @@ pub struct CacheStats {
 
 /// GC-queue statistics. Issue #30 observability hook: under sustained
 /// writes with aggressive compaction, the pending-deletions queue can
-/// grow faster than `gc_grace_period_secs` drains it if external HTAP
+/// grow faster than `gc_grace_period_secs` drains it if external external analytics
 /// readers hold the time-based grace. Operators correlate
 /// `pending_count` growth with RSS spikes.
 #[derive(Debug, Clone)]

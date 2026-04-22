@@ -292,7 +292,7 @@ impl OpenOptions {
     }
 
     /// Seconds to retain compaction-obsoleted files before GC. Gives
-    /// external HTAP readers (DuckDB, Spark) time to finish mid-read.
+    /// external external analytical readers (DuckDB, Spark) time to finish mid-read.
     /// Default: 300 (5 minutes). Internal readers use version-pin
     /// refcounting and are NOT bounded by this timer.
     pub fn gc_grace_period_secs(mut self, secs: u64) -> Self {
