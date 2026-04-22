@@ -51,11 +51,7 @@ use merutable::iceberg::{
     IcebergCatalog,
 };
 use merutable::store::local::LocalFileStore;
-use merutable::types::{
-    level::ParquetFileMeta,
-    schema::{ColumnDef, ColumnType, TableSchema},
-    MeruError, Result,
-};
+use merutable::types::{level::ParquetFileMeta, schema::TableSchema, MeruError, Result};
 
 /// Source / destination commit layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -129,23 +125,20 @@ struct PlanEntry {
 /// manifest and build a migration plan — file references + sizes.
 /// No writes against the destination.
 async fn build_plan_posix_source(src: &str) -> Result<MigrationPlan> {
-    // Open the catalog read-only. We don't have the table schema a
-    // priori; the catalog deserializes the schema from the on-disk
-    // manifest, so a minimal placeholder schema suffices for open().
-    // (IcebergCatalog::open only uses the schema to stamp genesis
-    // on empty catalogs; existing catalogs carry their own schema.)
-    let placeholder = TableSchema {
-        table_name: "migrate-placeholder".into(),
-        columns: vec![ColumnDef {
-            name: "id".into(),
-            col_type: ColumnType::Int64,
-            nullable: false,
-            ..Default::default()
-        }],
-        primary_key: vec![0],
-        ..Default::default()
-    };
-    let catalog = IcebergCatalog::open(src, placeholder).await?;
+    // Issue #42: the catalog enforces schema-vs-persisted match on
+    // reopen, so we can't pass a placeholder. Instead, load the
+    // persisted schema first and re-use it — the migrate tool is
+    // read-only against the source and never writes with this
+    // schema, but using the persisted one keeps us inside the
+    // single-table contract.
+    let schema = merutable::iceberg::load_persisted_schema(src)
+        .await?
+        .ok_or_else(|| {
+            merutable::types::MeruError::Corruption(format!(
+                "no catalog manifest found at `{src}`; nothing to migrate"
+            ))
+        })?;
+    let catalog = IcebergCatalog::open(src, schema).await?;
     let manifest: Manifest = catalog.current_manifest().await;
 
     let mut data_files = Vec::new();
@@ -517,18 +510,14 @@ async fn verify_destination(
 /// initial plan builder hands back only file-level info, but Phase 3
 /// needs the full manifest to rebuild `IcebergDataFile` records.
 async fn read_source_manifest(src: &str) -> Result<Manifest> {
-    let placeholder = TableSchema {
-        table_name: "migrate-placeholder".into(),
-        columns: vec![ColumnDef {
-            name: "id".into(),
-            col_type: ColumnType::Int64,
-            nullable: false,
-            ..Default::default()
-        }],
-        primary_key: vec![0],
-        ..Default::default()
-    };
-    let catalog = IcebergCatalog::open(Path::new(src), placeholder).await?;
+    // Issue #42: use the persisted schema (no placeholder) so the
+    // reopen-compatibility check accepts us.
+    let schema = merutable::iceberg::load_persisted_schema(src)
+        .await?
+        .ok_or_else(|| {
+            merutable::types::MeruError::Corruption(format!("no catalog manifest found at `{src}`"))
+        })?;
+    let catalog = IcebergCatalog::open(Path::new(src), schema).await?;
     Ok(catalog.current_manifest().await)
 }
 
@@ -743,6 +732,7 @@ mod tests {
     use super::*;
     use merutable::iceberg::snapshot::{IcebergDataFile, SnapshotTransaction};
     use merutable::types::level::{Level, ParquetFileMeta};
+    use merutable::types::schema::{ColumnDef, ColumnType};
     use std::sync::Arc;
 
     fn test_schema() -> TableSchema {

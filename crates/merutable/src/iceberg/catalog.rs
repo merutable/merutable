@@ -60,6 +60,112 @@ pub struct IcebergCatalog {
     next_version: Mutex<i64>,
 }
 
+/// Issue #42: reject a reopen with a schema incompatible with what
+/// the catalog already persists. Used by `IcebergCatalog::open` when
+/// a manifest is loaded from disk (the fresh-open path has nothing
+/// to compare against, so it skips this check).
+///
+/// Comparison rules for 0.1:
+///   - `table_name` must match exactly.
+///   - Column count must match.
+///   - Every column's `name`, `col_type`, and `nullable` must match
+///     at the same index. Column order is semantically significant
+///     because PK columns are referenced by index, and field_id is
+///     assigned positionally by `TableSchema::validate`.
+///   - `primary_key` indices must match.
+///
+/// Additive schema evolution (allowing strictly-additive column
+/// appends on reopen) is #44's scope; this check is intentionally
+/// strict so a caller who reopens with a stale or reordered schema
+/// gets an error instead of silent data corruption.
+fn check_schema_compatible(persisted: &TableSchema, provided: &TableSchema) -> Result<()> {
+    if persisted.table_name != provided.table_name {
+        return Err(MeruError::SchemaMismatch(format!(
+            "catalog at this path was created for table `{}`; reopen provided \
+             `{}`. A merutable catalog is single-table — refusing to reopen \
+             under a conflicting name.",
+            persisted.table_name, provided.table_name,
+        )));
+    }
+    if persisted.columns.len() != provided.columns.len() {
+        return Err(MeruError::SchemaMismatch(format!(
+            "schema mismatch on reopen of table `{}`: persisted has {} \
+             columns, provided has {}. Additive schema evolution is tracked \
+             separately (#44); full-replace is not a valid reopen.",
+            persisted.table_name,
+            persisted.columns.len(),
+            provided.columns.len(),
+        )));
+    }
+    for (i, (pc, vc)) in persisted
+        .columns
+        .iter()
+        .zip(provided.columns.iter())
+        .enumerate()
+    {
+        if pc.name != vc.name {
+            return Err(MeruError::SchemaMismatch(format!(
+                "schema mismatch on reopen of table `{}`: column {} is named \
+                 `{}` in the persisted schema, but `{}` in the provided schema. \
+                 Columns are positional and cannot be renamed or reordered.",
+                persisted.table_name, i, pc.name, vc.name,
+            )));
+        }
+        if pc.col_type != vc.col_type {
+            return Err(MeruError::SchemaMismatch(format!(
+                "schema mismatch on reopen of table `{}`: column `{}` has \
+                 type {:?} persisted, but {:?} provided.",
+                persisted.table_name, pc.name, pc.col_type, vc.col_type,
+            )));
+        }
+        if pc.nullable != vc.nullable {
+            return Err(MeruError::SchemaMismatch(format!(
+                "schema mismatch on reopen of table `{}`: column `{}` has \
+                 nullable={} persisted, but {} provided.",
+                persisted.table_name, pc.name, pc.nullable, vc.nullable,
+            )));
+        }
+    }
+    if persisted.primary_key != provided.primary_key {
+        return Err(MeruError::SchemaMismatch(format!(
+            "schema mismatch on reopen of table `{}`: primary key was {:?} \
+             persisted, provided as {:?}. PK cannot change post-creation.",
+            persisted.table_name, persisted.primary_key, provided.primary_key,
+        )));
+    }
+    Ok(())
+}
+
+/// Issue #42: read-only helper that loads the `TableSchema`
+/// persisted in an existing catalog's latest manifest, without
+/// running the reopen-compatibility check. Used by admin/migration
+/// tools that need to discover the schema before calling the
+/// ordinary `IcebergCatalog::open(path, schema)` — such tools
+/// inspect catalog contents without knowing the original schema
+/// a priori and would otherwise need a placeholder that the #42
+/// check would (correctly) reject.
+///
+/// Returns `Ok(None)` when the directory has no catalog yet
+/// (i.e., no `version-hint.text`). Returns `Err` on a corrupted
+/// manifest or I/O failure.
+pub async fn load_persisted_schema(base_path: impl AsRef<Path>) -> Result<Option<TableSchema>> {
+    let base = base_path.as_ref();
+    let hint_path = base.join("version-hint.text");
+    if !hint_path.exists() {
+        return Ok(None);
+    }
+    let hint = tokio::fs::read_to_string(&hint_path)
+        .await
+        .map_err(MeruError::Io)?;
+    let ver: i64 = hint
+        .trim()
+        .parse()
+        .map_err(|_| MeruError::Corruption("bad version-hint".into()))?;
+    let data = read_manifest_payload(&base.join("metadata"), ver).await?;
+    let manifest = decode_manifest(&data)?;
+    Ok(Some(manifest.schema))
+}
+
 impl IcebergCatalog {
     /// Open or create a catalog at `base_path`.
     /// If the directory already has metadata, loads the latest manifest.
@@ -111,6 +217,20 @@ impl IcebergCatalog {
             if manifest.table_uuid.is_empty() {
                 manifest.table_uuid = uuid::Uuid::new_v4().to_string();
             }
+            // Issue #42: enforce the single-table invariant at the
+            // API boundary on reopen. Before this check, a caller
+            // could open `./db` with schema `{table_name:"events"}`
+            // and reopen the same path with
+            // `{table_name:"logs"}` — the engine silently accepted
+            // the mismatch and subsequent commits overwrote the
+            // persisted schema, corrupting reads that depended on
+            // the original schema.
+            //
+            // Contract for 0.1: the provided schema must match the
+            // persisted schema exactly. Full evolution rules are
+            // #44's scope; here we reject every mismatch so a stale
+            // caller cannot write under a conflicting shape.
+            check_schema_compatible(&manifest.schema, &schema)?;
             (manifest, ver + 1)
         } else {
             // No version-hint.text. Detect silent data loss: if the
