@@ -120,11 +120,11 @@
   <text x="965" y="297" text-anchor="middle" font-size="8" fill="#4527A0">3. Scan ≤ 1 restart interval</text>
 
   <!-- ═══════════════════════════════════════════════ -->
-  <!-- ROW 2 (y=430..580): HTAP — full width section -->
+  <!-- ROW 2 (y=430..580): External analytical reads — full-width section -->
   <!-- ═══════════════════════════════════════════════ -->
 
   <rect x="30" y="430" width="1040" height="140" rx="8" fill="#FFF8E1" stroke="#F9A825" stroke-width="1.5"/>
-  <text x="550" y="455" text-anchor="middle" font-size="14" font-weight="bold" fill="#F57F17">HTAP — Zero ETL</text>
+  <text x="550" y="455" text-anchor="middle" font-size="14" font-weight="bold" fill="#F57F17">External analytical reads — Zero ETL</text>
 
   <rect x="80" y="475" width="150" height="40" rx="4" fill="#E8F5E9" stroke="#2E7D32" stroke-width="1"/>
   <text x="155" y="494" text-anchor="middle" font-size="10" font-weight="600" fill="#1B5E20">merutable</text>

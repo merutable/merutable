@@ -33,9 +33,9 @@ const TOTAL_ROWS: i64 = 100;
 /// `(name?, active, score?)`. `id` is the map key elsewhere.
 type DecodedRow = (Option<Vec<u8>>, bool, Option<f64>);
 
-fn htap_schema() -> TableSchema {
+fn external_reader_schema() -> TableSchema {
     TableSchema {
-        table_name: "htap_demo".into(),
+        table_name: "external_reader_demo".into(),
         columns: vec![
             ColumnDef {
                 name: "id".into(),
@@ -113,7 +113,7 @@ async fn discover_l0_file(catalog_root: &Path) -> PathBuf {
 async fn l0_file_is_readable_by_upstream_parquet_with_typed_columns() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = EngineConfig {
-        schema: htap_schema(),
+        schema: external_reader_schema(),
         catalog_uri: tmp.path().to_string_lossy().to_string(),
         object_store_prefix: tmp.path().to_string_lossy().to_string(),
         wal_dir: tmp.path().join("wal"),
@@ -301,7 +301,7 @@ async fn l1_file_is_readable_by_upstream_parquet_without_value_blob() {
         sequence::{OpType, SeqNum},
     };
 
-    let schema = Arc::new(htap_schema());
+    let schema = Arc::new(external_reader_schema());
 
     // Build (InternalKey, Row) inputs in PK-ascending order.
     let mut rows: Vec<(InternalKey, Row)> = Vec::with_capacity(TOTAL_ROWS as usize);

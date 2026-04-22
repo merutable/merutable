@@ -95,7 +95,7 @@ def render_htap_flow():
         print("pip install graphviz")
         return None
 
-    dot = graphviz.Digraph("HTAP Flow")
+    dot = graphviz.Digraph("External-reads flow")
     dot.attr(rankdir="LR", fontname="Helvetica", bgcolor="white")
     dot.attr("node", fontname="Helvetica", fontsize="11")
 
