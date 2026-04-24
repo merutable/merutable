@@ -11,18 +11,11 @@
 
 <p align="center"><b>An embeddable Rust table engine. LSM writes, Parquet storage, Iceberg-compatible metadata.</b></p>
 
-> **🚧  0.0.1 preview.** Storage format is already Iceberg v2–compatible and
-> CI-pinned. The public Rust API is not yet stable — treat 0.x as a design
-> surface, not a deployment target. Not production-ready.
-
----
-
-`merutable` is a single-table LSM storage engine you link into your process,
-not a server you deploy. Writes go through a WAL + skip-list memtable; flushes
-land as Apache Parquet SSTables; every commit publishes a manifest that is a
-strict superset of Apache Iceberg v2 `TableMetadata`. The same bytes your
-writes land in are the bytes DuckDB, Spark, Trino, Snowflake, and pyiceberg
-read — no export, no format conversion.
+`merutable` is a single-table engine you link into your process, not a server
+you deploy. Writes go through a WAL + skip-list memtable; flushes land as
+Apache Parquet SSTables. Call `db.export_iceberg(path)` when you want an
+Iceberg v2 view — DuckDB, Spark, Trino, Snowflake, and pyiceberg read it with
+no format conversion.
 
 ```rust
 use merutable::{MeruDB, OpenOptions};
@@ -58,20 +51,10 @@ async fn main() -> merutable::error::Result<()> {
 
 ## When merutable fits
 
-**Yes:** structured data at a single-process scope that needs to be both
-write-fast (agent memory, session state, audit logs, feature stores, embedded
-time-series) and also readable by external analytical engines without an ETL
-job. An LSM gives you the writes; Iceberg-compatible manifests give you the
-reads. Your process is the source of truth; DuckDB or Spark are guests.
-
-**No:** multi-table OLTP, cross-table transactions, multi-writer object-store
-layouts, a replacement for PostgreSQL or Snowflake. merutable ships no SQL
-surface on the primary table (reads and writes are through a typed Rust KV
-API); the only SQL entry point is the change-feed `TableProvider` you
-register on your own DataFusion `SessionContext`. Analytical queries over
-the primary table run in external engines on the Parquet files merutable
-writes. See [`docs/TAXONOMY.md`](docs/TAXONOMY.md) for what each word in
-the tagline earns.
+Structured data at a single-process scope that needs to be both write-fast —
+agent memory, session state, audit logs, feature stores, embedded
+time-series — and readable by analytical engines without an ETL job. An LSM
+gives you the writes; Iceberg export gives you the reads.
 
 ## What's in the box
 
@@ -82,23 +65,21 @@ the tagline earns.
 - **Leveled compaction.** Full-rewrite, run in parallel on disjoint level
   sets, bounded per-job memory, fsync-before-commit, version-pinned GC so
   a long scan never sees a file disappear mid-read.
-- **Iceberg v2-superset manifest.** Every commit emits a native JSON manifest
-  that carries `table_uuid`, `last_updated_ms`, parent-snapshot chain,
-  `schemas[]`, and additive-evolution fields (`field_id`, `initial_default`,
-  `write_default`). `db.export_iceberg(path)` writes a spec-clean Iceberg v2
-  chain — `metadata.json` + manifest-list Avro + manifest Avro — that DuckDB
-  `iceberg_scan`, pyiceberg, Spark, Trino, and Athena consume as-is. CI
-  round-trips the manifest chain through `iceberg-rs`.
-- **Change feed.** `merutable::sql::datafusion_provider::ChangeFeedTableProvider`
-  exposes the committed op log as a DataFusion `TableProvider` (`seq > N`
-  predicates push down as `Exact`), with per-DELETE pre-image reconstruction.
-- **Scale-out read replica** *(opt-in, `replica` feature).* Read-only base
-  + tail replayed from the change feed; rebase hot-swaps behind `ArcSwap`
-  so in-flight readers never see a torn state. v1 `LogSource` is in-process;
-  a transport shipping the tail across hosts is follow-on work.
-- **Additive schema evolution.** `db.add_column(ColumnDef)` — reopen accepts
-  the extension, reads of pre-evolution files fill defaults, writes pad
-  short rows with `write_default`.
+- **Iceberg export on demand.** `db.export_iceberg(path)` writes a
+  spec-clean Iceberg v2 chain — `metadata.json` + manifest-list Avro +
+  manifest Avro — that DuckDB `iceberg_scan`, pyiceberg, Spark, Trino, and
+  Athena consume as-is. CI round-trips the chain through `iceberg-rs`. You
+  call `export_iceberg` when you want the view; on-disk layout is not bound
+  to the Iceberg spec.
+- **Change feed.** Committed operations are exposed as a change feed table
+  provider with `seq > N` predicate pushdown and per-DELETE pre-image
+  reconstruction.
+- **Read-only replica** *(opt-in).* Base + tail replayed from the change
+  feed; rebase hot-swaps behind `ArcSwap` so in-flight readers never see a
+  torn state.
+- **Schema evolution.** `db.add_column(ColumnDef)` — reopen accepts the
+  extension, reads of pre-evolution files fill defaults, writes pad short
+  rows with `write_default`.
 - **Python bindings** *(via PyO3).* `crates/merutable-python/`.
 
 ## Install
@@ -108,19 +89,6 @@ the tagline earns.
 merutable = "0.0.1"
 ```
 
-Cargo features:
-
-| Feature    | Default | What it pulls in                                                                 |
-|------------|---------|----------------------------------------------------------------------------------|
-| `sql`      | ✅       | DataFusion `TableProvider` wrapper for the change feed.                          |
-| `replica`  | —       | Scale-out RO replica. Implies `sql`.                                             |
-
-```bash
-cargo add merutable                            # default (sql on)
-cargo add merutable --no-default-features      # core engine only
-cargo add merutable --features replica         # + replica module
-```
-
 ## Architecture at a glance
 
 ```
@@ -128,10 +96,12 @@ cargo add merutable --features replica         # + replica module
 writes ──▶│ WAL → memtable → flush → SST │
 reads  ◀──│   memtable  ∪  L0  ∪  L1…    │
           └─────────────┬────────────────┘
-                        │    Parquet + Iceberg v2 metadata
+                        │  Parquet files on disk
+                        ▼
+              db.export_iceberg(path)
+                        │
                         ▼
            DuckDB / Spark / Trino / pyiceberg
-                  (no ETL, same bytes)
 ```
 
 Deeper reads:
