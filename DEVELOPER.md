@@ -83,7 +83,7 @@ merutable/
 │   │       ├── wal/                    # Write-ahead log
 │   │       ├── memtable/               # Skip-list memtable + arena
 │   │       ├── parquet/                # Parquet SSTable + bloom + KvSparseIndex
-│   │       ├── iceberg/                # Iceberg catalog + manifest + deletion vectors
+│   │       ├── iceberg/                # Iceberg catalog + manifest
 │   │       ├── engine/                 # Flush, compaction, read/write paths
 │   │       ├── sql/                    # Change-feed (feature `sql`, on by default)
 │   │       ├── replica/                # Scale-out RO replica (feature `replica`)

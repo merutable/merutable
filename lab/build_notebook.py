@@ -290,7 +290,7 @@ CELLS = [
         "",
         "**Zero-ETL means zero format conversion.** After the flush, DuckDB saw the new rows *as-is* — no `COPY`, no transform, no staging table. Same Parquet files merutable wrote are the ones DuckDB reads. The Iceberg v2 compatibility layer (`db.export_iceberg()`) makes this work even for the manifest metadata: DuckDB can open the dataset as an Iceberg table without merutable ever writing a different format.",
         "",
-        "See `docs/EXTERNAL_READS.md` for the canonical projection that handles MVCC dedup + deletion vectors when DuckDB reads the whole dataset.",
+        "See `docs/EXTERNAL_READS.md` for the canonical MVCC dedup projection DuckDB applies when reading the whole dataset.",
     ),
     md("## Cleanup"),
     code(
