@@ -22,9 +22,6 @@ cd crates/merutable-python
 maturin develop --release
 ```
 
-The `lab/setup.sh` script automates this along with the Jupyter
-dependencies needed by the notebook.
-
 ## Building
 
 ```bash
